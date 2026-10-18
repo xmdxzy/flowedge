@@ -248,4 +248,166 @@ export const workflowTemplates: WorkflowTemplate[] = [
       { id: 'e3-4', source: 'llm-1', target: 'end-1' },
     ],
   },
+  {
+    id: 'loop-refine',
+    name: '迭代精炼',
+    description: '同一个任务反复打磨 N 轮，每轮以上一轮结果为输入（循环·固定次数）',
+    category: '循环与迭代',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 40, y: 180 },
+        data: { prompt: '写一句关于秋天的短诗' },
+      },
+      {
+        id: 'loop-1',
+        type: 'loop',
+        position: { x: 300, y: 180 },
+        data: {
+          mode: 'count',
+          iterations: 3,
+          max_iterations: 20,
+          _inner: {
+            name: '迭代精炼·内层',
+            nodes: [
+              { id: 's', type: 'start', position: { x: 0, y: 0 }, data: {} },
+              {
+                id: 'l',
+                type: 'llm',
+                position: { x: 220, y: 0 },
+                data: {
+                  model: 'qwen2.5-coder:32b',
+                  prompt: '请改进下面这段文字，让它更精炼、更有画面感。只输出改进后的结果，不要解释：',
+                },
+              },
+              { id: 'e', type: 'end', position: { x: 440, y: 0 }, data: {} },
+            ],
+            edges: [
+              { id: 'ie1', source: 's', target: 'l' },
+              { id: 'ie2', source: 'l', target: 'e' },
+            ],
+          },
+        },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 580, y: 180 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1', source: 'start-1', target: 'loop-1' },
+      { id: 'e2', source: 'loop-1', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'loop-batch',
+    name: '批量处理',
+    description: '多行输入逐条处理（循环·遍历列表），适合批量改写、批量描述',
+    category: '循环与迭代',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 40, y: 180 },
+        data: { prompt: '丹炉\n剑冢\n符箓' },
+      },
+      {
+        id: 'loop-1',
+        type: 'loop',
+        position: { x: 300, y: 180 },
+        data: {
+          mode: 'foreach',
+          max_iterations: 20,
+          _inner: {
+            name: '批量处理·内层',
+            nodes: [
+              { id: 's', type: 'start', position: { x: 0, y: 0 }, data: {} },
+              {
+                id: 'l',
+                type: 'llm',
+                position: { x: 220, y: 0 },
+                data: {
+                  model: 'qwen2.5-coder:32b',
+                  prompt: '为下面这个修仙物品写一句 20 字以内的描述，只输出描述本身：',
+                },
+              },
+              { id: 'e', type: 'end', position: { x: 440, y: 0 }, data: {} },
+            ],
+            edges: [
+              { id: 'ie1', source: 's', target: 'l' },
+              { id: 'ie2', source: 'l', target: 'e' },
+            ],
+          },
+        },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 580, y: 180 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1', source: 'start-1', target: 'loop-1' },
+      { id: 'e2', source: 'loop-1', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'loop-until',
+    name: '重试到合格',
+    description: '反复生成直到输出包含指定标记（循环·条件循环，带最大次数保护）',
+    category: '循环与迭代',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 40, y: 180 },
+        data: { prompt: '一句话介绍工作流引擎' },
+      },
+      {
+        id: 'loop-1',
+        type: 'loop',
+        position: { x: 300, y: 180 },
+        data: {
+          mode: 'until',
+          condition_type: 'contains',
+          compare_value: '合格',
+          max_iterations: 5,
+          _inner: {
+            name: '重试到合格·内层',
+            nodes: [
+              { id: 's', type: 'start', position: { x: 0, y: 0 }, data: {} },
+              {
+                id: 'l',
+                type: 'llm',
+                position: { x: 220, y: 0 },
+                data: {
+                  model: 'qwen2.5-coder:32b',
+                  prompt: '审校下面这句话：若它已经通顺明确，就在结尾加上「合格」；否则只输出改写后的版本。',
+                },
+              },
+              { id: 'e', type: 'end', position: { x: 440, y: 0 }, data: {} },
+            ],
+            edges: [
+              { id: 'ie1', source: 's', target: 'l' },
+              { id: 'ie2', source: 'l', target: 'e' },
+            ],
+          },
+        },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 580, y: 180 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1', source: 'start-1', target: 'loop-1' },
+      { id: 'e2', source: 'loop-1', target: 'end-1' },
+    ],
+  },
 ]

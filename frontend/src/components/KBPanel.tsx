@@ -22,6 +22,8 @@ type Tab = 'list' | 'add' | 'import' | 'query'
 
 export default function KBPanel({ open, onClose }: KBPanelProps) {
   const [tab, setTab] = useState<Tab>('list')
+  const [dirPath, setDirPath] = useState('')
+  const [recursive, setRecursive] = useState(true)
   const [status, setStatus] = useState<{ embedder?: string; chunks?: number }>({})
   const [docs, setDocs] = useState<KBDoc[]>([])
   const [loading, setLoading] = useState(false)
@@ -88,6 +90,32 @@ export default function KBPanel({ open, onClose }: KBPanelProps) {
       const data = await resp.json()
       if (!resp.ok) throw new Error(data.error || 'import failed')
       setMessage(`已导入「${data.file}」${data.chunks} 个知识块（总计 ${data.total}）`)
+      refresh()
+    } catch (err: any) {
+      setMessage(`失败: ${err.message}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const importDir = async () => {
+    if (!dirPath.trim()) return
+    setLoading(true)
+    setMessage('')
+    try {
+      const resp = await fetch('/api/kb/import-dir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dir: dirPath.trim(), recursive }),
+      })
+      const data = await resp.json()
+      if (!resp.ok) throw new Error(data.error || 'import failed')
+      const names = (data.files || []).map((f: any) => f.file).slice(0, 3).join('、')
+      setMessage(
+        `导入 ${data.fileCount} 个文件 / ${data.chunks} 个知识块（总计 ${data.total}）` +
+          (names ? `：${names}${data.fileCount > 3 ? ' 等' : ''}` : '') +
+          (data.errors?.length ? `；${data.errors.length} 个文件出错` : ''),
+      )
       refresh()
     } catch (err: any) {
       setMessage(`失败: ${err.message}`)
@@ -235,6 +263,32 @@ export default function KBPanel({ open, onClose }: KBPanelProps) {
                 />
               </label>
               {loading && <p className="text-xs text-indigo-300">向量化中（bge-m3）...</p>}
+
+              <div className="pt-3 border-t border-border">
+                <p className="text-xs text-gray-400 mb-2">或批量导入整个目录</p>
+                <input
+                  value={dirPath}
+                  onChange={(e) => setDirPath(e.target.value)}
+                  placeholder="C:////docs////knowledge"
+                  className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-xs font-mono focus:border-primary outline-none"
+                />
+                <label className="flex items-center gap-2 mt-2 text-[11px] text-gray-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={recursive}
+                    onChange={(e) => setRecursive(e.target.checked)}
+                    className="accent-indigo-500"
+                  />
+                  递归子目录（自动跳过 node_modules / .git / venv / data）
+                </label>
+                <button
+                  onClick={importDir}
+                  disabled={loading || !dirPath.trim()}
+                  className="mt-2 w-full py-2 rounded-lg fe-btn-primary text-xs disabled:opacity-40"
+                >
+                  导入目录
+                </button>
+              </div>
             </div>
           )}
 

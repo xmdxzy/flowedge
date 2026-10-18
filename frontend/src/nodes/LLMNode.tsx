@@ -27,7 +27,16 @@ function LLMNode({ data, selected }: NodeProps) {
 
       {/* 内容 */}
       <div className="px-3 py-2">
-        <p className="text-xs text-gray-400 mb-1">模型: {(data.model as string) || 'qwen2.5:7b'}</p>
+        <div className="flex items-center gap-1.5 mb-1">
+          <p className="text-xs text-gray-400 truncate max-w-[130px]">
+            模型: {(data.model as string) || 'qwen2.5-coder:32b'}
+          </p>
+          {((data.tools as string[]) || []).length > 0 && (
+            <span className="text-[9px] px-1 py-0.5 rounded bg-ai/20 text-ai shrink-0">
+              {(data.tools as string[]).length} 工具
+            </span>
+          )}
+        </div>
         <p className="text-sm text-white truncate max-w-[180px]">
           {(data.prompt as string) || '使用上游输入'}
         </p>

@@ -53,6 +53,14 @@ const nodeTypes: NodeTypes = {
   rag_query: RAGNode,
 }
 
+// LLM 节点可用的内置工具（后端 service/tools.go 实现，全部本地执行）
+const LLM_TOOL_OPTIONS = [
+  { id: 'kb_search', label: '知识库检索' },
+  { id: 'http_get', label: 'HTTP 查询' },
+  { id: 'calc', label: '计算器' },
+  { id: 'now', label: '当前时间' },
+]
+
 // 初始示例工作流
 const initialNodes: Node[] = [
   {
@@ -428,10 +436,33 @@ function FlowEditor() {
   }
 
   // 加载模板
-  const loadTemplate = (template: WorkflowTemplate) => {
-    setNodes(template.nodes)
-    setEdges(template.edges)
+  // 加载模板：若模板内含「嵌套内层定义」（_inner），先自动创建内层工作流
+  // 并把返回的 id 回填到 loop / sub_workflow 节点，模板开箱即用
+  const loadTemplate = async (template: WorkflowTemplate) => {
+    const nodes = JSON.parse(JSON.stringify(template.nodes)) as any[]
+
+    for (const n of nodes) {
+      const inner = n?.data?._inner
+      if (!inner) continue
+      try {
+        const resp = await fetch('/api/workflows', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(inner),
+        })
+        const wf = await resp.json()
+        n.data.workflow_id = wf.id
+        n.data.workflow_name = wf.name
+      } catch (err) {
+        console.error('failed to create inner workflow for template', err)
+      }
+      delete n.data._inner
+    }
+
+    setNodes(nodes)
+    setEdges(JSON.parse(JSON.stringify(template.edges)))
     setSelectedNode(null)
+    loadWorkflows()
   }
 
   // 执行工作流
@@ -927,6 +958,37 @@ function FlowEditor() {
                     placeholder="留空则使用上游输入..."
                   />
                 </div>
+
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">工具调用（可选）</label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {LLM_TOOL_OPTIONS.map((tool) => {
+                      const cur = ((selectedNode.data.tools as string[]) || [])
+                      const on = cur.includes(tool.id)
+                      return (
+                        <button
+                          key={tool.id}
+                          onClick={() =>
+                            updateSelectedNodeData(
+                              'tools',
+                              on ? cur.filter((x) => x !== tool.id) : [...cur, tool.id],
+                            )
+                          }
+                          className={`px-2 py-1 rounded-md text-[11px] border transition-all ${
+                            on
+                              ? 'bg-ai/20 border-ai/60 text-white'
+                              : 'bg-canvas border-border text-gray-400 hover:border-ai/40'
+                          }`}
+                        >
+                          {tool.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <p className="text-[10px] text-gray-500 mt-1">
+                    勾选后模型可自行决定调用（最多 4 轮），全部在本地执行
+                  </p>
+                </div>
               </>
             )}
 
@@ -1143,7 +1205,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'start':
       return { prompt: '' }
     case 'llm':
-      return { model: 'qwen2.5-coder:32b', prompt: '' }
+      return { model: 'qwen2.5-coder:32b', prompt: '', tools: [] }
     case 'end':
       return {}
     case 'text2image':
