@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,10 @@ type Embedder struct {
 	Model    string // embedding 模型，如 bge-m3
 	Timeout  time.Duration
 	fallback func(string) []float64
+
+	mu      sync.RWMutex
+	probed  EmbedBackend
+	probeAt time.Time
 }
 
 func NewEmbedder(baseURL, model string) *Embedder {
@@ -43,12 +48,45 @@ func NewEmbedder(baseURL, model string) *Embedder {
 	}
 }
 
-// Backend 当前生效的后端（探测 Ollama 可用性）
+// backendCacheTTL 后端探测结果缓存时长。
+// 原实现每次调用都真打一次 /api/version：AddDocument 每处理一块 / 每次检索
+// 都多付一次 HTTP 往返，Ollama 挂了还会让 KB 反复等待。
+const backendCacheTTL = 30 * time.Second
+
+// Backend 当前生效的后端（探测 Ollama 可用性，30 秒内复用探测结果）
 func (e *Embedder) Backend() EmbedBackend {
-	if e.ollamaAlive() {
-		return EmbedBackendOllama
+	e.mu.RLock()
+	if !e.probeAt.IsZero() && time.Now().Before(e.probeAt.Add(backendCacheTTL)) {
+		b := e.probed
+		e.mu.RUnlock()
+		return b
 	}
-	return EmbedBackendSimple
+	e.mu.RUnlock()
+
+	b := EmbedBackendSimple
+	if e.ollamaAlive() {
+		b = EmbedBackendOllama
+	}
+
+	e.mu.Lock()
+	e.probed, e.probeAt = b, time.Now()
+	e.mu.Unlock()
+	return b
+}
+
+// EmbedBatch 顺序批量向量化。
+// Ollama 无稳定 batch 接口，这里仍逐条请求；真正的收益在调用方：
+// 由「每块一次全量持久化」改为「一批一次持久化」，导入耗时从 O(n²) 降为 O(n)。
+func (e *Embedder) EmbedBatch(texts []string) ([][]float64, error) {
+	out := make([][]float64, len(texts))
+	for i, t := range texts {
+		v, err := e.Embed(t)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
 }
 
 func (e *Embedder) ollamaAlive() bool {

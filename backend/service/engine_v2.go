@@ -1238,9 +1238,28 @@ func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]int
 	if tk, ok := node.Data["top_k"].(float64); ok && tk > 0 {
 		topK = int(tk)
 	}
-	context, err := e.rag.GetContext(query, topK)
+	// 检索一次，同时产出「文本上下文」与「结构化引用」
+	// （此前 GetContext 内部会再检索一次，等于每次 RAG 节点多付一轮 embedding）
+	results, err := e.rag.Query(query, topK)
 	if err != nil {
 		return nil, err
+	}
+	context := e.rag.ContextFrom(results)
+
+	// 结构化引用：下游可写 {{rag-1.sources[0].content}} 精确取某一条，
+	// 也能据此在 UI 上做点击跳转溯源
+	sources := make([]interface{}, 0, len(results))
+	for _, r := range results {
+		idx := 0
+		if v, ok := r.Record.Metadata["chunk_index"].(float64); ok {
+			idx = int(v)
+		}
+		sources = append(sources, map[string]interface{}{
+			"source":      r.Record.Source,
+			"chunk_index": idx,
+			"score":       r.Score,
+			"content":     r.Record.Content,
+		})
 	}
 
 	// 拼接上下文和查询
@@ -1252,6 +1271,8 @@ func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]int
 	return map[string]interface{}{
 		"text":    fullPrompt,
 		"context": context,
+		"sources": sources,
+		"hits":    len(results),
 	}, nil
 }
 

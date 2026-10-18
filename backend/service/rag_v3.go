@@ -2,7 +2,7 @@ package service
 
 import (
 	"fmt"
-	"log"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -33,24 +33,38 @@ func NewRAGServiceV3(dataDir, ollamaURL, embedModel string) *RAGServiceV3 {
 // Backend 当前 embedding 后端
 func (s *RAGServiceV3) Backend() EmbedBackend { return s.embedder.Backend() }
 
-// AddDocument 添加文档（段落感知分块 + 逐块向量化）
+// minVecScore 语义阈值：bge-m3 下不相关文本的余弦通常 < 0.35，0.30 是保守下限。
+// 仅在后端为 Ollama（真语义向量）时生效 —— 降级到 SimpleEmbed 时向量分不可信，
+// 此时关键词一路（BM25）是主要命中来路，不能再用向量阈值把它过滤掉。
+const minVecScore = 0.30
+
+// AddDocument 添加文档（段落感知分块 + 批量向量化 + 单次落盘）
 func (s *RAGServiceV3) AddDocument(content, source string) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.addChunks(chunkByParagraph(content, 500, 80), source)
+}
 
-	chunks := chunkByParagraph(content, 500, 80)
+// addChunks 批量写入：先全部向量化，再一次持久化。
+// 原实现每块调用 store.Add（每次都全量 marshal 覆写 vectors.json），
+// 导入 N 块是 O(n²) 写放大；现在降为一次。
+func (s *RAGServiceV3) addChunks(chunks []string, source string) ([]string, error) {
+	if len(chunks) == 0 {
+		return nil, nil
+	}
 	backend := s.embedder.Backend()
-	ids := make([]string, 0, len(chunks))
 
+	vecs, err := s.embedder.EmbedBatch(chunks)
+	if err != nil {
+		return nil, err
+	}
+
+	records := make([]VectorRecord, 0, len(chunks))
 	for i, chunk := range chunks {
-		vec, err := s.embedder.Embed(chunk)
-		if err != nil {
-			return ids, fmt.Errorf("embed chunk %d failed: %w", i, err)
-		}
-		id, err := s.store.Add(VectorRecord{
+		records = append(records, VectorRecord{
 			Content:   chunk,
 			Source:    source,
-			Embedding: vec,
+			Embedding: vecs[i],
 			Metadata: map[string]interface{}{
 				"chunk_index":  i,
 				"total_chunks": len(chunks),
@@ -58,16 +72,17 @@ func (s *RAGServiceV3) AddDocument(content, source string) ([]string, error) {
 				"embed_model":  s.embedder.Model,
 			},
 		})
-		if err != nil {
-			return ids, err
-		}
-		ids = append(ids, id)
 	}
-	return ids, nil
+	return s.store.AddBatch(records)
 }
 
-// Query 语义检索（按当前后端标签过滤，topK 上限 10）
+// Query 混合检索：向量（语义）+ BM25（关键词）双路，RRF 融合后 MMR 去重。
+// sourceContains 非空时按来源子串过滤（元数据过滤的最小可用形态）。
 func (s *RAGServiceV3) Query(query string, topK int) ([]SearchResult, error) {
+	return s.QueryFiltered(query, topK, "")
+}
+
+func (s *RAGServiceV3) QueryFiltered(query string, topK int, sourceContains string) ([]SearchResult, error) {
 	if topK <= 0 {
 		topK = 3
 	}
@@ -75,48 +90,125 @@ func (s *RAGServiceV3) Query(query string, topK int) ([]SearchResult, error) {
 		topK = 10
 	}
 
-	log.Printf("[kb] query start: %.40s", query)
 	backend := s.embedder.Backend()
-	log.Printf("[kb] backend=%s", backend)
+
+	// 候选集：向量空间兼容（同后端标签）+ 可选来源过滤
+	all := s.store.GetAll()
+	cands := make([]VectorRecord, 0, len(all))
+	for _, r := range all {
+		if tag, _ := r.Metadata["embedder"].(string); tag != "" && tag != string(backend) {
+			continue
+		}
+		if len(r.Embedding) == 0 {
+			continue
+		}
+		if sourceContains != "" &&
+			!strings.Contains(strings.ToLower(r.Source), strings.ToLower(sourceContains)) {
+			continue
+		}
+		cands = append(cands, r)
+	}
+	if len(cands) == 0 {
+		return nil, nil
+	}
+
+	// 第一路：向量（语义）
 	qvec, err := s.embedder.Embed(query)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[kb] query embedded, dim=%d", len(qvec))
-
-	all := s.store.GetAll()
-	scored := make([]SearchResult, 0, len(all))
-	for _, r := range all {
-		// 向量空间兼容性：只与同后端的记录比较
-		if tag, _ := r.Metadata["embedder"].(string); tag != "" && tag != string(backend) {
+	vecScored := make([]SearchResult, 0, len(cands))
+	for _, r := range cands {
+		if len(r.Embedding) != len(qvec) {
 			continue
 		}
-		if len(r.Embedding) == 0 || len(r.Embedding) != len(qvec) {
+		vecScored = append(vecScored, SearchResult{Record: r, Score: cosineSimilarity(qvec, r.Embedding)})
+	}
+	sortByScoreDesc(vecScored)
+
+	// 第二路：BM25（关键词）。embedding 降级到 SimpleEmbed 时，它几乎是唯一能命中的路。
+	terms := tokenize(query)
+	docs := make([][]string, len(cands))
+	for i, r := range cands {
+		docs[i] = tokenize(r.Content)
+	}
+	kw := newBM25(docs).score(terms)
+	kwScored := make([]SearchResult, 0, len(cands))
+	for i, r := range cands {
+		if kw[i] > 0 {
+			kwScored = append(kwScored, SearchResult{Record: r, Score: kw[i]})
+		}
+	}
+	sortByScoreDesc(kwScored)
+
+	// RRF 融合：两路各取前 30 名参与（两路绝对分数量纲不同，只比排名）
+	cut := func(rs []SearchResult) []SearchResult {
+		if len(rs) > 30 {
+			return rs[:30]
+		}
+		return rs
+	}
+	vecRank := idsOf(cut(vecScored))
+	kwRank := idsOf(cut(kwScored))
+	fused := rrfFuse([][]string{vecRank, kwRank}, 60.0)
+
+	byID := make(map[string]SearchResult, len(vecScored))
+	for _, r := range vecScored {
+		byID[r.Record.ID] = r
+	}
+	out := make([]SearchResult, 0, len(fused))
+	for id, fuse := range fused {
+		r, ok := byID[id]
+		if !ok {
+			for _, k := range kwScored {
+				if k.Record.ID == id {
+					r = k
+					break
+				}
+			}
+		}
+		if r.Record.ID == "" {
 			continue
 		}
-		scored = append(scored, SearchResult{Record: r, Score: cosineSimilarity(qvec, r.Embedding)})
+		r.Fused = fuse
+		out = append(out, r)
+	}
+	sortByFusedDesc(out)
+
+	// 阈值过滤：语义后端下丢掉不相关结果（否则 RAG 会拿噪声充上下文）
+	if backend == EmbedBackendOllama {
+		kept := out[:0]
+		for _, r := range out {
+			if r.Score < minVecScore && r.Fused < 0.016 {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		out = kept
 	}
 
-	// 长度归一排序：短文本在 embedding 空间中天然虚高，按长度折扣参与排序
-	// （仅影响排序，Score 字段保持原始余弦值）
-	effective := func(r SearchResult) float64 {
-		f := float64(len([]rune(r.Record.Content))) / 160.0
-		if f > 1 {
-			f = 1
-		}
-		return r.Score * (0.75 + 0.25*f)
+	// MMR 去重：硬切 + 80 字重叠会让同一自然段产生多个近似块
+	out = mmrDiversify(out, topK, 0.7)
+	if len(out) > topK {
+		out = out[:topK]
 	}
+	return out, nil
+}
 
-	// 简单插入排序（KB 规模小，避免引入额外依赖）
-	for i := 1; i < len(scored); i++ {
-		for j := i; j > 0 && effective(scored[j]) > effective(scored[j-1]); j-- {
-			scored[j], scored[j-1] = scored[j-1], scored[j]
-		}
+func idsOf(rs []SearchResult) []string {
+	ids := make([]string, 0, len(rs))
+	for _, r := range rs {
+		ids = append(ids, r.Record.ID)
 	}
-	if len(scored) > topK {
-		scored = scored[:topK]
-	}
-	return scored, nil
+	return ids
+}
+
+func sortByScoreDesc(rs []SearchResult) {
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].Score > rs[j].Score })
+}
+
+func sortByFusedDesc(rs []SearchResult) {
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].Fused > rs[j].Fused })
 }
 
 // GetContext 拼接检索上下文（供 RAG 节点）
@@ -125,19 +217,35 @@ func (s *RAGServiceV3) GetContext(query string, topK int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return s.ContextFrom(results), nil
+}
+
+// ContextFrom 把检索结果拼成上下文文本。
+// 单独拆出来：RAG 节点可以只检索一次，同时拿到文本上下文与结构化引用。
+func (s *RAGServiceV3) ContextFrom(results []SearchResult) string {
 	if len(results) == 0 {
-		return "", nil
+		return ""
 	}
 	var sb strings.Builder
 	sb.WriteString("以下是相关参考资料：\n\n")
 	for i, r := range results {
-		src := r.Record.Source
-		if src == "" {
-			src = "FlowEdge 手册"
-		}
-		sb.WriteString(fmt.Sprintf("[%d] (%s, 相似度 %.2f) %s\n", i+1, src, r.Score, r.Record.Content))
+		sb.WriteString(fmt.Sprintf("[%d] %s %s\n", i+1, refLabel(r), r.Record.Content))
 	}
-	return sb.String(), nil
+	return sb.String()
+}
+
+// refLabel 生成可溯源的引用标签：source.md#chunk3 (语义相似度 0.72)
+func refLabel(r SearchResult) string {
+	rec := r.Record
+	src := rec.Source
+	if src == "" {
+		src = "FlowEdge 手册"
+	}
+	idx := 0
+	if v, ok := rec.Metadata["chunk_index"].(float64); ok {
+		idx = int(v)
+	}
+	return fmt.Sprintf("(来源: %s#chunk%d, 语义相似度 %.2f)", src, idx, r.Score)
 }
 
 // Count / List / Delete 透传

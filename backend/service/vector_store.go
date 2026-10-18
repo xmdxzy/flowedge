@@ -24,8 +24,29 @@ type VectorRecord struct {
 
 // SearchResult 搜索结果
 type SearchResult struct {
-	Record   VectorRecord
-	Score    float64
+	Record VectorRecord
+	Score  float64 // 语义（向量）相关度；BM25 一路独有结果时为关键词分
+	Fused  float64 // 融合排名分（RRF），排序依据
+}
+
+// AddBatch 批量添加，只在最后一次写盘。
+// 原实现每块一次 Add，每次都全量 marshal 覆写 vectors.json，导入 N 块是 O(n²)。
+func (s *VectorStore) AddBatch(records []VectorRecord) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]string, 0, len(records))
+	for i := range records {
+		if records[i].ID == "" {
+			records[i].ID = generateID(len(s.records) + i)
+		}
+		ids = append(ids, records[i].ID)
+	}
+	s.records = append(s.records, records...)
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // VectorStore 内存向量存储
