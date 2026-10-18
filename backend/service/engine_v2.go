@@ -430,7 +430,7 @@ func (e *EngineV2) execTTSNode(node *model.NodeInstance, upstream map[string]int
 		return nil, fmt.Errorf("tts node has no text input")
 	}
 
-	outputPath := "/tmp/output.wav"
+	outputPath := fmt.Sprintf("data/generated/tts-%d.wav", time.Now().UnixNano())
 	if p, ok := node.Data["output_path"].(string); ok {
 		outputPath = p
 	}
@@ -465,7 +465,7 @@ func (e *EngineV2) execVideoNode(node *model.NodeInstance, upstream map[string]i
 		return nil, fmt.Errorf("video compose node has no image input")
 	}
 
-	outputPath := "/tmp/output.mp4"
+	outputPath := fmt.Sprintf("data/generated/video-%d.mp4", time.Now().UnixNano())
 	if p, ok := node.Data["output_path"].(string); ok {
 		outputPath = p
 	}

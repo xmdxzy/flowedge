@@ -1,0 +1,10 @@
+# 构建上下文瘦身：排除运行时产物与本地产物
+.git
+backend/data
+backend/local-services/.venv
+backend/flowedge.exe
+frontend/node_modules
+frontend/dist
+**/*.db
+**/*.log
+**/.DS_Store

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -261,10 +262,18 @@ func (s *ASRService) Transcribe(audioPath string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return "", fmt.Errorf("asr service returned status %d: %s", resp.StatusCode, string(body))
+	}
+
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
 	text, _ := result["text"].(string)
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("asr service returned empty transcription")
+	}
 	return text, nil
 }
 
@@ -301,6 +310,11 @@ func (s *TTSService) Synthesize(text string, outputPath string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return fmt.Errorf("tts service returned status %d: %s", resp.StatusCode, string(body))
+	}
+
 	// 保存音频文件
 	out, err := os.Create(outputPath)
 	if err != nil {
@@ -308,8 +322,14 @@ func (s *TTSService) Synthesize(text string, outputPath string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	n, err := io.Copy(out, resp.Body)
+	if err != nil {
+		return err
+	}
+	if n < 1000 {
+		return fmt.Errorf("tts service returned too-small audio (%d bytes)", n)
+	}
+	return nil
 }
 
 // VideoService 视频处理服务（FFmpeg）

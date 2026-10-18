@@ -37,3 +37,6 @@ Thumbs.db
 # 日志
 *.log
 logs/
+
+# 本地服务虚拟环境
+backend/local-services/.venv/
