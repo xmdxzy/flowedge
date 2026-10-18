@@ -11,6 +11,12 @@
 - ✅ 并行汇合策略：`join: any`（任一前驱完成即执行）/ `continue_on_error`（失败不中断、错误对象向下游传播）
 - ✅ 工具调用：LLM 节点可挂内置工具（知识库检索 / HTTP 查询 / 计算器 / 当前时间），模型自行决定调用，全部本地执行
 - ✅ 知识库目录批量导入（递归、自动跳过 node_modules/.git/.venv/data）
+- ✅ **变量系统**：节点可引用任意已完成节点的输出 `{{nodeId.field}}`，跨并行分支取值，面板一键复制
+- ✅ **触发器**：Webhook（外部 POST 即触发，token 即凭据）+ Cron 定时（五段式表达式 + 分钟级去重）
+- ✅ **执行控制**：取消进行中的运行（已完成的节点保留）、执行记录列表与节点耗时瀑布图
+- ✅ **产物画廊**：生成的图片 / 视频 / 音频统一浏览、预览、复制路径复用
+- ✅ **命令面板**：`Ctrl/Cmd + K` 搜索节点、模板、面板、动作
+- ✅ 画布空状态引导、节点图标体系、可用变量提示
 - ✅ Ollama 本地 LLM 集成（OpenAI 兼容接口 + 流式输出）
 - ✅ SQLite 零依赖持久化（工作流、执行记录、版本快照），可选 PostgreSQL
 - ✅ GPU 显存调度器（LRU 缓存 + 三级水位线 70%/85%/92%）
@@ -224,6 +230,34 @@ ollama pull qwen2.5:7b
 - `POST /api/workflows/:id/run` - 执行工作流
 - `GET /api/workflows/:id/runs` - 列出执行历史
 - `GET /api/runs/:runId` - 获取执行状态
+
+### 触发器
+- `GET /api/workflows/:id/trigger` - 读取触发器配置（token / cron / 上次触发）
+- `PUT /api/workflows/:id/trigger` - 设置 cron 与启用状态
+- `POST /api/workflows/:id/trigger/rotate` - 重新生成 token（旧链接失效）
+- `POST /api/hooks/:token` - **公开**触发端点：外部系统 POST 即执行
+
+### 运行控制与产物
+- `POST /api/runs/:runId/cancel` - 中止进行中的运行
+- `GET /api/artifacts` - 列出生成的图片 / 视频 / 音频
+- `GET /api/artifacts/:name` - 获取单个产物
+- `DELETE /api/artifacts/:name` - 删除产物
+- `GET /api/capabilities` - 部署环境自检（GPU / Ollama / ComfyUI / ffmpeg / ASR / TTS）
+- `GET /api/health` - 轻量探活
+
+### 变量语法
+
+节点数据里任何字符串字段都可以引用其他节点的输出：
+
+```
+{{llm-1.text}}          上游 LLM 的文本输出
+{{http-2.status_code}}  HTTP 节点的状态码
+{{loop-3.iterations}}   循环执行了几轮
+{{loop-3.stopped_by}}   循环的停止原因
+```
+
+- 只替换「已完成节点」的引用，未完成的保留原文（便于排障）
+- `{{input}}` 属于 `data_transform` 的模板语法，不会被变量解析动过
 
 ### 版本
 - `GET /api/workflows/:id/versions` - 列出所有版本

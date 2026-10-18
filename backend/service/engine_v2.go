@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -36,6 +37,8 @@ type EngineV2 struct {
 	gpuSched        *GPUScheduler
 	wsHub           *WSHub
 	tools           *ToolExecutor
+	runMu           sync.Mutex
+	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
 	depth           atomic.Int32                       // 当前嵌套深度
 }
@@ -75,6 +78,38 @@ func NewEngineV2(
 }
 
 // Execute 执行工作流（按层并行 DAG + 按边传递输入 + 分支级联跳过 + 节点超时）
+// ExecuteWithRunID 可取消的执行入口：注册 runID → 取消函数
+func (e *EngineV2) ExecuteWithRunID(nodesJSON, edgesJSON []byte, runID uint, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	e.runMu.Lock()
+	if e.activeRuns == nil {
+		e.activeRuns = make(map[uint]context.CancelFunc)
+	}
+	e.activeRuns[runID] = cancel
+	e.runMu.Unlock()
+
+	defer func() {
+		cancel()
+		e.runMu.Lock()
+		delete(e.activeRuns, runID)
+		e.runMu.Unlock()
+	}()
+
+	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, persist)
+}
+
+// CancelRun 中止一个正在运行的工作流，返回是否找到该运行
+func (e *EngineV2) CancelRun(runID uint) bool {
+	e.runMu.Lock()
+	defer e.runMu.Unlock()
+	if cancel, ok := e.activeRuns[runID]; ok {
+		cancel()
+		return true
+	}
+	return false
+}
+
 func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, error) {
 	return e.run(nodesJSON, edgesJSON, nil, nil)
 }
@@ -91,6 +126,10 @@ func (e *EngineV2) Resume(nodesJSON, edgesJSON []byte, prevStates []model.NodeIn
 
 // run 引擎主循环
 func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	return e.runWithContext(context.Background(), nodesJSON, edgesJSON, prev, persist)
+}
+
+func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []byte, prev []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
 	var nodes []model.NodeInstance
 	var edges []model.EdgeInstance
 
@@ -108,6 +147,7 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 	remaining := make(map[string]int)                     // 该节点尚未完成的前驱数
 	nodeInputs := make(map[string]map[string]interface{}) // nodeID -> {sourceID: output}
 	preds := make(map[string][]string)                    // nodeID -> 前驱列表（判断分支是否会合）
+	runCtx := make(map[string]interface{})                // 变量系统：已完成节点的输出（{{id.text}}）
 
 	// 断点回填：上次 success 的节点复用输出；skipped 重置为 pending
 	// （由本轮执行重新裁剪分支）；failed/running/pending 重跑
@@ -228,6 +268,18 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 	const nodeTimeout = 180 * time.Second
 
 	for len(current) > 0 {
+		// 每层开始前检查取消：节点内部无法中断，但已完成的层不会浪费
+		select {
+		case <-ctx.Done():
+			for _, id := range order {
+				if nodeMap[id].Status == "pending" {
+					nodeMap[id].Status = "skipped"
+				}
+			}
+			return nodes, fmt.Errorf("运行已取消")
+		default:
+		}
+
 		var wg sync.WaitGroup
 		next := []string{}
 		inNext := map[string]bool{}
@@ -283,6 +335,15 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 				for k, v := range nodeInputs[nid] {
 					upstream[k] = v
 				}
+				// 变量解析：把 {{nodeId.field}} 换成上游输出。
+				// 用 data 的副本执行，避免替换结果被写回工作流定义
+				ctxSnapshot := make(map[string]interface{}, len(runCtx))
+				for k, v := range runCtx {
+					ctxSnapshot[k] = v
+				}
+				nodeCopy := *node
+				nodeCopy.Data = resolveData(node.Data, ctxSnapshot)
+				execNode := &nodeCopy
 				mu.Unlock()
 
 				if e.wsHub != nil {
@@ -317,7 +378,7 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 					}
 					resCh := make(chan execResult, 1)
 					go func() {
-						o, err := e.executeNode(node, upstream)
+						o, err := e.executeNode(execNode, upstream)
 						resCh <- execResult{o, err}
 					}()
 					select {
@@ -366,6 +427,7 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 
 				node.Status = "success"
 				node.Output = out
+				runCtx[nid] = out // 供下游节点以 {{nid.field}} 引用
 				mu.Unlock()
 				if e.wsHub != nil {
 					e.wsHub.Broadcast(Event{Type: "node_finished", NodeID: nid, Data: map[string]interface{}{"output": out}})

@@ -134,9 +134,23 @@ func main() {
 		c.Next()
 	})
 
+	// handlers（cron 调度器也要用到 wfHandler，故在路由组之前构造）
+	wfHandler := handler.NewWorkflowHandler(db, engine)
+	triggerHandler := handler.NewTriggerHandler(db, wfHandler)
+
+	// 定时触发器：每 20 秒扫描一次启用了 cron 的工作流（分钟级去重）
+	cronScheduler := service.NewCronScheduler(db, func(id uint) error {
+		var wf model.Workflow
+		if err := db.First(&wf, id).Error; err != nil {
+			return err
+		}
+		wfHandler.StartRun(&wf)
+		return nil
+	})
+	cronScheduler.Start(20 * time.Second)
+
 	api := r.Group("/api")
 	{
-		wfHandler := handler.NewWorkflowHandler(db, engine)
 		versionHandler := handler.NewVersionHandler(db)
 		wsHandler := handler.NewWSHandler(wsHub)
 
@@ -150,6 +164,7 @@ func main() {
 		api.GET("/workflows/:id/runs", wfHandler.ListRuns)
 		api.GET("/runs/:runId", wfHandler.GetRun)
 		api.POST("/runs/:runId/resume", wfHandler.ResumeRun)
+		api.POST("/runs/:runId/cancel", wfHandler.CancelRun)
 
 		// 项目专属知识库
 		kbHandler := handler.NewKBHandler(ragService)
@@ -170,6 +185,21 @@ func main() {
 		// GPU 状态接口
 		api.GET("/gpu/status", func(c *gin.Context) {
 			c.JSON(200, gpuSched.GetSchedulerStatus())
+		})
+
+		// 产物管理（生成的图片 / 视频 / 音频）
+		artifactHandler := handler.NewArtifactHandler(getEnv("GENERATED_DIR", "data/generated"))
+		api.GET("/artifacts", artifactHandler.List)
+		api.GET("/artifacts/:name", artifactHandler.Serve)
+		api.DELETE("/artifacts/:name", artifactHandler.Delete)
+
+		// 触发器：Webhook（外部调用）+ Cron（定时）
+		api.GET("/workflows/:id/trigger", triggerHandler.Get)
+		api.PUT("/workflows/:id/trigger", triggerHandler.Update)
+		api.POST("/workflows/:id/trigger/rotate", triggerHandler.Rotate)
+		api.POST("/hooks/:token", triggerHandler.Webhook)
+		api.GET("/triggers", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"schedules": cronScheduler.CronSummary()})
 		})
 
 		// WebSocket 实时推送
@@ -244,15 +274,14 @@ func initDB(cfg *config.Config) *gorm.DB {
 
 // mountStatic 挂载前端资源：外部目录 > exe 内嵌 > 明确的排障页
 func mountStatic(r *gin.Engine) {
+	// 显式指定 > 同目录构建产物 > 内嵌 > 开发态的前端目录
+	// （内嵌优先于 ../frontend/dist：否则打包后的 exe 放在 dist/ 里运行时，
+	//   会意外加载仓库里的旧构建，而不是自己内嵌的那份）
 	candidates := []string{}
 	if dir := os.Getenv("STATIC_DIR"); dir != "" {
 		candidates = append(candidates, config.Resolve(dir))
 	}
-	candidates = append(candidates,
-		config.Resolve(filepath.Join("web", "static")),
-		config.Resolve(filepath.Join("..", "frontend", "dist")),
-		config.Resolve(filepath.Join("frontend", "dist")),
-	)
+	candidates = append(candidates, config.Resolve(filepath.Join("web", "static")))
 
 	spaHandler := func(root fs.FS, fileServer http.FileSystem, label string) {
 		r.NoRoute(func(c *gin.Context) {
@@ -294,6 +323,17 @@ func mountStatic(r *gin.Engine) {
 	if embedded := web.Dist(); embedded != nil {
 		spaHandler(embedded, http.FS(embedded), "已内嵌在 exe 中")
 		return
+	}
+
+	// 开发态兜底：从 backend/ 目录运行时用仓库里的前端构建
+	for _, dir := range []string{
+		config.Resolve(filepath.Join("..", "frontend", "dist")),
+		config.Resolve(filepath.Join("frontend", "dist")),
+	} {
+		if _, err := os.Stat(filepath.Join(dir, "index.html")); err == nil {
+			spaHandler(os.DirFS(dir), http.Dir(dir), "开发目录 "+dir)
+			return
+		}
 	}
 
 	r.NoRoute(func(c *gin.Context) {

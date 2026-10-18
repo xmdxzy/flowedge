@@ -36,6 +36,9 @@ import ExecutionPanel from './components/ExecutionPanel'
 import ContextMenu from './components/ContextMenu'
 import DebugPanel from './components/DebugPanel'
 import CapabilityPanel from './components/CapabilityPanel'
+import TriggerPanel from './components/TriggerPanel'
+import GalleryPanel from './components/GalleryPanel'
+import CommandPalette, { type CommandItem } from './components/CommandPalette'
 import KBPanel from './components/KBPanel'
 
 const nodeTypes: NodeTypes = {
@@ -52,6 +55,55 @@ const nodeTypes: NodeTypes = {
   http_request: HTTPNode,
   data_transform: TransformNode,
   rag_query: RAGNode,
+}
+
+// 节点库（数据驱动：新增节点类型只需在这里加一行）
+const PALETTE: { label: string; items: { type: string; label: string; icon: string; tone: string }[] }[] = [
+  {
+    label: '控制',
+    items: [
+      { type: 'start', label: '开始', icon: '▶', tone: 'tone-control' },
+      { type: 'end', label: '结束', icon: '■', tone: 'tone-control' },
+      { type: 'if_else', label: '条件分支', icon: '⑂', tone: 'tone-warn' },
+      { type: 'loop', label: '循环', icon: '⟳', tone: 'tone-warn' },
+      { type: 'sub_workflow', label: '子工作流', icon: '⧉', tone: 'tone-purple' },
+    ],
+  },
+  {
+    label: 'AI 推理',
+    items: [
+      { type: 'llm', label: '大语言模型', icon: '✦', tone: 'tone-ai' },
+      { type: 'text2image', label: '文生图', icon: '◈', tone: 'tone-ai' },
+      { type: 'rag_query', label: '知识库检索', icon: '⌕', tone: 'tone-ai' },
+    ],
+  },
+  {
+    label: '多模态',
+    items: [
+      { type: 'asr', label: '语音转写', icon: '♪', tone: 'tone-multimodal' },
+      { type: 'tts', label: '语音合成', icon: '◍', tone: 'tone-multimodal' },
+      { type: 'video_compose', label: '视频合成', icon: '▤', tone: 'tone-purple' },
+    ],
+  },
+  {
+    label: '数据处理',
+    items: [
+      { type: 'http_request', label: 'HTTP 请求', icon: '⇄', tone: 'tone-data' },
+      { type: 'data_transform', label: '数据转换', icon: '⇋', tone: 'tone-muted' },
+    ],
+  },
+]
+
+// 各节点类型的常用输出字段（用于变量提示；与后端 defaultOutputFields 对齐）
+const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
+  http_request: ['text', 'status_code'],
+  if_else: ['text', 'branch'],
+  loop: ['text', 'all', 'iterations', 'stopped_by'],
+  text2image: ['image'],
+  video_compose: ['video'],
+  tts: ['audio'],
+  asr: ['text'],
+  rag_query: ['text'],
 }
 
 // LLM 节点可用的内置工具（后端 service/tools.go 实现，全部本地执行）
@@ -115,9 +167,24 @@ function FlowEditor() {
   const [canResume, setCanResume] = useState(false)
   const [kbOpen, setKbOpen] = useState(false)
   const [envOpen, setEnvOpen] = useState(false)
+  const [triggerOpen, setTriggerOpen] = useState(false)
+  const [galleryOpen, setGalleryOpen] = useState(false)
+  const [cmdOpen, setCmdOpen] = useState(false)
   const streamBufRef = useRef<Map<string, string>>(new Map())
   const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
+
+  // 命令面板：Ctrl/Cmd + K 随时唤起
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setCmdOpen((v) => !v)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // 加载已保存的工作流列表
   const loadWorkflows = async () => {
@@ -590,136 +657,75 @@ function FlowEditor() {
     }
   }
 
+  // 命令面板条目：节点 / 模板 / 面板 / 动作
+  const buildCommands = (): CommandItem[] => {
+    const list: CommandItem[] = []
+    PALETTE.forEach((sec) =>
+      sec.items.forEach((it) =>
+        list.push({
+          id: `node-${it.type}`,
+          label: `添加节点：${it.label}`,
+          icon: it.icon,
+          section: '节点',
+          run: () => addNode(it.type),
+        }),
+      ),
+    )
+    workflowTemplates.forEach((t) =>
+      list.push({
+        id: `tpl-${t.id}`,
+        label: `套用模板：${t.name}`,
+        hint: t.description,
+        icon: '▦',
+        section: '模板',
+        run: () => loadTemplate(t),
+      }),
+    )
+    list.push(
+      { id: 'panel-kb', label: '打开知识库', icon: '⌕', section: '面板', run: () => setKbOpen(true) },
+      { id: 'panel-env', label: '查看运行环境', icon: '◍', section: '面板', run: () => setEnvOpen(true) },
+      { id: 'panel-trigger', label: '配置触发器', icon: '⚡', section: '面板', run: () => setTriggerOpen(true) },
+      { id: 'panel-gallery', label: '打开产物画廊', icon: '▣', section: '面板', run: () => setGalleryOpen(true) },
+      { id: 'act-run', label: '运行工作流', hint: 'Ctrl+Enter', icon: '▶', section: '动作', run: () => runWorkflow() },
+      { id: 'act-save', label: '保存工作流', icon: '▤', section: '动作', run: () => saveWorkflow() },
+    )
+    return list
+  }
+
   return (
     <div className="flex h-screen w-screen">
       {/* 左侧节点库 */}
       <div className="w-56 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
-        <h3 className="text-sm font-semibold text-gray-300 mb-2">节点库</h3>
-
-        <div className="fe-section-label mb-1">控制（拖拽到画布）</div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'start')}
-          onClick={() => addNode('start')}
-          className="fe-palette-item flex items-center gap-2 px-3 py-2 text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-control" />
-          <span className="text-sm">开始</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'end')}
-          onClick={() => addNode('end')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-output transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-output" />
-          <span className="text-sm">结束</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'if_else')}
-          onClick={() => addNode('if_else')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-warning" />
-          <span className="text-sm">条件分支</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'loop')}
-          onClick={() => addNode('loop')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-warning" />
-          <span className="text-sm">循环</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'sub_workflow')}
-          onClick={() => addNode('sub_workflow')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-purple" />
-          <span className="text-sm">子工作流</span>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-sm font-semibold text-gray-300">节点库</h3>
+          <button
+            onClick={() => setCmdOpen(true)}
+            title="命令面板（Ctrl/Cmd + K）"
+            className="text-[10px] text-gray-500 hover:text-white border border-border rounded px-1.5 py-0.5 font-mono"
+          >
+            ⌘K
+          </button>
         </div>
 
-        <div className="fe-section-label mt-3 mb-1">AI 推理</div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'llm')}
-          onClick={() => addNode('llm')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-ai transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-ai" />
-          <span className="text-sm">大语言模型</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'text2image')}
-          onClick={() => addNode('text2image')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-data transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-data" />
-          <span className="text-sm">文生图</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'rag_query')}
-          onClick={() => addNode('rag_query')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-indigo-500 transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-indigo-500" />
-          <span className="text-sm">知识库检索</span>
-        </div>
-
-        <div className="fe-section-label mt-3 mb-1">多模态</div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'asr')}
-          onClick={() => addNode('asr')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-warning" />
-          <span className="text-sm">语音转写</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'tts')}
-          onClick={() => addNode('tts')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-success transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-success" />
-          <span className="text-sm">语音合成</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'video_compose')}
-          onClick={() => addNode('video_compose')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-purple" />
-          <span className="text-sm">视频合成</span>
-        </div>
-
-        <div className="fe-section-label mt-3 mb-1">数据处理</div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'http_request')}
-          onClick={() => addNode('http_request')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-cyan-500 transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-cyan-500" />
-          <span className="text-sm">HTTP 请求</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'data_transform')}
-          onClick={() => addNode('data_transform')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-gray-500 transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-gray-500" />
-          <span className="text-sm">数据转换</span>
-        </div>
+        {PALETTE.map((section) => (
+          <div key={section.label}>
+            <div className="fe-section-label mt-1 mb-1">{section.label}</div>
+            <div className="flex flex-col gap-1">
+              {section.items.map((item) => (
+                <div
+                  key={item.type}
+                  draggable
+                  onDragStart={(e) => onDragStart(e, item.type)}
+                  onClick={() => addNode(item.type)}
+                  className="fe-palette-item flex items-center gap-2 px-2.5 py-1.5 text-left cursor-grab active:cursor-grabbing"
+                >
+                  <span className={`fe-palette-icon ${item.tone}`}>{item.icon}</span>
+                  <span className="text-xs">{item.label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
 
         {/* 模板库 */}
         <div className="fe-section-label mt-3 mb-1">模板</div>
@@ -815,6 +821,20 @@ function FlowEditor() {
               知识库
             </button>
             <button
+              onClick={() => setGalleryOpen(true)}
+              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+              title="浏览生成的图片 / 视频 / 音频"
+            >
+              产物
+            </button>
+            <button
+              onClick={() => setTriggerOpen(true)}
+              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+              title="Webhook 调用与定时运行"
+            >
+              ⚡ 触发
+            </button>
+            <button
               onClick={() => setEnvOpen(true)}
               className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
               title="查看 GPU / Ollama / ComfyUI / ffmpeg / 语音服务的可用状态"
@@ -854,7 +874,36 @@ function FlowEditor() {
 
         {/* 画布 */}
         <div className="flex-1 flex flex-col">
-          <div className="flex-1">
+          <div className="flex-1 relative">
+            {/* 空状态引导 */}
+            {nodes.length === 0 && (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center pointer-events-none">
+                <div className="pointer-events-auto flex flex-col items-center gap-3 px-8 py-7 rounded-2xl border border-border/70 bg-surface/60 backdrop-blur-sm">
+                  <div className="fe-logo-mark" style={{ width: 40, height: 40, borderRadius: 12 }}>
+                    <svg width="20" height="20" viewBox="0 0 16 16" fill="none">
+                      <path d="M9 1L3 9h4l-1 6 6-8H8l1-6z" fill="white" />
+                    </svg>
+                  </div>
+                  <p className="text-sm text-white font-medium">画布是空的</p>
+                  <p className="text-[11px] text-gray-500 -mt-1">从左侧拖一个节点，或直接套用模板</p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <button
+                      onClick={() => setCmdOpen(true)}
+                      className="fe-btn-primary px-3 py-1.5 rounded-lg text-xs"
+                    >
+                      打开命令面板
+                    </button>
+                    <button
+                      onClick={() => addNode('start')}
+                      className="fe-btn-ghost px-3 py-1.5 rounded-lg text-xs"
+                    >
+                      添加开始节点
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <ReactFlow
               nodes={nodes}
               edges={edges}
@@ -916,6 +965,15 @@ function FlowEditor() {
       {/* 运行环境自检面板 */}
       {envOpen && <CapabilityPanel onClose={() => setEnvOpen(false)} />}
 
+      {/* 触发器面板 */}
+      {triggerOpen && <TriggerPanel workflowId={currentWorkflowId} onClose={() => setTriggerOpen(false)} />}
+
+      {/* 产物画廊 */}
+      {galleryOpen && <GalleryPanel onClose={() => setGalleryOpen(false)} />}
+
+      {/* 命令面板 */}
+      {cmdOpen && <CommandPalette items={buildCommands()} onClose={() => setCmdOpen(false)} />}
+
       {/* 右侧属性面板 */}
       <div className="w-72 border-l border-border bg-surface p-4 overflow-y-auto">
         {/* Tab 切换 */}
@@ -937,6 +995,46 @@ function FlowEditor() {
               <label className="text-xs text-gray-400 block mb-1">节点类型</label>
               <p className="text-sm text-white">{selectedNode.type}</p>
             </div>
+
+            {/* 可用变量：列出上游节点输出，点击复制引用写法 */}
+            {(() => {
+              const ups = nodes.filter((n) =>
+                edges.some((e) => e.target === selectedNode.id && e.source === n.id),
+              )
+              if (ups.length === 0) return null
+              return (
+                <div className="mb-3 pb-3 border-b border-border">
+                  <label className="text-[10px] text-gray-500 uppercase tracking-wider block mb-1.5">
+                    可用变量（点击复制）
+                  </label>
+                  <div className="flex flex-wrap gap-1">
+                    {ups.flatMap((u) =>
+                      ['text', ...(NODE_OUTPUT_FIELDS[u.type as string] || [])]
+                        .filter((f, i, arr) => arr.indexOf(f) === i)
+                        .map((f) => (
+                          <button
+                            key={`${u.id}.${f}`}
+                            onClick={async () => {
+                              const ref = `{{${u.id}.${f}}}`
+                              try {
+                                await navigator.clipboard.writeText(ref)
+                                setRunResult(`已复制 ${ref}`)
+                              } catch {
+                                setRunResult(ref)
+                              }
+                            }}
+                            title={`${u.id} (${u.type}) 的 ${f} 输出`}
+                            className="text-[9px] px-1.5 py-0.5 rounded bg-primary/10 text-indigo-300 font-mono hover:bg-primary/25 transition-all"
+                          >
+                            {`{{${u.id}.${f}}}`}
+                          </button>
+                        )),
+                    )}
+                  </div>
+                  <p className="text-[10px] text-gray-600 mt-1">上游节点完成后即可引用，未完成时保留原文</p>
+                </div>
+              )
+            })()}
 
             {selectedNode.type === 'start' && (
               <div>

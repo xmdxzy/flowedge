@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -85,18 +86,11 @@ func (h *WorkflowHandler) Delete(c *gin.Context) {
 }
 
 // Run 执行工作流
-func (h *WorkflowHandler) Run(c *gin.Context) {
-	id := c.Param("id")
-	var wf model.Workflow
-	if err := h.db.First(&wf, id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
-		return
-	}
-
+// StartRun 创建执行记录并异步跑完（触发器与手动运行共用同一条路径）
+func (h *WorkflowHandler) StartRun(wf *model.Workflow) *model.WorkflowRun {
 	nodesJSON := []byte(wf.Nodes)
 	edgesJSON := []byte(wf.Edges)
 
-	// 创建执行记录
 	now := time.Now()
 	run := model.WorkflowRun{
 		WorkflowID: wf.ID,
@@ -115,29 +109,49 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 			Update("node_states", json.RawMessage(statesJSON))
 	}
 
-	// 异步执行
 	go func() {
-		nodeStates, err := h.engine.ExecutePersistent(nodesJSON, edgesJSON, persist)
+		// 走可取消入口：前端可对进行中的运行发起中止
+		nodeStates, err := h.engine.ExecuteWithRunID(nodesJSON, edgesJSON, run.ID, persist)
 
 		endNow := time.Now()
 		run.EndedAt = &endNow
-
 		if err != nil {
 			run.Status = "failed"
 			run.Error = err.Error()
 		} else {
 			run.Status = "success"
 		}
-
 		statesJSON, _ := json.Marshal(nodeStates)
 		run.NodeStates = json.RawMessage(statesJSON)
 		h.db.Save(&run)
 	}()
 
-	c.JSON(http.StatusAccepted, gin.H{
-		"run_id": run.ID,
-		"status": "running",
-	})
+	return &run
+}
+
+// CancelRun 中止进行中的运行（已完成的节点保留，剩余标记为 skipped）
+func (h *WorkflowHandler) CancelRun(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("runId"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid run id"})
+		return
+	}
+	if !h.engine.CancelRun(uint(id)) {
+		c.JSON(http.StatusConflict, gin.H{"error": "该运行已结束或未在进行中"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"run_id": id, "status": "cancelling"})
+}
+
+// Run 手动执行工作流
+func (h *WorkflowHandler) Run(c *gin.Context) {
+	var wf model.Workflow
+	if err := h.db.First(&wf, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
+		return
+	}
+	run := h.StartRun(&wf)
+	c.JSON(http.StatusAccepted, gin.H{"run_id": run.ID, "status": "running"})
 }
 
 // ResumeRun 断点续跑：复用上次成功节点的输出，只重跑失败/未执行节点

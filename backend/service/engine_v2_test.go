@@ -993,3 +993,80 @@ func TestParseTextToolCalls(t *testing.T) {
 		}
 	}
 }
+
+// 变量替换的基本行为：已知节点替换、未知节点/字段保留原文、{{input}} 不被动
+func TestResolveDataVariables(t *testing.T) {
+	ctx := map[string]interface{}{
+		"llm-1":  map[string]interface{}{"text": "摘要内容"},
+		"http-2": map[string]interface{}{"text": "ok", "status_code": float64(200)},
+		"meta-3": map[string]interface{}{"tags": []interface{}{"a", "b"}},
+		"loop-4": map[string]interface{}{"iterations": float64(3), "text": "done"},
+	}
+
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"前缀 {{llm-1.text}} 后缀", "前缀 摘要内容 后缀"},
+		{"状态 {{http-2.status_code}}", "状态 200"},
+		{"{{ loop-4.iterations }} 轮", "3 轮"},
+		{"{{meta-3.tags}}", `["a","b"]`},
+		{"{{missing.text}} 未完成", "{{missing.text}} 未完成"},
+		{"{{llm-1.nosuch}}", "{{llm-1.nosuch}}"},
+		{"保留 {{input}} 给模板节点", "保留 {{input}} 给模板节点"},
+		{"无变量", "无变量"},
+	}
+	for _, c := range cases {
+		if got := resolveString(c.in, ctx); got != c.want {
+			t.Errorf("resolveString(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	// 深拷贝：不能修改原始数据
+	orig := map[string]interface{}{"template": "{{llm-1.text}}", "nested": map[string]interface{}{"v": "{{llm-1.text}}"}}
+	out := resolveData(orig, ctx)
+	if orig["template"] != "{{llm-1.text}}" {
+		t.Error("resolveData mutated the source map")
+	}
+	if out["template"] != "摘要内容" {
+		t.Errorf("resolved template = %v", out["template"])
+	}
+	if n := out["nested"].(map[string]interface{}); n["v"] != "摘要内容" {
+		t.Errorf("nested value not resolved: %v", n["v"])
+	}
+}
+
+// 端到端：两条并行分支各自产出，汇合节点用变量把它们拼起来
+func TestEngine_VariablesAcrossBranches(t *testing.T) {
+	e := newTestEngine()
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
+		{"id": "t1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"template": "A"}},
+		{"id": "t2", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"template": "B"}},
+		{"id": "m1", "type": "data_transform", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{"template": "{{t1.text}}-{{t2.text}}"}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 3, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "t1"},
+		{"id": "b", "source": "s1", "target": "t2"},
+		{"id": "c", "source": "t1", "target": "m1"},
+		{"id": "d", "source": "t2", "target": "m1"},
+		{"id": "e", "source": "m1", "target": "e1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	for _, n := range states {
+		if n.ID == "m1" {
+			m := n.Output.(map[string]interface{})
+			if m["text"] != "A-B" {
+				t.Errorf("merge output = %v, want A-B (variable refs across parallel branches)", m["text"])
+			}
+			return
+		}
+	}
+	t.Fatal("merge node state missing")
+}

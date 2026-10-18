@@ -21,6 +21,7 @@ function LLMNode({ data, selected }: NodeProps) {
       {/* 头部 */}
       <div className="flex items-center gap-2 rounded-t-lg bg-gradient-to-r from-ai/20 to-ai/5 px-3 py-2 border-b border-border">
         <div className={`w-2 h-2 rounded-full ${statusColor}`} />
+        <span className="fe-node-icon">✦</span>
         <span className="text-xs font-semibold text-white">AI 推理</span>
         <span className="ml-auto text-[10px] text-gray-500 font-mono">LLM</span>
       </div>

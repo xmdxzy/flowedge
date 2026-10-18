@@ -263,3 +263,48 @@ input, textarea, select {
   min-width: 0;
   flex-shrink: 1;
 }
+
+/* ============ 节点库图标 ============ */
+.fe-palette-icon {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+}
+.tone-control { background: rgba(99, 102, 241, 0.14); color: #A5B4FC; border-color: rgba(99, 102, 241, 0.28); }
+.tone-warn { background: rgba(251, 191, 36, 0.14); color: #FBBF24; border-color: rgba(251, 191, 36, 0.28); }
+.tone-purple { background: rgba(192, 132, 252, 0.14); color: #C084FC; border-color: rgba(192, 132, 252, 0.28); }
+.tone-ai { background: rgba(167, 139, 250, 0.16); color: #C4B5FD; border-color: rgba(167, 139, 250, 0.3); }
+.tone-multimodal { background: rgba(52, 211, 153, 0.14); color: #6EE7B7; border-color: rgba(52, 211, 153, 0.28); }
+.tone-data { background: rgba(34, 211, 238, 0.14); color: #67E8F9; border-color: rgba(34, 211, 238, 0.28); }
+.tone-muted { background: rgba(148, 163, 184, 0.12); color: #94A3B8; border-color: rgba(148, 163, 184, 0.24); }
+
+/* ============ Toast ============ */
+.fe-toast {
+  animation: fe-toast-in 0.18s ease-out;
+}
+@keyframes fe-toast-in {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ============ 节点卡片图标 ============ */
+.fe-node-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  line-height: 1;
+  background: rgba(255, 255, 255, 0.09);
+  color: rgba(255, 255, 255, 0.85);
+  flex-shrink: 0;
+}

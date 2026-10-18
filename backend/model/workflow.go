@@ -7,12 +7,18 @@ import (
 
 // Workflow 工作流定义
 type Workflow struct {
-	ID        uint           `gorm:"primaryKey" json:"id"`
-	Name      string         `gorm:"size:255;not null" json:"name"`
+	ID        uint            `gorm:"primaryKey" json:"id"`
+	Name      string          `gorm:"size:255;not null" json:"name"`
 	Nodes     json.RawMessage `gorm:"type:text" json:"nodes"`
 	Edges     json.RawMessage `gorm:"type:text" json:"edges"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+
+	// 触发器：外部系统可通过 Webhook token 调用，或按 cron 定时执行
+	TriggerToken    string     `gorm:"size:64;index" json:"trigger_token"`
+	CronExpr        string     `gorm:"size:64" json:"cron_expr"`
+	TriggerEnabled  bool       `gorm:"default:false" json:"trigger_enabled"`
+	LastTriggeredAt *time.Time `json:"last_triggered_at"`
 }
 
 // WorkflowRun 工作流执行记录
