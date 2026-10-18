@@ -44,3 +44,4 @@ backend/local-services/.venv/
 # 桌面客户端
 desktop/node_modules/
 desktop/window-screenshot.png
+*.exe~
