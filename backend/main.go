@@ -91,6 +91,8 @@ func main() {
 	ttsURL := getEnv("TTS_BASE_URL", "")
 
 	t2iService := service.NewText2ImageService(comfyURL, getEnv("COMFYUI_CHECKPOINT", "flux1-schnell-fp8.safetensors"))
+	// 可选：指定 data/comfy_workflows/<name>.json 作为自定义工作流模板
+	t2iService.Template = getEnv("COMFYUI_TEMPLATE", "")
 	asrService := service.NewASRService(asrURL)
 	ttsService := service.NewTTSService(ttsURL)
 	videoService := service.NewVideoService()

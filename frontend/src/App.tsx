@@ -110,6 +110,15 @@ const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   code: ['text', 'code_out'],
 }
 
+// 节点 → 依赖的环境能力（缺了就标灰；用户仍可先编排，环境补齐后直接跑）
+const NODE_REQUIRES: Record<string, string> = {
+  llm: 'llm',
+  text2image: 'image',
+  asr: 'audio',
+  tts: 'audio',
+  video_compose: 'video',
+}
+
 // LLM 节点可用的内置工具（后端 service/tools.go 实现，全部本地执行）
 const LLM_TOOL_OPTIONS = [
   { id: 'kb_search', label: '知识库检索' },
@@ -175,6 +184,17 @@ function FlowEditor() {
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [cmdOpen, setCmdOpen] = useState(false)
   const [propTab, setPropTab] = useState<'config' | 'output'>('config')
+  // 环境就绪状态：用于把「当前跑不了」的节点标灰（仍可拖入画布，方便先编排）
+  const [envReady, setEnvReady] = useState<Record<string, boolean> | null>(null)
+
+  useEffect(() => {
+    fetch('/api/capabilities')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.capabilities?.ready) setEnvReady(d.capabilities.ready)
+      })
+      .catch(() => {})
+  }, [])
   const streamBufRef = useRef<Map<string, string>>(new Map())
   const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
@@ -789,7 +809,16 @@ function FlowEditor() {
                   draggable
                   onDragStart={(e) => onDragStart(e, item.type)}
                   onClick={() => addNode(item.type)}
-                  className="fe-palette-item flex items-center gap-2 px-2.5 py-1.5 text-left cursor-grab active:cursor-grabbing"
+                  title={
+                    NODE_REQUIRES[item.type] && envReady && !envReady[NODE_REQUIRES[item.type]]
+                      ? `当前环境未就绪（缺 ${NODE_REQUIRES[item.type]}），可以先把节点摆好，补齐环境后再运行`
+                      : undefined
+                  }
+                  className={`fe-palette-item flex items-center gap-2 px-2.5 py-1.5 text-left cursor-grab active:cursor-grabbing ${
+                    NODE_REQUIRES[item.type] && envReady && !envReady[NODE_REQUIRES[item.type]]
+                      ? 'opacity-45'
+                      : ''
+                  }`}
                 >
                   <span className={`fe-palette-icon ${item.tone}`}>{item.icon}</span>
                   <span className="text-xs">{item.label}</span>

@@ -10,6 +10,7 @@ import (
 // TestGPUScheduler_AcquireReleaseRefs 引用计数必须正确加减，且并发下不得自死锁
 func TestGPUScheduler_AcquireReleaseRefs(t *testing.T) {
 	done := make(chan struct{})
+	var refsAfter int
 	go func() {
 		defer close(done)
 		s := NewGPUScheduler(24576)
@@ -43,17 +44,18 @@ func TestGPUScheduler_AcquireReleaseRefs(t *testing.T) {
 		wg.Wait()
 
 		s.mu.Lock()
-		refs := s.models["m"].Refs
+		refsAfter = s.models["m"].Refs
 		s.mu.Unlock()
-		if refs < 0 {
-			t.Fatalf("refs went negative: %d", refs)
-		}
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(20 * time.Second):
 		t.Fatal("Acquire/Release 并发下死锁（GetGPUInfo 重入 s.mu）")
+	}
+	// 断言放在主 goroutine：从子 goroutine 调 Fatalf 会被 vet 判定为误用
+	if refsAfter < 0 {
+		t.Fatalf("refs went negative: %d", refsAfter)
 	}
 }
 

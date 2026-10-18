@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,6 +20,8 @@ import (
 type Text2ImageService struct {
 	BaseURL    string
 	Checkpoint string
+	OutputDir  string // 生成图片落盘目录（默认 data/generated）
+	Template   string // ComfyUI 工作流模板名（data/comfy_workflows/<name>.json）
 	client     *http.Client
 }
 
@@ -50,6 +54,61 @@ func (s *Text2ImageService) UnloadModels() error {
 		return fmt.Errorf("comfyui free status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ComfyTemplateDir ComfyUI 工作流模板目录（用户把自己的 workflow JSON 放这里即可接入）
+const ComfyTemplateDir = "data/comfy_workflows"
+
+// ListComfyTemplates 列出可用模板（文件名去 .json）——供前端下拉选择
+func ListComfyTemplates() []string {
+	entries, err := os.ReadDir(ComfyTemplateDir)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		out = append(out, strings.TrimSuffix(e.Name(), ".json"))
+	}
+	return out
+}
+
+// buildGraphFromTemplate 用模板 + 占位符替换构造 ComfyUI API 图。
+//
+// 约定：模板 JSON 里可写 __PROMPT__ / __NEGATIVE__ / __WIDTH__ / __HEIGHT__ / __SEED__ / __CHECKPOINT__，
+// 加载时做字符串替换。这样用户从 ComfyUI 导出的 API 格式工作流（Save (API Format)）
+// 改几个占位符就能直接用，不必学一套新的节点映射 DSL。
+func (s *Text2ImageService) buildGraphFromTemplate(name, prompt, negative string, width, height int, seed int64) (map[string]interface{}, error) {
+	raw, err := os.ReadFile(filepath.Join(ComfyTemplateDir, name+".json"))
+	if err != nil {
+		return nil, fmt.Errorf("读取模板 %s 失败：%w", name, err)
+	}
+
+	quote := func(v string) string {
+		b, _ := json.Marshal(v)
+		return strings.Trim(string(b), `"`)
+	}
+
+	text := string(raw)
+	repl := map[string]string{
+		"__PROMPT__":     quote(prompt),
+		"__NEGATIVE__":   quote(negative),
+		"__WIDTH__":      strconv.Itoa(width),
+		"__HEIGHT__":     strconv.Itoa(height),
+		"__SEED__":       strconv.FormatInt(seed, 10),
+		"__CHECKPOINT__": quote(s.Checkpoint),
+	}
+	for k, v := range repl {
+		text = strings.ReplaceAll(text, k, v)
+	}
+
+	var graph map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &graph); err != nil {
+		return nil, fmt.Errorf("模板 %s 不是合法 JSON：%w", name, err)
+	}
+	return graph, nil
 }
 
 // GenerateImage 生成图片：POST /prompt → 轮询 /history → GET /view 下载落盘，返回本地文件路径
@@ -125,6 +184,16 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 				"filename_prefix": "flowedge",
 			},
 		},
+	}
+
+	// 用户提供了模板就用模板：这样 ControlNet / LoRA / img2img / upscale
+	// 等任意 ComfyUI 图都能接入，而不必改 FlowEdge 的代码
+	if s.Template != "" {
+		g, err := s.buildGraphFromTemplate(s.Template, prompt, "", width, height, time.Now().UnixNano())
+		if err != nil {
+			return "", err
+		}
+		workflow = g
 	}
 
 	// ComfyUI /prompt 协议要求 {"prompt": <graph>} 包裹
@@ -355,47 +424,86 @@ type VideoService struct {
 	FFmpegPath string
 }
 
+// NewVideoService 构造视频服务。
+// 支持 FFMPEG_PATH 覆盖（能力自检的提示文案一直宣称可设置该变量，但实现里
+// 从未读取——典型的「文档说支持、代码不支持」）。
 func NewVideoService() *VideoService {
+	p := os.Getenv("FFMPEG_PATH")
+	if p == "" {
+		p = "ffmpeg"
+	}
 	return &VideoService{
-		FFmpegPath: "ffmpeg",
+		FFmpegPath: p,
 	}
 }
 
-// ComposeVideo 合成视频
+// ComposeVideo 用第一张图 + 可选音轨生成视频（兼容旧调用）
 func (s *VideoService) ComposeVideo(imagePaths []string, audioPath string, outputPath string) error {
+	return s.ComposeVideoMulti(imagePaths, audioPath, outputPath, 3)
+}
+
+// ComposeVideoMulti 多图合成：每张图按 perImageSec 秒轮播，再叠加音轨。
+//
+// 原实现只用 imagePaths[0]，其余图片被静默丢弃（用户的 4 张分镜只出 1 张）。
+// 现在用 concat filter 一次调用完成，避免多次转码带来的画质损失。
+//
+// 超时保护：exec.Command 没有 ctx 时，ffmpeg 卡住会永久占用一个 goroutine 且
+// 节点超时后仍在跑（进程泄漏）。这里统一 10 分钟上限。
+func (s *VideoService) ComposeVideoMulti(imagePaths []string, audioPath string, outputPath string, perImageSec float64) error {
 	if len(imagePaths) == 0 {
 		return fmt.Errorf("no images provided")
 	}
-
-	// 简化版：用第一张图 + 音频生成视频
-	args := []string{
-		"-y",
-		"-loop", "1",
-		"-i", imagePaths[0],
+	if perImageSec <= 0 {
+		perImageSec = 3
+	}
+	if perImageSec > 30 {
+		perImageSec = 30
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	args := []string{"-y"}
+	for _, img := range imagePaths {
+		args = append(args, "-loop", "1", "-t", fmt.Sprintf("%.2f", perImageSec), "-i", img)
+	}
 	if audioPath != "" {
 		args = append(args, "-i", audioPath)
-		args = append(args, "-c:v", "libx264", "-tune", "stillimage",
-			"-c:a", "aac", "-b:a", "192k",
-			"-pix_fmt", "yuv420p", "-shortest")
+	}
+
+	// 视频流拼接
+	if len(imagePaths) > 1 {
+		var filter string
+		for i := range imagePaths {
+			filter += fmt.Sprintf("[%d:v]", i)
+		}
+		filter += fmt.Sprintf("concat=n=%d:v=1:a=0[v]", len(imagePaths))
+		args = append(args, "-filter_complex", filter, "-map", "[v]")
+	}
+
+	args = append(args, "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p")
+
+	if audioPath != "" {
+		// 音频输入索引 = 图片数量
+		args = append(args, "-map", fmt.Sprintf("%d:a", len(imagePaths)),
+			"-c:a", "aac", "-b:a", "192k", "-shortest")
 	} else {
-		args = append(args, "-c:v", "libx264", "-t", "5",
-			"-pix_fmt", "yuv420p")
+		args = append(args, "-t", fmt.Sprintf("%.2f", perImageSec*float64(len(imagePaths))))
 	}
 
 	args = append(args, outputPath)
 
-	cmd := exec.Command(s.FFmpegPath, args...)
+	cmd := exec.CommandContext(ctx, s.FFmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("ffmpeg failed: %w, output: %s", err, string(output))
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("ffmpeg 超时（10 分钟）已终止")
+		}
+		return fmt.Errorf("ffmpeg failed: %w, output: %s", err, truncateRunes(string(output), 600))
 	}
-
 	return nil
 }
 
-// AddSubtitles 添加字幕
 func (s *VideoService) AddSubtitles(videoPath string, subtitlePath string, outputPath string) error {
 	cmd := exec.Command(s.FFmpegPath,
 		"-y", "-i", videoPath,

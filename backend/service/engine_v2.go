@@ -1129,11 +1129,17 @@ func (e *EngineV2) execVideoNode(node *model.NodeInstance, upstream map[string]i
 	}
 
 	outputPath := fmt.Sprintf("data/generated/video-%d.mp4", time.Now().UnixNano())
-	if p, ok := node.Data["output_path"].(string); ok {
+	if p, ok := node.Data["output_path"].(string); ok && p != "" {
 		outputPath = p
 	}
 
-	err := e.video.ComposeVideo(images, audioPath, outputPath)
+	// 每张图轮播时长（秒），默认 3；上限由 ComposeVideoMulti 钳制
+	perImage := 3.0
+	if v, ok := node.Data["image_duration"].(float64); ok && v > 0 {
+		perImage = v
+	}
+
+	err := e.video.ComposeVideoMulti(images, audioPath, outputPath, perImage)
 	if err != nil {
 		return nil, err
 	}
