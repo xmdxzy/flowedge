@@ -250,3 +250,16 @@ input, textarea, select {
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover { background: #3A4560; background-clip: padding-box; border: 2px solid #0A0D14; }
+
+/* ============ 顶栏 ============ */
+/* 按钮增多时（导出/导入/保存/知识库/环境/调试）窄窗口下会被压成竖排，这里锁死 */
+.fe-topbar { flex-wrap: nowrap; }
+.fe-topbar button,
+.fe-topbar label {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.fe-topbar input {
+  min-width: 0;
+  flex-shrink: 1;
+}

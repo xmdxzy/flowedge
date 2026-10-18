@@ -10,7 +10,10 @@ const path = require('path')
 const fs = require('fs')
 
 const ROOT = path.resolve(__dirname, '..')
-const BACKEND_EXE = process.env.FLOWEDGE_BACKEND_EXE || path.join(ROOT, 'backend', 'flowedge-backend.exe')
+// 优先用 dist/FlowEdge.exe（单文件构建，前端已内嵌）；否则退回开发用后端
+const PACKAGED_EXE = path.join(ROOT, 'dist', 'FlowEdge.exe')
+const DEV_EXE = path.join(ROOT, 'backend', 'flowedge-backend.exe')
+const BACKEND_EXE = process.env.FLOWEDGE_BACKEND_EXE || (fs.existsSync(PACKAGED_EXE) ? PACKAGED_EXE : DEV_EXE)
 const BACKEND_PORT = process.env.FLOWEDGE_PORT || '8080'
 const BASE_URL = `http://127.0.0.1:${BACKEND_PORT}`
 const LOCAL_SERVICES = path.join(ROOT, 'backend', 'local-services')
@@ -102,6 +105,24 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => {
     setTimeout(async () => {
       // 可选：自动点选某个节点（UI 验收时把配置面板一并截进来）
+      const clickText = process.env.FLOWEDGE_CLICK_TEXT
+      if (clickText) {
+        try {
+          await win.webContents.executeJavaScript(
+            `(() => {
+              const btns = Array.from(document.querySelectorAll('button'))
+              const btn = btns.find((b) => (b.textContent || '').trim() === ${JSON.stringify(clickText)})
+              if (!btn) return 'button not found'
+              btn.click()
+              return 'clicked'
+            })()`,
+          )
+          await new Promise((r) => setTimeout(r, 1800))
+        } catch (err) {
+          console.error('[flowedge] click text failed:', err.message)
+        }
+      }
+
       const clickNode = process.env.FLOWEDGE_CLICK_NODE
       if (clickNode) {
         try {

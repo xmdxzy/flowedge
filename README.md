@@ -24,12 +24,92 @@
 - ✅ 执行历史面板
 - ✅ 深色科技风 UI（三栏布局、节点状态指示灯、连线流动画）
 
+## 在 Windows 上运行（推荐：不需要 Docker / WSL）
+
+FlowEdge 的目标是「一台有显卡的 Windows 机器，拿到就双击用」。
+整个引擎编译成**单个 exe**：前端界面、数据库、语音服务脚本全部内嵌，
+不依赖 Docker、WSL、Node.js 或 Python。
+
+### 构建（只需一次）
+
+```bash
+python scripts/build-windows.py
+```
+
+产出 `dist/FlowEdge.exe`（约 18 MB）。把它复制到任意目录（例如 `D://FlowEdge//`），
+双击 `FlowEdge.exe` 或仓库里的 `FlowEdge.bat`，浏览器自动打开 `http://127.0.0.1:8080`。
+
+### 运行后会生成什么
+
+```
+D://FlowEdge//
+├── FlowEdge.exe
+└── data\              ← 所有数据都在这里；卸载 = 删掉这个目录
+    ├── flowedge.db    ← 工作流 / 执行记录 / 版本快照（SQLite，无需安装数据库）
+    ├── kb\            ← 知识库向量
+    └── generated\     ← 生成的图片与视频
+```
+
+exe 会把工作目录切到自己所在位置，所以从桌面快捷方式、计划任务启动都不会把数据写到奇怪的地方。
+
+### 依赖分级（缺了不影响启动）
+
+| 能力 | 需要 | 缺少时的影响 |
+|---|---|---|
+| LLM 推理 / 知识库向量化 | [Ollama](https://ollama.com) | 只有 LLM 与 RAG 节点不可用 |
+| 文生图 | ComfyUI | 只有文生图节点不可用 |
+| 视频合成 | ffmpeg | 只有视频节点不可用 |
+| 语音转写 / 合成 | Python 3.10+ | 只有这两个语音节点不可用 |
+
+界面右上角 **「环境」** 按钮（或 `GET /api/capabilities`）实时显示每项是否就绪，
+缺失项会直接给出安装命令；启动时控制台也会打印一行环境摘要，例如：
+
+```
+环境自检  GPU OK | LLM(Ollama) OK | 文生图(ComfyUI) 缺失 | 视频(ffmpeg) OK | 音频(ASR+TTS) 缺失
+```
+
+### 可选：启用语音能力
+
+```bat
+FlowEdge.exe --export-services
+```
+
+把内嵌的 `asr_server.py` / `tts_server.py` / `requirements.txt` 导出到 `local-services\`，
+按提示装好 Python 依赖后分别启动即可（TTS 走 Windows 自带语音引擎，不需要下载模型；
+ASR 首次会下载 whisper 模型约 500 MB）。
+
+### 常用环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PORT` | `8080` | 服务端口 |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 地址 |
+| `OLLAMA_MODEL` | 自动探测 | 留空时自动使用本地已装的第一个模型 |
+| `COMFYUI_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI 地址 |
+| `ASR_BASE_URL` / `TTS_BASE_URL` | 空 | 指向本地语音服务（导出脚本后自行启动） |
+| `FLOWEDGE_OPEN_BROWSER` | `0` | 设为 `1` 启动后自动打开浏览器 |
+| `STATIC_DIR` | 空 | 指定外部前端目录（想替换界面时用） |
+| `DB_DRIVER` | `sqlite` | 设为 `postgres` 且配置 `DB_*` 可切换 PostgreSQL |
+
+### Docker 只在服务器场景需要
+
+仓库里的 `docker-compose.yml` 保留给 Linux / 服务器部署，**Windows 桌面环境不需要它**。
+配置校验（无需 Docker 运行）：
+
+```bash
+python scripts/verify-docker.py
+```
+
+## 从源码开发
+
+> 上面的单文件部署已经覆盖绝大多数使用场景；下面是改代码时才需要的。
+
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
 | 前端 | React 18 + TypeScript + @xyflow/react + Tailwind CSS |
-| 后端 | Go 1.22 + Gin + GORM + Gorilla WebSocket |
+| 后端 | Go 1.25 + Gin + GORM + Gorilla WebSocket（编译为单文件，前端资源内嵌） |
 | 模型 | Ollama（LLM）+ ComfyUI（文生图）+ Whisper（ASR）+ TTS |
 | 视频 | FFmpeg（NVENC 硬件编解码） |
 | 数据库 | **SQLite（默认，零依赖开箱即用）**；可通过 `DB_DRIVER=postgres` 切换 PostgreSQL |
@@ -37,7 +117,7 @@
 ## 快速启动
 
 ### 前置要求
-- Go 1.22+
+- Go 1.25+
 - Node.js 18+
 - NVIDIA GPU（目标硬件 RTX 3090 24GB，已验证）
 - Ollama / ComfyUI / FFmpeg 按需（不装也能启动，仅对应节点会报错）
@@ -207,6 +287,7 @@ flowedge/
 - [x] 节点拖拽 + 右键菜单
 - [x] 工作流导出/导入
 - [ ] 单步调试 + 断点
-- [ ] Docker 一键部署
+- [x] 单文件 Windows 部署（前端内嵌，无需 Docker/WSL/Node）
+- [ ] Docker 一键部署（服务器场景）
 - [ ] 节点插件系统
 - [x] 子工作流嵌套

@@ -35,6 +35,7 @@ import { useWebSocket, type WSEvent } from './hooks/useWebSocket'
 import ExecutionPanel from './components/ExecutionPanel'
 import ContextMenu from './components/ContextMenu'
 import DebugPanel from './components/DebugPanel'
+import CapabilityPanel from './components/CapabilityPanel'
 import KBPanel from './components/KBPanel'
 
 const nodeTypes: NodeTypes = {
@@ -73,7 +74,7 @@ const initialNodes: Node[] = [
     id: 'llm-1',
     type: 'llm',
     position: { x: 350, y: 200 },
-    data: { model: 'qwen2.5:7b', prompt: '' },
+    data: { model: '', prompt: '' }, // 留空 = 用服务端自动探测到的本地模型
   },
   {
     id: 'end-1',
@@ -113,6 +114,7 @@ function FlowEditor() {
   const [lastRunId, setLastRunId] = useState<number | null>(null)
   const [canResume, setCanResume] = useState(false)
   const [kbOpen, setKbOpen] = useState(false)
+  const [envOpen, setEnvOpen] = useState(false)
   const streamBufRef = useRef<Map<string, string>>(new Map())
   const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
@@ -798,7 +800,7 @@ function FlowEditor() {
             <button onClick={exportWorkflow} className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm">
               导出
             </button>
-            <label className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm cursor-pointer">
+            <label className="fe-btn-ghost px-2.5 py-1.5 rounded-lg text-sm cursor-pointer shrink-0 whitespace-nowrap">
               导入
               <input type="file" accept=".json" onChange={importWorkflow} className="hidden" />
             </label>
@@ -811,6 +813,13 @@ function FlowEditor() {
               title="项目专属语义知识库"
             >
               知识库
+            </button>
+            <button
+              onClick={() => setEnvOpen(true)}
+              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+              title="查看 GPU / Ollama / ComfyUI / ffmpeg / 语音服务的可用状态"
+            >
+              环境
             </button>
 
             <DebugPanel
@@ -904,6 +913,9 @@ function FlowEditor() {
       {/* 项目知识库面板 */}
       <KBPanel open={kbOpen} onClose={() => setKbOpen(false)} />
 
+      {/* 运行环境自检面板 */}
+      {envOpen && <CapabilityPanel onClose={() => setEnvOpen(false)} />}
+
       {/* 右侧属性面板 */}
       <div className="w-72 border-l border-border bg-surface p-4 overflow-y-auto">
         {/* Tab 切换 */}
@@ -946,7 +958,7 @@ function FlowEditor() {
                     value={(selectedNode.data.model as string) || ''}
                     onChange={(e) => updateSelectedNodeData('model', e.target.value)}
                     className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
-                    placeholder="qwen2.5:7b"
+                    placeholder="留空则用自动探测到的模型"
                   />
                 </div>
                 <div>

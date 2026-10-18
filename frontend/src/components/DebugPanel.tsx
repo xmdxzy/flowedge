@@ -23,7 +23,7 @@ export default function DebugPanel({
         onClick={onStartDebug}
         className="px-3 py-1.5 rounded-lg bg-warning/20 hover:bg-warning/30 text-warning text-sm transition-all"
       >
-        🐞 调试模式
+        🐞 调试
       </button>
     )
   }

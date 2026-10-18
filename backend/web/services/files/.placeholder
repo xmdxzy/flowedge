@@ -1,0 +1,2 @@
+构建时会把 backend/local-services/*.py 复制到这里并内嵌进 exe，
+用户可通过 FlowEdge.exe --export-services 导出这些脚本。

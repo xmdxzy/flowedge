@@ -1,0 +1,6 @@
+# FlowEdge 可选语音服务依赖（不装不影响引擎其他功能）
+# 安装：python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+faster-whisper>=1.2,<2
+pywin32>=306
+# av 19.x 移除了 metadata_errors，会导致 faster-whisper 1.2 转写崩溃，必须钉在 19 以下
+av<19

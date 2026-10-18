@@ -1,0 +1,4 @@
+此目录用于存放前端构建产物（由 scripts/build-windows.py 生成），
+build 时会被 go:embed 打进 FlowEdge.exe，从而让单个 exe 自带 Web 界面。
+
+这个占位文件保证目录在干净 clone 后仍然存在（否则 go:embed all:static 会编译失败）。

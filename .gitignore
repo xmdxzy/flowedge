@@ -3,8 +3,15 @@ node_modules/
 vendor/
 
 # 构建产物
-dist/
+/frontend/dist/
+/dist/
 build/
+
+# 内嵌前端产物（构建时生成；保留 .placeholder 让目录在干净 clone 后存在）
+backend/web/static/*
+!backend/web/static/.placeholder
+backend/web/services/files/*
+!backend/web/services/files/.placeholder
 *.exe
 *.dll
 *.so
