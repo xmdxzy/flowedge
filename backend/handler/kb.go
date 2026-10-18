@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -101,6 +103,53 @@ func (h *KBHandler) Query(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": out})
+}
+
+// ImportFile 上传 .md/.txt 文件导入知识库
+func (h *KBHandler) ImportFile(c *gin.Context) {
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing file field"})
+		return
+	}
+	if file.Size > 2<<20 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file too large (max 2MB)"})
+		return
+	}
+	name := strings.ToLower(file.Filename)
+	if !strings.HasSuffix(name, ".md") && !strings.HasSuffix(name, ".txt") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only .md/.txt supported"})
+		return
+	}
+
+	src, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer src.Close()
+	data, err := io.ReadAll(src)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file is empty"})
+		return
+	}
+
+	ids, err := h.rag.AddDocument(string(data), file.Filename)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"file":    file.Filename,
+		"chunks":  len(ids),
+		"ids":     ids,
+		"total":   h.rag.Count(),
+		"embedder": h.rag.Backend(),
+	})
 }
 
 // Status 知识库状态（后端类型 + 文档数）

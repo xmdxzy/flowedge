@@ -34,6 +34,7 @@ import { useWebSocket, type WSEvent } from './hooks/useWebSocket'
 import ExecutionPanel from './components/ExecutionPanel'
 import ContextMenu from './components/ContextMenu'
 import DebugPanel from './components/DebugPanel'
+import KBPanel from './components/KBPanel'
 
 const nodeTypes: NodeTypes = {
   start: StartNode,
@@ -101,6 +102,7 @@ function FlowEditor() {
   const [pausedNodeId, setPausedNodeId] = useState<string | null>(null)
   const [lastRunId, setLastRunId] = useState<number | null>(null)
   const [canResume, setCanResume] = useState(false)
+  const [kbOpen, setKbOpen] = useState(false)
   const streamBufRef = useRef<Map<string, string>>(new Map())
   const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
@@ -735,6 +737,13 @@ function FlowEditor() {
             <button onClick={saveWorkflow} className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm">
               保存
             </button>
+            <button
+              onClick={() => setKbOpen(true)}
+              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+              title="项目专属语义知识库"
+            >
+              知识库
+            </button>
 
             <DebugPanel
               isDebugging={isDebugMode}
@@ -823,6 +832,9 @@ function FlowEditor() {
           }
         />
       )}
+
+      {/* 项目知识库面板 */}
+      <KBPanel open={kbOpen} onClose={() => setKbOpen(false)} />
 
       {/* 右侧属性面板 */}
       <div className="w-72 border-l border-border bg-surface p-4 overflow-y-auto">

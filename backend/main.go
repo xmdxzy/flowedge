@@ -117,6 +117,7 @@ func main() {
 		// 项目专属知识库
 		kbHandler := handler.NewKBHandler(ragService)
 		api.POST("/kb/documents", kbHandler.AddDocument)
+		api.POST("/kb/import", kbHandler.ImportFile)
 		api.GET("/kb/documents", kbHandler.ListDocuments)
 		api.DELETE("/kb/documents/:id", kbHandler.DeleteDocument)
 		api.POST("/kb/query", kbHandler.Query)

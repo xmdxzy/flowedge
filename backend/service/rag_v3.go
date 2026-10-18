@@ -97,9 +97,19 @@ func (s *RAGServiceV3) Query(query string, topK int) ([]SearchResult, error) {
 		scored = append(scored, SearchResult{Record: r, Score: cosineSimilarity(qvec, r.Embedding)})
 	}
 
+	// 长度归一排序：短文本在 embedding 空间中天然虚高，按长度折扣参与排序
+	// （仅影响排序，Score 字段保持原始余弦值）
+	effective := func(r SearchResult) float64 {
+		f := float64(len([]rune(r.Record.Content))) / 160.0
+		if f > 1 {
+			f = 1
+		}
+		return r.Score * (0.75 + 0.25*f)
+	}
+
 	// 简单插入排序（KB 规模小，避免引入额外依赖）
 	for i := 1; i < len(scored); i++ {
-		for j := i; j > 0 && scored[j].Score > scored[j-1].Score; j-- {
+		for j := i; j > 0 && effective(scored[j]) > effective(scored[j-1]); j-- {
 			scored[j], scored[j-1] = scored[j-1], scored[j]
 		}
 	}

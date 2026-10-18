@@ -26,7 +26,7 @@ export const workflowTemplates: WorkflowTemplate[] = [
         type: 'llm',
         position: { x: 320, y: 150 },
         data: {
-          model: 'qwen2.5:7b',
+          model: 'qwen2.5-coder:32b',
           prompt: '请将以下文本总结为3个要点，简洁明了：',
         },
       },
@@ -94,13 +94,13 @@ export const workflowTemplates: WorkflowTemplate[] = [
         id: 'llm-true',
         type: 'llm',
         position: { x: 560, y: 100 },
-        data: { model: 'qwen2.5:7b', prompt: '处理有内容的情况：' },
+        data: { model: 'qwen2.5-coder:32b', prompt: '处理有内容的情况：' },
       },
       {
         id: 'llm-false',
         type: 'llm',
         position: { x: 560, y: 300 },
-        data: { model: 'qwen2.5:7b', prompt: '处理空内容的情况：' },
+        data: { model: 'qwen2.5-coder:32b', prompt: '处理空内容的情况：' },
       },
       {
         id: 'end-1',
@@ -139,7 +139,7 @@ export const workflowTemplates: WorkflowTemplate[] = [
         id: 'llm-1',
         type: 'llm',
         position: { x: 600, y: 200 },
-        data: { model: 'qwen2.5:7b', prompt: '' },
+        data: { model: 'qwen2.5-coder:32b', prompt: '仅根据以下参考资料回答问题；资料不足时明确说明，不要编造：' },
       },
       {
         id: 'end-1',
@@ -170,7 +170,7 @@ export const workflowTemplates: WorkflowTemplate[] = [
         id: 'llm-script',
         type: 'llm',
         position: { x: 280, y: 300 },
-        data: { model: 'qwen2.5:7b', prompt: '生成短视频分镜脚本，包含画面描述和配音文案' },
+        data: { model: 'qwen2.5-coder:32b', prompt: '生成短视频分镜脚本，包含画面描述和配音文案' },
       },
       {
         id: 't2i-1',
@@ -188,7 +188,7 @@ export const workflowTemplates: WorkflowTemplate[] = [
         id: 'video-1',
         type: 'video_compose',
         position: { x: 840, y: 300 },
-        data: { output_path: '/tmp/output.mp4' },
+        data: { output_path: 'data/generated/video.mp4' },
       },
       {
         id: 'end-1',
@@ -233,7 +233,7 @@ export const workflowTemplates: WorkflowTemplate[] = [
         id: 'llm-1',
         type: 'llm',
         position: { x: 580, y: 200 },
-        data: { model: 'qwen2.5:7b', prompt: '分析以下API返回的数据，总结关键信息：' },
+        data: { model: 'qwen2.5-coder:32b', prompt: '分析以下API返回的数据，总结关键信息：' },
       },
       {
         id: 'end-1',

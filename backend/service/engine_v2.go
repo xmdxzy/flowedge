@@ -408,18 +408,27 @@ func (e *EngineV2) execStartNode(node *model.NodeInstance, upstream map[string]i
 }
 
 func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	prompt := ""
+	// 节点级提示词 = 指令前缀；上游文本 = 输入主体。两者拼接，缺一不可丢
+	instruction := ""
 	if p, ok := node.Data["prompt"].(string); ok {
-		prompt = p
+		instruction = p
 	}
 
-	if prompt == "" {
-		for _, out := range upstream {
-			if m, ok := out.(map[string]interface{}); ok {
-				if text, ok := m["text"].(string); ok {
-					prompt = text
-				}
+	upstreamText := ""
+	for _, out := range upstream {
+		if m, ok := out.(map[string]interface{}); ok {
+			if text, ok := m["text"].(string); ok && text != "" {
+				upstreamText = text
 			}
+		}
+	}
+
+	prompt := upstreamText
+	if instruction != "" {
+		if upstreamText != "" {
+			prompt = instruction + "\n\n" + upstreamText
+		} else {
+			prompt = instruction
 		}
 	}
 
