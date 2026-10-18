@@ -1,0 +1,145 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: #0F1115;
+  color: #fff;
+  overflow: hidden;
+}
+
+/* ===== React Flow 样式覆盖 ===== */
+.react-flow {
+  background: #0F1115;
+}
+
+.react-flow__background {
+  background: #0F1115;
+}
+
+.react-flow__handle {
+  width: 8px;
+  height: 8px;
+  background: #3B82F6;
+  border: 2px solid #0F1115;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+}
+
+.react-flow__handle:hover {
+  background: #60A5FA;
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.3);
+  transform: scale(1.2);
+}
+
+.react-flow__handle-connecting {
+  background: #F59E0B;
+}
+
+.react-flow__handle-valid {
+  background: #10B981;
+}
+
+.react-flow__edge-path {
+  stroke: #3B82F6;
+  stroke-width: 2;
+}
+
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: #60A5FA;
+  stroke-width: 2.5;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #8B5CF6;
+}
+
+/* 执行中连线流动画 */
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+
+.react-flow__edge.animated .react-flow__edge-path {
+  stroke-dasharray: 5;
+  animation: flow-dash 1s linear infinite;
+}
+
+.react-flow__controls {
+  background: #1A1D24;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  border: 1px solid #2E3340;
+  overflow: hidden;
+}
+
+.react-flow__controls button {
+  background: transparent;
+  border-bottom: 1px solid #2E3340;
+  color: #9CA3AF;
+  transition: all 0.15s ease;
+}
+
+.react-flow__controls button:hover {
+  background: #242832;
+  color: #fff;
+}
+
+.react-flow__controls button:last-child {
+  border-bottom: none;
+}
+
+.react-flow__minimap {
+  background: #1A1D24;
+  border-radius: 8px;
+  border: 1px solid #2E3340;
+  overflow: hidden;
+}
+
+/* ===== 节点状态动画 ===== */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
+  50% { box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }
+}
+
+.node-running {
+  animation: pulse-glow 1.5s ease-in-out infinite;
+}
+
+/* ===== 滚动条美化 ===== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1A1D24;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2E3340;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3B82F6;
+}
+
+/* ===== 输入框聚焦效果 ===== */
+input:focus, textarea:focus, select:focus {
+  border-color: #3B82F6 !important;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* ===== 选中节点效果 ===== */
+.react-flow__node.selected {
+  filter: drop-shadow(0 0 8px rgba(59, 130, 246, 0.4));
+}

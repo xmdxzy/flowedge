@@ -1,0 +1,251 @@
+// 预置工作流模板
+export interface WorkflowTemplate {
+  id: string
+  name: string
+  description: string
+  category: string
+  nodes: any[]
+  edges: any[]
+}
+
+export const workflowTemplates: WorkflowTemplate[] = [
+  {
+    id: 'text-summarize',
+    name: '文本总结',
+    description: '输入长文本，AI 自动生成摘要',
+    category: '文本处理',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 50, y: 150 },
+        data: { prompt: '' },
+      },
+      {
+        id: 'llm-1',
+        type: 'llm',
+        position: { x: 320, y: 150 },
+        data: {
+          model: 'qwen2.5:7b',
+          prompt: '请将以下文本总结为3个要点，简洁明了：',
+        },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 600, y: 150 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 'llm-1' },
+      { id: 'e2-3', source: 'llm-1', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'image-generate',
+    name: '文生图',
+    description: '输入描述，AI 生成对应图片',
+    category: '图像生成',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 50, y: 150 },
+        data: { prompt: '一只在月球上的猫，科幻风格' },
+      },
+      {
+        id: 't2i-1',
+        type: 'text2image',
+        position: { x: 320, y: 150 },
+        data: { prompt: '', width: 1024, height: 1024 },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 600, y: 150 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 't2i-1' },
+      { id: 'e2-3', source: 't2i-1', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'conditional-branch',
+    name: '条件分支',
+    description: '根据输入内容走不同分支',
+    category: '控制流',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 50, y: 200 },
+        data: { prompt: '' },
+      },
+      {
+        id: 'if-1',
+        type: 'if_else',
+        position: { x: 300, y: 200 },
+        data: { condition_type: 'not_empty', compare_value: '' },
+      },
+      {
+        id: 'llm-true',
+        type: 'llm',
+        position: { x: 560, y: 100 },
+        data: { model: 'qwen2.5:7b', prompt: '处理有内容的情况：' },
+      },
+      {
+        id: 'llm-false',
+        type: 'llm',
+        position: { x: 560, y: 300 },
+        data: { model: 'qwen2.5:7b', prompt: '处理空内容的情况：' },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 820, y: 200 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 'if-1' },
+      { id: 'e2-true', source: 'if-1', sourceHandle: 'true', target: 'llm-true' },
+      { id: 'e2-false', source: 'if-1', sourceHandle: 'false', target: 'llm-false' },
+      { id: 'e3-1', source: 'llm-true', target: 'end-1' },
+      { id: 'e3-2', source: 'llm-false', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'rag-qa',
+    name: 'RAG 知识库问答',
+    description: '基于知识库检索后回答问题',
+    category: 'AI 应用',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 50, y: 200 },
+        data: { prompt: '请介绍一下 FlowEdge 的核心功能' },
+      },
+      {
+        id: 'rag-1',
+        type: 'rag_query',
+        position: { x: 320, y: 200 },
+        data: { query: '' },
+      },
+      {
+        id: 'llm-1',
+        type: 'llm',
+        position: { x: 600, y: 200 },
+        data: { model: 'qwen2.5:7b', prompt: '' },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 880, y: 200 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 'rag-1' },
+      { id: 'e2-3', source: 'rag-1', target: 'llm-1' },
+      { id: 'e3-4', source: 'llm-1', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'video-pipeline',
+    name: '短视频生成流水线',
+    description: '文案→分镜→生图→配音→合成视频',
+    category: '多模态',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 30, y: 300 },
+        data: { prompt: '介绍人工智能的一分钟短视频脚本' },
+      },
+      {
+        id: 'llm-script',
+        type: 'llm',
+        position: { x: 280, y: 300 },
+        data: { model: 'qwen2.5:7b', prompt: '生成短视频分镜脚本，包含画面描述和配音文案' },
+      },
+      {
+        id: 't2i-1',
+        type: 'text2image',
+        position: { x: 560, y: 200 },
+        data: { prompt: '', width: 1024, height: 576 },
+      },
+      {
+        id: 'tts-1',
+        type: 'tts',
+        position: { x: 560, y: 400 },
+        data: { text: '' },
+      },
+      {
+        id: 'video-1',
+        type: 'video_compose',
+        position: { x: 840, y: 300 },
+        data: { output_path: '/tmp/output.mp4' },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 1100, y: 300 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 'llm-script' },
+      { id: 'e2-3a', source: 'llm-script', target: 't2i-1' },
+      { id: 'e2-3b', source: 'llm-script', target: 'tts-1' },
+      { id: 'e3a-4', source: 't2i-1', target: 'video-1' },
+      { id: 'e3b-4', source: 'tts-1', target: 'video-1' },
+      { id: 'e4-5', source: 'video-1', target: 'end-1' },
+    ],
+  },
+  {
+    id: 'http-api-chain',
+    name: 'API 链式调用',
+    description: 'HTTP 请求→数据处理→AI 分析',
+    category: '数据处理',
+    nodes: [
+      {
+        id: 'start-1',
+        type: 'start',
+        position: { x: 50, y: 200 },
+        data: { prompt: '' },
+      },
+      {
+        id: 'http-1',
+        type: 'http_request',
+        position: { x: 300, y: 200 },
+        data: {
+          method: 'GET',
+          url: 'https://api.example.com/data',
+          headers: { 'Content-Type': 'application/json' },
+          body: '',
+        },
+      },
+      {
+        id: 'llm-1',
+        type: 'llm',
+        position: { x: 580, y: 200 },
+        data: { model: 'qwen2.5:7b', prompt: '分析以下API返回的数据，总结关键信息：' },
+      },
+      {
+        id: 'end-1',
+        type: 'end',
+        position: { x: 860, y: 200 },
+        data: {},
+      },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 'http-1' },
+      { id: 'e2-3', source: 'http-1', target: 'llm-1' },
+      { id: 'e3-4', source: 'llm-1', target: 'end-1' },
+    ],
+  },
+]
