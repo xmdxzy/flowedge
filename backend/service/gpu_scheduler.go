@@ -21,21 +21,21 @@ type GPUInfo struct {
 type ModelStatus string
 
 const (
-	ModelStatusIdle     ModelStatus = "idle"
-	ModelStatusLoading  ModelStatus = "loading"
-	ModelStatusReady   ModelStatus = "ready"
+	ModelStatusIdle      ModelStatus = "idle"
+	ModelStatusLoading   ModelStatus = "loading"
+	ModelStatusReady     ModelStatus = "ready"
 	ModelStatusUnloading ModelStatus = "unloading"
 )
 
 // ModelInstance 模型实例
 type ModelInstance struct {
-	Name        string
-	Type        string // llm, text2image, asr, tts
-	VramMB      int    // 预估显存占用
-	Status      ModelStatus
-	LoadedAt    time.Time
-	LastUsedAt  time.Time
-	LoadCostMS  int    // 历史平均加载耗时
+	Name       string
+	Type       string // llm, text2image, asr, tts
+	VramMB     int    // 预估显存占用
+	Status     ModelStatus
+	LoadedAt   time.Time
+	LastUsedAt time.Time
+	LoadCostMS int // 历史平均加载耗时
 }
 
 // SchedulerConfig 调度器配置
@@ -48,10 +48,13 @@ type SchedulerConfig struct {
 
 // GPUScheduler 显存调度器
 type GPUScheduler struct {
-	config     SchedulerConfig
-	models     map[string]*ModelInstance
-	mu         sync.Mutex
-	listening  bool
+	config            SchedulerConfig
+	models            map[string]*ModelInstance
+	mu                sync.Mutex
+	listening         bool
+	cachedGPU         *GPUInfo
+	cachedAt          time.Time
+	telemetryInterval time.Duration
 }
 
 func NewGPUScheduler(totalVramMB int) *GPUScheduler {
@@ -63,15 +66,73 @@ func NewGPUScheduler(totalVramMB int) *GPUScheduler {
 		config: SchedulerConfig{
 			TotalVramMB:     totalVramMB,
 			SafeThresholdMB: int(float64(totalVramMB) * 0.7),  // 70% 安全线
-			WarnThresholdMB: int(float64(totalVramMB) * 0.85),  // 85% 预警线
+			WarnThresholdMB: int(float64(totalVramMB) * 0.85), // 85% 预警线
 			RedThresholdMB:  int(float64(totalVramMB) * 0.92), // 92% 红线
 		},
 		models: make(map[string]*ModelInstance),
 	}
 }
 
-// GetGPUInfo 获取当前GPU显存状态
+// StartTelemetry 启动后台 nvidia-smi 轮询，缓存真实遥测
+// （避免每个请求/每次 Acquire 都拉子进程；拿不到 nvidia-smi 时静默降级）
+func (s *GPUScheduler) StartTelemetry(interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	s.mu.Lock()
+	if s.telemetryInterval > 0 {
+		s.mu.Unlock()
+		return // 已启动
+	}
+	s.telemetryInterval = interval
+	s.mu.Unlock()
+
+	go func() {
+		refresh := func() {
+			if info, err := s.queryGPU(); err == nil {
+				s.mu.Lock()
+				s.cachedGPU = info
+				s.cachedAt = time.Now()
+				s.mu.Unlock()
+			}
+		}
+		refresh()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			refresh()
+		}
+	}()
+}
+
+// GetGPUInfo 获取当前GPU显存状态（优先用遥测缓存，过期则现场查询）
 func (s *GPUScheduler) GetGPUInfo() (*GPUInfo, error) {
+	s.mu.Lock()
+	cached, cachedAt := s.cachedGPU, s.cachedAt
+	interval := s.telemetryInterval
+	s.mu.Unlock()
+
+	if cached != nil && time.Since(cachedAt) < 2*interval {
+		return cached, nil
+	}
+
+	info, err := s.queryGPU()
+	if err != nil {
+		if cached != nil {
+			return cached, nil // 现场查询失败时退回缓存
+		}
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.cachedGPU = info
+	s.cachedAt = time.Now()
+	s.mu.Unlock()
+	return info, nil
+}
+
+// queryGPU 现场执行 nvidia-smi（无锁：调用方自行决定锁策略）
+func (s *GPUScheduler) queryGPU() (*GPUInfo, error) {
 	cmd := exec.Command("nvidia-smi",
 		"--query-gpu=memory.total,memory.used,memory.free,utilization.gpu",
 		"--format=csv,noheader,nounits")
@@ -214,23 +275,24 @@ func (s *GPUScheduler) evictLRU(neededMB int) {
 
 // GetSchedulerStatus 获取调度器状态
 func (s *GPUScheduler) GetSchedulerStatus() map[string]interface{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// 先取 GPU 快照（GetGPUInfo 内部有锁），再拿模型锁——避免非重入死锁
 	gpuInfo, err := s.GetGPUInfo()
 	if err != nil {
 		gpuInfo = &GPUInfo{}
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	modelsList := make([]map[string]interface{}, 0, len(s.models))
 	for _, m := range s.models {
 		modelsList = append(modelsList, map[string]interface{}{
-			"name":       m.Name,
-			"type":       m.Type,
-			"vram_mb":    m.VramMB,
-			"status":     m.Status,
-			"loaded_at":  m.LoadedAt,
-			"last_used":  m.LastUsedAt,
+			"name":      m.Name,
+			"type":      m.Type,
+			"vram_mb":   m.VramMB,
+			"status":    m.Status,
+			"loaded_at": m.LoadedAt,
+			"last_used": m.LastUsedAt,
 		})
 	}
 

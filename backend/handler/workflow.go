@@ -105,9 +105,19 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 	}
 	h.db.Create(&run)
 
+	// 增量落库：每层完成后更新 node_states（断点续跑依据）
+	persist := func(states []model.NodeInstance) {
+		statesJSON, err := json.Marshal(states)
+		if err != nil {
+			return
+		}
+		h.db.Model(&model.WorkflowRun{}).Where("id = ?", run.ID).
+			Update("node_states", json.RawMessage(statesJSON))
+	}
+
 	// 异步执行
 	go func() {
-		nodeStates, err := h.engine.Execute(nodesJSON, edgesJSON)
+		nodeStates, err := h.engine.ExecutePersistent(nodesJSON, edgesJSON, persist)
 
 		endNow := time.Now()
 		run.EndedAt = &endNow
@@ -127,6 +137,74 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{
 		"run_id": run.ID,
 		"status": "running",
+	})
+}
+
+// ResumeRun 断点续跑：复用上次成功节点的输出，只重跑失败/未执行节点
+func (h *WorkflowHandler) ResumeRun(c *gin.Context) {
+	runID := c.Param("runId")
+	var run model.WorkflowRun
+	if err := h.db.First(&run, runID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+		return
+	}
+	if run.Status == "running" {
+		c.JSON(http.StatusConflict, gin.H{"error": "run is still running"})
+		return
+	}
+
+	var wf model.Workflow
+	if err := h.db.First(&wf, run.WorkflowID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
+		return
+	}
+
+	prev := []model.NodeInstance{}
+	if len(run.NodeStates) > 0 {
+		if err := json.Unmarshal(run.NodeStates, &prev); err != nil {
+			prev = []model.NodeInstance{}
+		}
+	}
+
+	now := time.Now()
+	run.Status = "running"
+	run.Error = ""
+	run.EndedAt = nil
+	run.StartedAt = &now
+	h.db.Save(&run)
+
+	persist := func(states []model.NodeInstance) {
+		statesJSON, err := json.Marshal(states)
+		if err != nil {
+			return
+		}
+		h.db.Model(&model.WorkflowRun{}).Where("id = ?", run.ID).
+			Update("node_states", json.RawMessage(statesJSON))
+	}
+
+	go func() {
+		nodeStates, err := h.engine.Resume([]byte(wf.Nodes), []byte(wf.Edges), prev, persist)
+
+		endNow := time.Now()
+		run.EndedAt = &endNow
+
+		if err != nil {
+			run.Status = "failed"
+			run.Error = err.Error()
+		} else {
+			run.Status = "success"
+		}
+
+		statesJSON, _ := json.Marshal(nodeStates)
+		run.NodeStates = json.RawMessage(statesJSON)
+		h.db.Save(&run)
+	}()
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"run_id":     run.ID,
+		"status":     "running",
+		"resumed":    true,
+		"prev_nodes": len(prev),
 	})
 }
 

@@ -5,22 +5,33 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"flowedge/backend/model"
 )
 
+// maxSubWorkflowDepth 子工作流最大嵌套深度
+const maxSubWorkflowDepth = 4
+
 // EngineV2 增强版工作流引擎
 type EngineV2 struct {
-	llm       *LLMService
-	t2i       *Text2ImageService
-	asr       *ASRService
-	tts       *TTSService
-	video     *VideoService
-	http      *HTTPService
-	rag       *RAGService
-	gpuSched  *GPUScheduler
-	wsHub     *WSHub
+	llm             *LLMService
+	t2i             *Text2ImageService
+	asr             *ASRService
+	tts             *TTSService
+	video           *VideoService
+	http            *HTTPService
+	rag             *RAGService
+	gpuSched        *GPUScheduler
+	wsHub           *WSHub
+	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
+	depth           atomic.Int32                       // 当前嵌套深度
+}
+
+// SetResolver 注入子工作流解析器（由 main 用 DB 实现）
+func (e *EngineV2) SetResolver(fn func(uint) ([]byte, []byte, error)) {
+	e.resolveWorkflow = fn
 }
 
 func NewEngineV2(
@@ -49,6 +60,21 @@ func NewEngineV2(
 
 // Execute 执行工作流（按层并行 DAG + 按边传递输入 + 分支级联跳过 + 节点超时）
 func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, error) {
+	return e.run(nodesJSON, edgesJSON, nil, nil)
+}
+
+// ExecutePersistent 执行并逐层增量落库（persist 在每层完成后回调，供断点续跑）
+func (e *EngineV2) ExecutePersistent(nodesJSON, edgesJSON []byte, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	return e.run(nodesJSON, edgesJSON, nil, persist)
+}
+
+// Resume 断点续跑：prevStates 中 success 节点复用输出直接跳过、skipped 分支保持跳过，其余节点重新执行
+func (e *EngineV2) Resume(nodesJSON, edgesJSON []byte, prevStates []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	return e.run(nodesJSON, edgesJSON, prevStates, persist)
+}
+
+// run 引擎主循环
+func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
 	var nodes []model.NodeInstance
 	var edges []model.EdgeInstance
 
@@ -63,19 +89,34 @@ func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, e
 	adj := make(map[string][]model.EdgeInstance)
 	nodeMap := make(map[string]*model.NodeInstance)
 	order := make([]string, 0, len(nodes))
-	remaining := make(map[string]int)            // 该节点尚未完成的前驱数
+	remaining := make(map[string]int)                     // 该节点尚未完成的前驱数
 	nodeInputs := make(map[string]map[string]interface{}) // nodeID -> {sourceID: output}
 
-	for i := range nodes {
-		nodes[i].Status = "pending"
-		nodeMap[nodes[i].ID] = &nodes[i]
-		order = append(order, nodes[i].ID)
-		remaining[nodes[i].ID] = 0
-		nodeInputs[nodes[i].ID] = make(map[string]interface{})
+	// 断点回填：上次 success 的节点复用输出；skipped 重置为 pending
+	// （由本轮执行重新裁剪分支）；failed/running/pending 重跑
+	prevMap := make(map[string]model.NodeInstance, len(prev))
+	for _, pn := range prev {
+		prevMap[pn.ID] = pn
 	}
-	for _, edge := range edges {
-		adj[edge.Source] = append(adj[edge.Source], edge)
-		remaining[edge.Target]++
+	for i := range nodes {
+		n := &nodes[i]
+		if pn, ok := prevMap[n.ID]; ok {
+			switch pn.Status {
+			case "success":
+				n.Status = "success"
+				n.Output = pn.Output
+				n.StartedAt = pn.StartedAt
+				n.EndedAt = pn.EndedAt
+			default:
+				n.Status = "pending"
+			}
+		} else {
+			n.Status = "pending"
+		}
+		nodeMap[n.ID] = n
+		order = append(order, n.ID)
+		remaining[n.ID] = 0
+		nodeInputs[n.ID] = make(map[string]interface{})
 	}
 
 	var mu sync.Mutex
@@ -107,12 +148,41 @@ func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, e
 		}
 	}
 
-	// 初始层：没有任何前驱的节点
+	for _, edge := range edges {
+		adj[edge.Source] = append(adj[edge.Source], edge)
+		src := nodeMap[edge.Source]
+		switch {
+		case src != nil && src.Status == "success":
+			// 已完成节点：复用输出、不占前驱计数（它不会再进入执行层）。
+			// if_else 需按上次分支结果路由，未命中的分支照常级联跳过
+			if src.Type == "if_else" {
+				branch, _ := src.Output.(map[string]interface{})
+				branchPath, _ := branch["branch"].(string)
+				label := edge.SourceHandle
+				if label == "" {
+					label = "true"
+				}
+				if branchPath != label {
+					skipBFS(edge.Target)
+					continue
+				}
+			}
+			nodeInputs[edge.Target][edge.Source] = src.Output
+		default:
+			remaining[edge.Target]++
+		}
+	}
+
+	// 初始层：无未满足前驱的待执行节点
 	current := []string{}
 	for _, id := range order {
-		if remaining[id] == 0 {
+		if remaining[id] == 0 && nodeMap[id].Status == "pending" {
 			current = append(current, id)
 		}
+	}
+
+	if persist != nil {
+		persist(nodes)
 	}
 
 	const nodeTimeout = 180 * time.Second
@@ -146,24 +216,46 @@ func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, e
 					e.wsHub.Broadcast(Event{Type: "node_started", NodeID: nid, Data: map[string]interface{}{"type": node.Type}})
 				}
 
-				// 带超时执行节点（防止单个节点卡死整个引擎）
+				// 带超时 + 重试执行节点（retry / retry_delay_ms 数据驱动，重试上限 5）
 				type execResult struct {
 					out interface{}
 					err error
 				}
-				resCh := make(chan execResult, 1)
-				go func() {
-					out, err := e.executeNode(node, upstream)
-					resCh <- execResult{out, err}
-				}()
+				retryCount := 0
+				if r, ok := node.Data["retry"].(float64); ok && r > 0 {
+					retryCount = int(r)
+					if retryCount > 5 {
+						retryCount = 5
+					}
+				}
+				retryDelay := 1000 * time.Millisecond
+				if d, ok := node.Data["retry_delay_ms"].(float64); ok && d >= 0 {
+					retryDelay = time.Duration(d) * time.Millisecond
+				}
 
 				var out interface{}
 				var execErr error
-				select {
-				case res := <-resCh:
-					out, execErr = res.out, res.err
-				case <-time.After(nodeTimeout):
-					execErr = fmt.Errorf("node timeout after %s", nodeTimeout)
+				for attempt := 0; attempt <= retryCount; attempt++ {
+					if attempt > 0 {
+						time.Sleep(retryDelay)
+						if e.wsHub != nil {
+							e.wsHub.Broadcast(Event{Type: "node_retry", NodeID: nid, Message: fmt.Sprintf("attempt %d/%d", attempt+1, retryCount+1)})
+						}
+					}
+					resCh := make(chan execResult, 1)
+					go func() {
+						o, err := e.executeNode(node, upstream)
+						resCh <- execResult{o, err}
+					}()
+					select {
+					case res := <-resCh:
+						out, execErr = res.out, res.err
+					case <-time.After(nodeTimeout):
+						execErr = fmt.Errorf("node timeout after %s", nodeTimeout)
+					}
+					if execErr == nil {
+						break
+					}
 				}
 
 				mu.Lock()
@@ -238,6 +330,11 @@ func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, e
 			return nodes, wfErr
 		}
 
+		// 每层完成后增量落库（断点续跑依据）
+		if persist != nil {
+			persist(nodes)
+		}
+
 		current = next
 	}
 
@@ -276,6 +373,9 @@ func (e *EngineV2) executeNode(node *model.NodeInstance, upstream map[string]int
 
 	case "rag_query":
 		return e.execRAGNode(node, upstream)
+
+	case "sub_workflow":
+		return e.execSubWorkflowNode(node, upstream)
 
 	case "end":
 		return e.execEndNode(node, upstream)
@@ -550,7 +650,7 @@ func (e *EngineV2) execHTTPNode(node *model.NodeInstance, upstream map[string]in
 	}
 
 	return map[string]interface{}{
-		"text":       respBody,
+		"text":        respBody,
 		"status_code": statusCode,
 	}, nil
 }
@@ -617,4 +717,73 @@ func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]int
 		"text":    fullPrompt,
 		"context": context,
 	}, nil
+}
+
+// execSubWorkflowNode 子工作流：解析 workflow_id → 注入上游文本到内层 start → 嵌套执行 → 返回内层 end 输出
+func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	if e.resolveWorkflow == nil {
+		return nil, fmt.Errorf("sub_workflow resolver not configured")
+	}
+
+	wfID := 0
+	switch v := node.Data["workflow_id"].(type) {
+	case float64:
+		wfID = int(v)
+	case int:
+		wfID = v
+	}
+	if wfID <= 0 {
+		return nil, fmt.Errorf("sub_workflow node has no workflow_id")
+	}
+
+	if d := e.depth.Add(1); d > maxSubWorkflowDepth {
+		e.depth.Add(-1)
+		return nil, fmt.Errorf("sub_workflow nesting too deep (>%d)", maxSubWorkflowDepth)
+	}
+	defer e.depth.Add(-1)
+
+	nodesJSON, edgesJSON, err := e.resolveWorkflow(uint(wfID))
+	if err != nil {
+		return nil, fmt.Errorf("resolve sub workflow %d failed: %w", wfID, err)
+	}
+
+	var sub []model.NodeInstance
+	if err := json.Unmarshal(nodesJSON, &sub); err != nil {
+		return nil, fmt.Errorf("parse sub workflow %d nodes failed: %w", wfID, err)
+	}
+
+	// 上游文本注入内层 start（仅当内层 start 未配置 prompt）
+	if len(sub) > 0 && sub[0].Type == "start" {
+		if p, _ := sub[0].Data["prompt"].(string); p == "" {
+			for _, out := range upstream {
+				if m, ok := out.(map[string]interface{}); ok {
+					if t, ok := m["text"].(string); ok && t != "" {
+						sub[0].Data["prompt"] = t
+						break
+					}
+				}
+			}
+		}
+	}
+
+	subNodesJSON, err := json.Marshal(sub)
+	if err != nil {
+		return nil, err
+	}
+
+	states, err := e.run(subNodesJSON, edgesJSON, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sub workflow %d failed: %w", wfID, err)
+	}
+
+	// 返回内层 end 节点输出；缺失时退化为最后一个节点输出
+	for i := range states {
+		if states[i].Type == "end" && states[i].Status == "success" {
+			return states[i].Output, nil
+		}
+	}
+	if len(states) > 0 {
+		return states[len(states)-1].Output, nil
+	}
+	return map[string]interface{}{"text": ""}, nil
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -61,6 +62,22 @@ func main() {
 	// 引擎
 	engine := service.NewEngineV2(llmService, t2iService, asrService, ttsService, videoService, httpService, ragService, gpuSched, wsHub)
 
+	// 子工作流解析器（从 DB 读取嵌套工作流定义）
+	engine.SetResolver(func(id uint) ([]byte, []byte, error) {
+		var wf model.Workflow
+		if err := db.First(&wf, id).Error; err != nil {
+			return nil, nil, err
+		}
+		return []byte(wf.Nodes), []byte(wf.Edges), nil
+	})
+
+	// GPU 真实遥测轮询（缓存 nvidia-smi 结果，避免每请求拉子进程）
+	gpuSched.StartTelemetry(5 * time.Second)
+
+	if getEnv("FLOWEDGE_MODE", "release") == "release" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
 	// 初始化路由
 	r := gin.Default()
 
@@ -91,6 +108,7 @@ func main() {
 		api.POST("/workflows/:id/run", wfHandler.Run)
 		api.GET("/workflows/:id/runs", wfHandler.ListRuns)
 		api.GET("/runs/:runId", wfHandler.GetRun)
+		api.POST("/runs/:runId/resume", wfHandler.ResumeRun)
 
 		// 版本管理
 		api.GET("/workflows/:id/versions", versionHandler.ListVersions)
