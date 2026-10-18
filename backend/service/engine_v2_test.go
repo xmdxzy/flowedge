@@ -434,3 +434,191 @@ drained:
 		}
 	}
 }
+
+// loopInner 内层工作流：start → data_transform({{input}}+ ) → end
+// 每轮把输入追加一个 "+"，用于验证链式迭代（上一轮输出 → 下一轮输入）
+func loopInner(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "in-s", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{}},
+		{"id": "in-t", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"template": "{{input}}+"}},
+		{"id": "in-e", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "ie1", "source": "in-s", "target": "in-t"},
+		{"id": "ie2", "source": "in-t", "target": "in-e"},
+	})
+	return nodes, edges
+}
+
+// loopState 启动一个外层 start → loop → end 并返回 loop 节点输出
+func runLoopCase(t *testing.T, loopData map[string]interface{}, prompt string) (map[string]interface{}, *EngineV2) {
+	t.Helper()
+	e := newTestEngine()
+	innerNodes, innerEdges := loopInner(t)
+	e.SetResolver(func(id uint) ([]byte, []byte, error) {
+		if id == 88 {
+			return innerNodes, innerEdges, nil
+		}
+		return nil, nil, fmt.Errorf("workflow %d not found", id)
+	})
+
+	loopData["workflow_id"] = 88
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": prompt}},
+		{"id": "lp", "type": "loop", "position": map[string]float64{"x": 1, "y": 0}, "data": loopData},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "lp"},
+		{"id": "b", "source": "lp", "target": "e1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("loop execute failed: %v", err)
+	}
+	for _, n := range states {
+		if n.ID == "lp" {
+			m, ok := n.Output.(map[string]interface{})
+			if !ok {
+				t.Fatalf("loop output is not a map: %v", n.Output)
+			}
+			return m, e
+		}
+	}
+	t.Fatalf("loop node state missing")
+	return nil, nil
+}
+
+// count 模式：固定 3 轮，每轮以上一轮输出为输入（链式精炼）
+func TestEngine_LoopCount(t *testing.T) {
+	out, _ := runLoopCase(t, map[string]interface{}{
+		"mode":       "count",
+		"iterations": 3,
+	}, "a")
+
+	if got := out["text"]; got != "a+++" {
+		t.Errorf("loop text = %v, want a+++", got)
+	}
+	if got := out["iterations"]; got != 3 {
+		t.Errorf("iterations = %v, want 3", got)
+	}
+	if got := out["stopped_by"]; got != "completed" {
+		t.Errorf("stopped_by = %v, want completed", got)
+	}
+
+	items, ok := out["items"].([]interface{})
+	if !ok || len(items) != 3 {
+		t.Fatalf("items = %v, want 3 records", out["items"])
+	}
+	wantInputs := []string{"a", "a+", "a++"}
+	for i, it := range items {
+		rec := it.(map[string]interface{})
+		if rec["input"] != wantInputs[i] {
+			t.Errorf("iteration %d input = %v, want %s (not chained?)", i+1, rec["input"], wantInputs[i])
+		}
+	}
+}
+
+// foreach 模式：按换行切分上游文本，逐项输入，迭代次数 = 条目数
+func TestEngine_LoopForeach(t *testing.T) {
+	out, _ := runLoopCase(t, map[string]interface{}{
+		"mode": "foreach",
+	}, "x\ny\nz")
+
+	if got := out["iterations"]; got != 3 {
+		t.Errorf("iterations = %v, want 3", got)
+	}
+	if got := out["stopped_by"]; got != "exhausted" {
+		t.Errorf("stopped_by = %v, want exhausted", got)
+	}
+	if got := out["text"]; got != "z+" {
+		t.Errorf("text = %v, want z+ (last item output)", got)
+	}
+
+	items := out["items"].([]interface{})
+	want := []string{"x", "y", "z"}
+	for i, it := range items {
+		if rec := it.(map[string]interface{}); rec["input"] != want[i] {
+			t.Errorf("iteration %d input = %v, want %s", i+1, rec["input"], want[i])
+		}
+	}
+}
+
+// until 模式：条件命中即停（本例跑到第三轮出现 "+++"）
+func TestEngine_LoopUntil(t *testing.T) {
+	out, _ := runLoopCase(t, map[string]interface{}{
+		"mode":           "until",
+		"condition_type": "contains",
+		"compare_value":  "+++",
+		"max_iterations": 10,
+	}, "a")
+
+	if got := out["iterations"]; got != 3 {
+		t.Errorf("iterations = %v, want 3 (stop at a+++)", got)
+	}
+	if got := out["stopped_by"]; got != "condition" {
+		t.Errorf("stopped_by = %v, want condition", got)
+	}
+	if got := out["text"]; got != "a+++" {
+		t.Errorf("text = %v, want a+++", got)
+	}
+}
+
+// 安全阀：条件永不满足时必须被 max_iterations 截断，不能无限跑
+func TestEngine_LoopMaxIterations(t *testing.T) {
+	out, _ := runLoopCase(t, map[string]interface{}{
+		"mode":           "until",
+		"condition_type": "contains",
+		"compare_value":  "never-appears",
+		"max_iterations": 4,
+	}, "a")
+
+	if got := out["iterations"]; got != 4 {
+		t.Errorf("iterations = %v, want 4", got)
+	}
+	if got := out["stopped_by"]; got != "max_iterations" {
+		t.Errorf("stopped_by = %v, want max_iterations", got)
+	}
+	if got := out["text"]; got != "a++++" {
+		t.Errorf("text = %v, want a++++", got)
+	}
+}
+
+// 模板引擎：{{input}} 与 JSON 字段路径替换（此前 replacePlaceholders 是空壳，模板等于摆设）
+func TestTransform_TemplatePlaceholders(t *testing.T) {
+	e := newTestEngine()
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": `{"name":"道门","nested":{"v":7}}`}},
+		{"id": "t1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"template": "项目={{name}} 版本={{nested.v}} 原文={{input}}"}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "t1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("transform execute failed: %v", err)
+	}
+	for _, n := range states {
+		if n.ID == "t1" {
+			got := n.Output.(map[string]interface{})["text"]
+			want := `项目=道门 版本=7 原文={"name":"道门","nested":{"v":7}}`
+			if got != want {
+				t.Errorf("template render = %q, want %q", got, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("transform node state missing")
+}
+
+// 纯文本输入时只替换 {{input}}，其它占位符保留原文
+func TestTransform_PlainInputKeepsUnknownPlaceholders(t *testing.T) {
+	got := replacePlaceholders("前缀-{{input}}-{{unknown}}", "纯文本")
+	if got != "前缀-纯文本-{{unknown}}" {
+		t.Errorf("render = %q", got)
+	}
+}

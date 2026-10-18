@@ -11,8 +11,11 @@ import (
 	"flowedge/backend/model"
 )
 
-// maxSubWorkflowDepth 子工作流最大嵌套深度
+// maxSubWorkflowDepth 子工作流/循环最大嵌套深度
 const maxSubWorkflowDepth = 4
+
+// maxLoopIterations 循环节点硬迭代上限（安全阀，防止无限循环打爆资源）
+const maxLoopIterations = 100
 
 // EngineV2 增强版工作流引擎
 type EngineV2 struct {
@@ -383,6 +386,9 @@ func (e *EngineV2) executeNode(node *model.NodeInstance, upstream map[string]int
 	case "sub_workflow":
 		return e.execSubWorkflowNode(node, upstream)
 
+	case "loop":
+		return e.execLoopNode(node, upstream)
+
 	case "end":
 		return e.execEndNode(node, upstream)
 
@@ -630,26 +636,31 @@ func (e *EngineV2) execIfElseNode(node *model.NodeInstance, upstream map[string]
 	compareValue, _ := node.Data["compare_value"].(string)
 
 	branch := "false"
-
-	switch conditionType {
-	case "contains":
-		if strings.Contains(inputText, compareValue) {
-			branch = "true"
-		}
-	case "not_empty":
-		if inputText != "" {
-			branch = "true"
-		}
-	case "equals":
-		if inputText == compareValue {
-			branch = "true"
-		}
+	if matchCondition(conditionType, inputText, compareValue) {
+		branch = "true"
 	}
 
 	return map[string]interface{}{
 		"text":   inputText,
 		"branch": branch,
 	}, nil
+}
+
+// matchCondition 通用条件判定，if_else 分支与 loop 的 until 终止共用
+func matchCondition(condType, text, compareValue string) bool {
+	switch condType {
+	case "contains":
+		return strings.Contains(text, compareValue)
+	case "not_contains":
+		return !strings.Contains(text, compareValue)
+	case "not_empty":
+		return strings.TrimSpace(text) != ""
+	case "empty":
+		return strings.TrimSpace(text) == ""
+	case "equals":
+		return text == compareValue
+	}
+	return false
 }
 
 func (e *EngineV2) execEndNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
@@ -690,28 +701,30 @@ func (e *EngineV2) execHTTPNode(node *model.NodeInstance, upstream map[string]in
 }
 
 func (e *EngineV2) execTransformNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	// 获取上游文本
-	inputText := ""
-	for _, out := range upstream {
-		if m, ok := out.(map[string]interface{}); ok {
-			if text, ok := m["text"].(string); ok {
-				inputText = text
-			}
-		}
-	}
+	inputText := upstreamText(upstream)
 
 	template, _ := node.Data["template"].(string)
 	if template == "" {
-		template = inputText
+		return map[string]interface{}{"text": inputText}, nil
 	}
 
-	result, err := e.http.TransformJSON(inputText, template)
-	if err != nil {
-		// 简单回退：直接返回
-		result = template
+	// 输入是合法 JSON 时按对象处理（支持 {{a.b}}），否则只替换 {{input}}
+	var data interface{} = inputText
+	if m, err := parseJSONObject(inputText); err == nil {
+		m["input"] = inputText
+		data = m
 	}
 
-	return map[string]interface{}{"text": result}, nil
+	return map[string]interface{}{"text": replacePlaceholders(template, data)}, nil
+}
+
+// parseJSONObject 尝试把文本解析为 JSON 对象
+func parseJSONObject(s string) (map[string]interface{}, error) {
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
@@ -757,50 +770,23 @@ func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]int
 	}, nil
 }
 
-// execSubWorkflowNode 子工作流：解析 workflow_id → 注入上游文本到内层 start → 嵌套执行 → 返回内层 end 输出
-func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	if e.resolveWorkflow == nil {
-		return nil, fmt.Errorf("sub_workflow resolver not configured")
-	}
-
-	wfID := 0
-	switch v := node.Data["workflow_id"].(type) {
-	case float64:
-		wfID = int(v)
-	case int:
-		wfID = v
-	}
-	if wfID <= 0 {
-		return nil, fmt.Errorf("sub_workflow node has no workflow_id")
-	}
-
-	if d := e.depth.Add(1); d > maxSubWorkflowDepth {
-		e.depth.Add(-1)
-		return nil, fmt.Errorf("sub_workflow nesting too deep (>%d)", maxSubWorkflowDepth)
-	}
-	defer e.depth.Add(-1)
-
-	nodesJSON, edgesJSON, err := e.resolveWorkflow(uint(wfID))
+// executeInnerWorkflow 解析并内联执行一个内层工作流
+// injectText 非空时注入内层 start：overwrite=true 强制覆盖（循环每轮迭代用），
+// false 仅在 start 未配置 prompt 时注入（子工作流节点语义）
+func (e *EngineV2) executeInnerWorkflow(wfID uint, injectText string, overwrite bool) (interface{}, error) {
+	nodesJSON, edgesJSON, err := e.resolveWorkflow(wfID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve sub workflow %d failed: %w", wfID, err)
+		return nil, fmt.Errorf("resolve workflow %d failed: %w", wfID, err)
 	}
 
 	var sub []model.NodeInstance
 	if err := json.Unmarshal(nodesJSON, &sub); err != nil {
-		return nil, fmt.Errorf("parse sub workflow %d nodes failed: %w", wfID, err)
+		return nil, fmt.Errorf("parse workflow %d nodes failed: %w", wfID, err)
 	}
 
-	// 上游文本注入内层 start（仅当内层 start 未配置 prompt）
-	if len(sub) > 0 && sub[0].Type == "start" {
-		if p, _ := sub[0].Data["prompt"].(string); p == "" {
-			for _, out := range upstream {
-				if m, ok := out.(map[string]interface{}); ok {
-					if t, ok := m["text"].(string); ok && t != "" {
-						sub[0].Data["prompt"] = t
-						break
-					}
-				}
-			}
+	if injectText != "" && len(sub) > 0 && sub[0].Type == "start" {
+		if cur, _ := sub[0].Data["prompt"].(string); overwrite || cur == "" {
+			sub[0].Data["prompt"] = injectText
 		}
 	}
 
@@ -811,7 +797,7 @@ func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[st
 
 	states, err := e.run(subNodesJSON, edgesJSON, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("sub workflow %d failed: %w", wfID, err)
+		return nil, fmt.Errorf("workflow %d failed: %w", wfID, err)
 	}
 
 	// 返回内层 end 节点输出；缺失时退化为最后一个节点输出
@@ -824,4 +810,230 @@ func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[st
 		return states[len(states)-1].Output, nil
 	}
 	return map[string]interface{}{"text": ""}, nil
+}
+
+// execSubWorkflowNode 子工作流：解析 workflow_id → 注入上游文本到内层 start → 嵌套执行 → 返回内层 end 输出
+func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	if e.resolveWorkflow == nil {
+		return nil, fmt.Errorf("sub_workflow resolver not configured")
+	}
+
+	wfID := uint(dataInt(node.Data, "workflow_id", 0))
+	if wfID == 0 {
+		return nil, fmt.Errorf("sub_workflow node has no workflow_id")
+	}
+
+	if d := e.depth.Add(1); d > maxSubWorkflowDepth {
+		e.depth.Add(-1)
+		return nil, fmt.Errorf("sub_workflow nesting too deep (>%d)", maxSubWorkflowDepth)
+	}
+	defer e.depth.Add(-1)
+
+	out, err := e.executeInnerWorkflow(wfID, upstreamText(upstream), false)
+	if err != nil {
+		return nil, fmt.Errorf("sub workflow %d: %w", wfID, err)
+	}
+	return out, nil
+}
+
+// dataInt 从节点数据里取整数（JSON 数字是 float64，也兼容 int）
+func dataInt(data map[string]interface{}, key string, def int) int {
+	switch v := data[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	}
+	return def
+}
+
+// upstreamText 取上游输出里第一个非空 text
+func upstreamText(upstream map[string]interface{}) string {
+	for _, out := range upstream {
+		if m, ok := out.(map[string]interface{}); ok {
+			if t, ok := m["text"].(string); ok && t != "" {
+				return t
+			}
+		}
+		if s, ok := out.(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// execLoopNode 循环节点：迭代执行内层工作流
+//   mode=count  固定次数（iterations），每轮以上一轮输出为输入（链式精炼）
+//   mode=foreach 遍历 items（或按 separator 切分上游文本），逐项输入
+//   mode=until  至少跑一轮，直到 stop_condition 命中后停止
+//
+// 安全阀：max_iterations（默认 20，硬上限 100）
+func (e *EngineV2) execLoopNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	if e.resolveWorkflow == nil {
+		return nil, fmt.Errorf("loop resolver not configured")
+	}
+
+	wfID := uint(dataInt(node.Data, "workflow_id", 0))
+	if wfID == 0 {
+		return nil, fmt.Errorf("loop node has no workflow_id")
+	}
+
+	mode, _ := node.Data["mode"].(string)
+	if mode == "" {
+		mode = "count"
+	}
+
+	maxIter := dataInt(node.Data, "max_iterations", 20)
+	if maxIter <= 0 {
+		maxIter = 20
+	}
+	if maxIter > maxLoopIterations {
+		maxIter = maxLoopIterations
+	}
+
+	if d := e.depth.Add(1); d > maxSubWorkflowDepth {
+		e.depth.Add(-1)
+		return nil, fmt.Errorf("loop nesting too deep (>%d)", maxSubWorkflowDepth)
+	}
+	defer e.depth.Add(-1)
+
+	seed := upstreamText(upstream)
+	if v, ok := node.Data["input"].(string); ok && v != "" {
+		seed = v
+	}
+
+	// foreach：优先显式 items 数组，其次按分隔符切分上游文本
+	var items []string
+	if mode == "foreach" {
+		if arr, ok := node.Data["items"].([]interface{}); ok {
+			for _, it := range arr {
+				items = append(items, fmt.Sprintf("%v", it))
+			}
+		}
+		if len(items) == 0 {
+			sep, _ := node.Data["separator"].(string)
+			if sep == "" {
+				sep = "\n"
+			}
+			for _, line := range strings.Split(seed, sep) {
+				if t := strings.TrimSpace(line); t != "" {
+					items = append(items, t)
+				}
+			}
+		}
+		if len(items) == 0 {
+			return map[string]interface{}{
+				"text":       "",
+				"iterations": 0,
+				"stopped_by": "empty_items",
+				"items":      []interface{}{},
+			}, nil
+		}
+		if len(items) > maxIter {
+			items = items[:maxIter]
+		}
+	}
+
+	condType, _ := node.Data["condition_type"].(string)
+	condValue, _ := node.Data["compare_value"].(string)
+	if condType == "" {
+		condType = "not_empty"
+	}
+
+	current := seed
+	var texts []string
+	records := make([]interface{}, 0, maxIter)
+	stoppedBy := ""
+	iter := 0
+
+	for {
+		if iter >= maxIter {
+			stoppedBy = "max_iterations"
+			break
+		}
+		if mode == "foreach" && iter >= len(items) {
+			stoppedBy = "exhausted"
+			break
+		}
+
+		input := current
+		if mode == "foreach" {
+			input = items[iter]
+		}
+
+		out, err := e.executeInnerWorkflow(wfID, input, true)
+		if err != nil {
+			return nil, fmt.Errorf("loop iteration %d failed: %w", iter+1, err)
+		}
+
+		text := ""
+		if m, ok := out.(map[string]interface{}); ok {
+			text, _ = m["text"].(string)
+		}
+		texts = append(texts, text)
+		records = append(records, map[string]interface{}{
+			"index":  iter + 1,
+			"input":  input,
+			"output": text,
+		})
+		iter++
+
+		// 每轮广播进度（低频事件，前端可显示迭代计数）
+		if e.wsHub != nil {
+			e.wsHub.Broadcast(Event{
+				Type:   "loop_iteration",
+				NodeID: node.ID,
+				Data: map[string]interface{}{
+					"iteration": iter,
+					"max":       maxIter,
+					"output":    truncateRunes(text, 120),
+				},
+			})
+		}
+
+		if mode == "until" && matchCondition(condType, text, condValue) {
+			stoppedBy = "condition"
+			break
+		}
+
+		current = text
+		if mode == "count" {
+			// count 模式按 iterations 指定的次数跑
+			want := dataInt(node.Data, "iterations", 3)
+			if want <= 0 {
+				want = 3
+			}
+			if want > maxIter {
+				want = maxIter
+			}
+			if iter >= want {
+				stoppedBy = "completed"
+				break
+			}
+		}
+	}
+
+	last := seed
+	if len(texts) > 0 {
+		last = texts[len(texts)-1]
+	}
+
+	return map[string]interface{}{
+		"text":       last,
+		"all":        strings.Join(texts, "\n---\n"),
+		"iterations": iter,
+		"stopped_by": stoppedBy,
+		"items":      records,
+	}, nil
+}
+
+// truncateRunes 按字符截断（避免切坏多字节）
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }

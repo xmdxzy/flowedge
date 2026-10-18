@@ -25,6 +25,7 @@ import TTSNode from './nodes/TTSNode'
 import VideoNode from './nodes/VideoNode'
 import IfElseNode from './nodes/IfElseNode'
 import SubWorkflowNode from './nodes/SubWorkflowNode'
+import LoopNode from './nodes/LoopNode'
 import HTTPNode from './nodes/HTTPNode'
 import TransformNode from './nodes/TransformNode'
 import RAGNode from './nodes/RAGNode'
@@ -46,6 +47,7 @@ const nodeTypes: NodeTypes = {
   video_compose: VideoNode,
   if_else: IfElseNode,
   sub_workflow: SubWorkflowNode,
+  loop: LoopNode,
   http_request: HTTPNode,
   data_transform: TransformNode,
   rag_query: RAGNode,
@@ -209,6 +211,15 @@ function FlowEditor() {
     }
   }
 
+  // 深链：?workflow=<id> 直接打开指定工作流（Electron 启动参数 / 分享链接用）
+  useEffect(() => {
+    const wfId = new URLSearchParams(window.location.search).get('workflow')
+    if (wfId && /^\d+$/.test(wfId)) {
+      loadWorkflow(Number(wfId))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // WebSocket 实时事件处理
   const handleWSEvent = (event: WSEvent) => {
     if (event.type === 'node_started' && event.node_id) {
@@ -216,7 +227,7 @@ function FlowEditor() {
       setNodes((nds) =>
         nds.map((n) =>
           n.id === event.node_id
-            ? { ...n, data: { ...n.data, status: 'running', streamText: '' } }
+            ? { ...n, data: { ...n.data, status: 'running', streamText: '', loop_iteration: 0 } }
             : n,
         ),
       )
@@ -229,10 +240,18 @@ function FlowEditor() {
         ),
       )
     } else if (event.type === 'node_finished' && event.node_id) {
+      const finalIter = (event.data?.output as Record<string, any> | undefined)?.iterations
       setNodes((nds) =>
         nds.map((n) =>
           n.id === event.node_id
-            ? { ...n, data: { ...n.data, status: 'success' } }
+            ? {
+                ...n,
+                data: {
+                  ...n.data,
+                  status: 'success',
+                  ...(typeof finalIter === 'number' ? { loop_iteration: finalIter } : {}),
+                },
+              }
             : n,
         ),
       )
@@ -257,6 +276,15 @@ function FlowEditor() {
           e.source === event.node_id
             ? { ...e, animated: false }
             : e,
+        ),
+      )
+    } else if (event.type === 'loop_iteration' && event.node_id) {
+      // 循环节点每轮进度（低频，直接刷）
+      setNodes((nds) =>
+        nds.map((n) =>
+          n.id === event.node_id
+            ? { ...n, data: { ...n.data, loop_iteration: event.data?.iteration as number } }
+            : n,
         ),
       )
     } else if (event.type === 'node_token' && event.node_id) {
@@ -385,7 +413,7 @@ function FlowEditor() {
   }
 
   // 更新选中节点的数据
-  const updateSelectedNodeData = (key: string, value: string) => {
+  const updateSelectedNodeData = (key: string, value: unknown) => {
     if (!selectedNode) return
     setNodes((nds) =>
       nds.map((n) =>
@@ -563,6 +591,24 @@ function FlowEditor() {
           <div className="w-3 h-3 rounded-full bg-warning" />
           <span className="text-sm">条件分支</span>
         </div>
+        <div
+          draggable
+          onDragStart={(e) => onDragStart(e, 'loop')}
+          onClick={() => addNode('loop')}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
+        >
+          <div className="w-3 h-3 rounded-full bg-warning" />
+          <span className="text-sm">循环</span>
+        </div>
+        <div
+          draggable
+          onDragStart={(e) => onDragStart(e, 'sub_workflow')}
+          onClick={() => addNode('sub_workflow')}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
+        >
+          <div className="w-3 h-3 rounded-full bg-purple" />
+          <span className="text-sm">子工作流</span>
+        </div>
 
         <div className="fe-section-label mt-3 mb-1">AI 推理</div>
         <div
@@ -620,15 +666,6 @@ function FlowEditor() {
         >
           <div className="w-3 h-3 rounded-full bg-purple" />
           <span className="text-sm">视频合成</span>
-        </div>
-        <div
-          draggable
-          onDragStart={(e) => onDragStart(e, 'sub_workflow')}
-          onClick={() => addNode('sub_workflow')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
-        >
-          <div className="w-3 h-3 rounded-full bg-purple" />
-          <span className="text-sm">子工作流</span>
         </div>
 
         <div className="fe-section-label mt-3 mb-1">数据处理</div>
@@ -927,6 +964,118 @@ function FlowEditor() {
               </>
             )}
 
+            {(selectedNode.type === 'sub_workflow' || selectedNode.type === 'loop') && (
+              <>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">引用工作流</label>
+                  <select
+                    value={(selectedNode.data.workflow_id as number) ?? ''}
+                    onChange={(e) => {
+                      const id = e.target.value ? Number(e.target.value) : undefined
+                      const wf = savedWorkflows.find((w) => w.id === id)
+                      updateSelectedNodeData('workflow_id', id)
+                      updateSelectedNodeData('workflow_name', wf?.name || '')
+                    }}
+                    className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                  >
+                    <option value="">选择工作流...</option>
+                    {savedWorkflows
+                      .filter((w) => w.id !== currentWorkflowId)
+                      .map((w) => (
+                        <option key={w.id} value={w.id}>
+                          {w.name} (#{w.id})
+                        </option>
+                      ))}
+                  </select>
+                  {!selectedNode.data.workflow_id && (
+                    <p className="text-[10px] text-warning mt-1">需先保存目标工作流，再回到此处选择</p>
+                  )}
+                </div>
+
+                {selectedNode.type === 'loop' && (
+                  <>
+                    <div>
+                      <label className="text-xs text-gray-400 block mb-1">循环模式</label>
+                      <select
+                        value={(selectedNode.data.mode as string) || 'count'}
+                        onChange={(e) => updateSelectedNodeData('mode', e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                      >
+                        <option value="count">固定次数（每轮以上一轮输出为输入）</option>
+                        <option value="foreach">遍历列表（按分隔符切分上游）</option>
+                        <option value="until">条件循环（满足即停）</option>
+                      </select>
+                    </div>
+
+                    {(selectedNode.data.mode || 'count') === 'count' && (
+                      <div>
+                        <label className="text-xs text-gray-400 block mb-1">迭代次数</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={(selectedNode.data.iterations as number) ?? 3}
+                          onChange={(e) => updateSelectedNodeData('iterations', Number(e.target.value))}
+                          className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                        />
+                      </div>
+                    )}
+
+                    {selectedNode.data.mode === 'foreach' && (
+                      <div>
+                        <label className="text-xs text-gray-400 block mb-1">分隔符</label>
+                        <input
+                          value={(selectedNode.data.separator as string) ?? ''}
+                          onChange={(e) => updateSelectedNodeData('separator', e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                          placeholder="留空按换行切分"
+                        />
+                      </div>
+                    )}
+
+                    {selectedNode.data.mode === 'until' && (
+                      <>
+                        <div>
+                          <label className="text-xs text-gray-400 block mb-1">停止条件</label>
+                          <select
+                            value={(selectedNode.data.condition_type as string) || 'not_empty'}
+                            onChange={(e) => updateSelectedNodeData('condition_type', e.target.value)}
+                            className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                          >
+                            <option value="not_empty">输出不为空</option>
+                            <option value="contains">输出包含</option>
+                            <option value="not_contains">输出不包含</option>
+                            <option value="equals">输出等于</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-400 block mb-1">比较值</label>
+                          <input
+                            value={(selectedNode.data.compare_value as string) || ''}
+                            onChange={(e) => updateSelectedNodeData('compare_value', e.target.value)}
+                            className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                            placeholder="如 DONE"
+                          />
+                        </div>
+                      </>
+                    )}
+
+                    <div>
+                      <label className="text-xs text-gray-400 block mb-1">最大迭代（安全阀）</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={(selectedNode.data.max_iterations as number) ?? 20}
+                        onChange={(e) => updateSelectedNodeData('max_iterations', Number(e.target.value))}
+                        className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-warning outline-none"
+                      />
+                      <p className="text-[10px] text-gray-500 mt-1">硬上限 100，达到即中止并返回已有结果</p>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+
             {selectedNode.type === 'if_else' && (
               <>
                 <div>
@@ -994,7 +1143,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'start':
       return { prompt: '' }
     case 'llm':
-      return { model: 'qwen2.5:7b', prompt: '' }
+      return { model: 'qwen2.5-coder:32b', prompt: '' }
     case 'end':
       return {}
     case 'text2image':
@@ -1009,6 +1158,16 @@ function getDefaultNodeData(type: string): Record<string, any> {
       return { condition_type: 'not_empty', compare_value: '' }
     case 'sub_workflow':
       return { workflow_id: undefined, workflow_name: '' }
+    case 'loop':
+      return {
+        workflow_id: undefined,
+        workflow_name: '',
+        mode: 'count',
+        iterations: 3,
+        max_iterations: 20,
+        condition_type: 'not_empty',
+        compare_value: '',
+      }
     case 'http_request':
       return { method: 'GET', url: '', headers: {}, body: '' }
     case 'data_transform':

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -66,8 +69,69 @@ func (s *HTTPService) TransformJSON(input string, template string) (string, erro
 	return result, nil
 }
 
+// replacePlaceholders 模板占位符替换
+// 支持 {{input}} / {{text}}（原始输入）与 {{field}} / {{a.b}}（输入为 JSON 时取字段）
 func replacePlaceholders(template string, data interface{}) string {
-	// 简单实现：递归查找字段
-	// 实际生产中应该用模板引擎
-	return template
+	var obj map[string]interface{}
+	if m, ok := data.(map[string]interface{}); ok {
+		obj = m
+	}
+
+	// 原始输入：JSON 对象场景下由调用方塞在 "input" 键里，避免打印成 map[...]
+	input := ""
+	if obj != nil {
+		if s, ok := obj["input"].(string); ok {
+			input = s
+		}
+	}
+	if input == "" {
+		input = fmt.Sprintf("%v", data)
+	}
+
+	return placeholderRe.ReplaceAllStringFunc(template, func(match string) string {
+		key := strings.TrimSpace(match[2 : len(match)-2])
+		switch key {
+		case "input", "text":
+			return input
+		}
+		if obj == nil {
+			return match
+		}
+		return lookupPath(obj, key)
+	})
+}
+
+// placeholderRe 匹配 {{...}} 占位符
+var placeholderRe = regexp.MustCompile(`\{\{[^{}]+\}\}`)
+
+// lookupPath 按点号路径取值，缺失时保留占位符原文
+func lookupPath(obj map[string]interface{}, path string) string {
+	var cur interface{} = obj
+	for _, seg := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return "{{" + path + "}}"
+		}
+		cur, ok = m[seg]
+		if !ok {
+			return "{{" + path + "}}"
+		}
+	}
+	switch v := cur.(type) {
+	case string:
+		return v
+	case nil:
+		return ""
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(b)
+	}
 }

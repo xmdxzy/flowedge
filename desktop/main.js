@@ -92,7 +92,8 @@ function createWindow() {
     shell.openExternal(url)
     return { action: 'deny' }
   })
-  win.loadURL(BASE_URL)
+  const openWf = process.env.FLOWEDGE_OPEN_WORKFLOW
+  win.loadURL(openWf ? `${BASE_URL}/?workflow=${openWf}` : BASE_URL)
 
   // 启动 5 秒后截屏存盘（用于自动化视觉验收）
   win.webContents.on('console-message', (_e, level, message) => {
@@ -100,6 +101,26 @@ function createWindow() {
   })
   win.webContents.on('did-finish-load', () => {
     setTimeout(async () => {
+      // 可选：自动点选某个节点（UI 验收时把配置面板一并截进来）
+      const clickNode = process.env.FLOWEDGE_CLICK_NODE
+      if (clickNode) {
+        try {
+          await win.webContents.executeJavaScript(
+            `(() => {
+              const el = document.querySelector('[data-id="${clickNode}"]')
+              if (!el) return 'node not found'
+              el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }))
+              el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+              el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+              el.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+              return 'clicked'
+            })()`,
+          )
+          await new Promise((r) => setTimeout(r, 1200))
+        } catch (err) {
+          console.error('[flowedge] click node failed:', err.message)
+        }
+      }
       try {
         const image = await win.webContents.capturePage()
         const out = process.env.FLOWEDGE_SCREENSHOT || path.join(__dirname, 'window-screenshot.png')
