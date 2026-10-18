@@ -18,7 +18,10 @@ import (
 //   - 节点数据是共享结构，resolveData 返回深拷贝，不污染持久化的定义
 //   - 未知节点 / 未知字段保持原文（便于用户一眼看出哪里没取到值）
 
-var varRefRe = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_-]+)\.([A-Za-z0-9_.]+)\s*\}\}`)
+// varRefRe 变量引用：{{nodeId.path}}。
+// path 支持点号与数组索引：a、a.b、a[0]、a[0].b、a.b[1].c
+// （此前只支持纯点号路径，数组输出只能靠 data_transform 拼 JSON，体验很差）
+var varRefRe = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+(?:\[\d+\])*(?:\.[A-Za-z0-9_]+(?:\[\d+\])*)*)\s*\}\}`)
 
 // resolveData 深拷贝节点数据并替换其中的变量引用
 func resolveData(data map[string]interface{}, ctx map[string]interface{}) map[string]interface{} {
@@ -74,16 +77,58 @@ func resolveString(s string, ctx map[string]interface{}) string {
 	})
 }
 
-// lookupOutputField 按点号路径从节点输出里取值并转成字符串
+// jsonPathTokens 把 "a.b[0].c" 拆成 ["a", "b", 0, "c"]。
+// TOKEN 里 string 表示对象字段，int 表示数组下标；语法不完整时退化为字段名。
+func jsonPathTokens(path string) []interface{} {
+	var toks []interface{}
+	for _, seg := range strings.Split(path, ".") {
+		for seg != "" {
+			open := strings.IndexByte(seg, '[')
+			if open < 0 {
+				toks = append(toks, seg)
+				break
+			}
+			if name := seg[:open]; name != "" {
+				toks = append(toks, name)
+			}
+			closeAt := strings.IndexByte(seg, ']')
+			if closeAt < open {
+				toks = append(toks, seg[open:]) // 语法残缺：当成普通字段名
+				break
+			}
+			idx := seg[open+1 : closeAt]
+			if n, err := strconv.Atoi(idx); err == nil {
+				toks = append(toks, n)
+			} else {
+				toks = append(toks, idx)
+			}
+			seg = seg[closeAt+1:]
+		}
+	}
+	return toks
+}
+
+// lookupOutputField 按路径（含数组索引）从节点输出里取值并转成字符串
 func lookupOutputField(v interface{}, path string) (string, bool) {
 	var cur interface{} = v
-	for _, seg := range strings.Split(path, ".") {
-		m, ok := cur.(map[string]interface{})
-		if !ok {
-			return "", false
-		}
-		cur, ok = m[seg]
-		if !ok {
+	for _, tok := range jsonPathTokens(path) {
+		switch key := tok.(type) {
+		case int:
+			arr, ok := cur.([]interface{})
+			if !ok || key < 0 || key >= len(arr) {
+				return "", false
+			}
+			cur = arr[key]
+		case string:
+			m, ok := cur.(map[string]interface{})
+			if !ok {
+				return "", false
+			}
+			cur, ok = m[key]
+			if !ok {
+				return "", false
+			}
+		default:
 			return "", false
 		}
 	}

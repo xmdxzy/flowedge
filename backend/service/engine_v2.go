@@ -74,6 +74,7 @@ type EngineV2 struct {
 	wsHub           *WSHub
 	tools           *ToolExecutor
 	cache           *NodeCache
+	eventLog        *EventLogger
 	runMu           sync.Mutex
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
@@ -92,6 +93,40 @@ func (e *EngineV2) SetResolver(fn func(uint) ([]byte, []byte, error)) {
 
 // SetCache 注入节点缓存（nil 表示不启用）
 func (e *EngineV2) SetCache(c *NodeCache) { e.cache = c }
+
+// SetEventLog 注入事件日志（nil 表示只广播不落库）
+func (e *EngineV2) SetEventLog(l *EventLogger) { e.eventLog = l }
+
+// ctxKeyRunID runID 在 context 里的键类型（避免与其他包的 context 键冲突）
+type ctxKeyRunID struct{}
+
+// withRunID 把 runID 注入 context，供引擎子树取用
+func withRunID(ctx context.Context, id uint) context.Context {
+	return context.WithValue(ctx, ctxKeyRunID{}, id)
+}
+
+// runIDFrom 取 runID；取不到返回 0（表示独立执行，不入事件日志）
+func runIDFrom(ctx context.Context) uint {
+	if ctx == nil {
+		return 0
+	}
+	if v, ok := ctx.Value(ctxKeyRunID{}).(uint); ok {
+		return v
+	}
+	return 0
+}
+
+// emit 广播 + 落库。
+// 广播保持原有的非阻塞语义（WSHub 缓冲满即丢弃），落库失败只记日志不阻塞引擎。
+func (e *EngineV2) emit(runID uint, ev Event) {
+	ev.RunID = runID
+	if e.wsHub != nil {
+		e.wsHub.Broadcast(ev)
+	}
+	if e.eventLog != nil {
+		e.eventLog.Emit(runID, ev)
+	}
+}
 
 func NewEngineV2(
 	llm *LLMService,
@@ -121,6 +156,9 @@ func NewEngineV2(
 // ExecuteWithRunID 可取消的执行入口：注册 runID → 取消函数
 func (e *EngineV2) ExecuteWithRunID(nodesJSON, edgesJSON []byte, runID uint, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	// runID 注入 context：使主循环与 executeNode 子树内的事件都归属同一次运行，
+	// 事件日志落库后可回放与统计 token
+	ctx = withRunID(ctx, runID)
 
 	e.runMu.Lock()
 	if e.activeRuns == nil {
@@ -136,7 +174,7 @@ func (e *EngineV2) ExecuteWithRunID(nodesJSON, edgesJSON []byte, runID uint, per
 		e.runMu.Unlock()
 	}()
 
-	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, persist)
+	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, "", persist)
 }
 
 // CancelRun 中止一个正在运行的工作流，返回是否找到该运行
@@ -151,25 +189,79 @@ func (e *EngineV2) CancelRun(runID uint) bool {
 }
 
 func (e *EngineV2) Execute(nodesJSON, edgesJSON []byte) ([]model.NodeInstance, error) {
-	return e.run(nodesJSON, edgesJSON, nil, nil)
+	return e.run(nodesJSON, edgesJSON, nil, "", nil)
 }
 
 // ExecutePersistent 执行并逐层增量落库（persist 在每层完成后回调，供断点续跑）
 func (e *EngineV2) ExecutePersistent(nodesJSON, edgesJSON []byte, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
-	return e.run(nodesJSON, edgesJSON, nil, persist)
+	return e.run(nodesJSON, edgesJSON, nil, "", persist)
 }
 
 // Resume 断点续跑：prevStates 中 success 节点复用输出直接跳过、skipped 分支保持跳过，其余节点重新执行
 func (e *EngineV2) Resume(nodesJSON, edgesJSON []byte, prevStates []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
-	return e.run(nodesJSON, edgesJSON, prevStates, persist)
+	return e.run(nodesJSON, edgesJSON, prevStates, "", persist)
+}
+
+// ResumeFrom 从指定节点开始重跑：该节点及其全部下游强制重算，
+// 已成功的上游保留原输出不变（单节点重跑与「从这继续」共用此入口）。
+// fromNode 为空时等同 Resume。
+func (e *EngineV2) ResumeFrom(nodesJSON, edgesJSON []byte, prevStates []model.NodeInstance, fromNode string, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	return e.run(nodesJSON, edgesJSON, prevStates, fromNode, persist)
+}
+
+// ResumeFromWithRunID 断点续跑的可取消入口（带 runID）。
+// 必须走这个入口：否则 ctx 里没有 runID，续跑产生的事件会因 runID=0 而被丢弃，
+// 表现为「重跑后执行面板看不到任何新事件」。
+func (e *EngineV2) ResumeFromWithRunID(nodesJSON, edgesJSON []byte, prevStates []model.NodeInstance, fromNode string, runID uint, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = withRunID(ctx, runID)
+
+	e.runMu.Lock()
+	if e.activeRuns == nil {
+		e.activeRuns = make(map[uint]context.CancelFunc)
+	}
+	e.activeRuns[runID] = cancel
+	e.runMu.Unlock()
+
+	defer func() {
+		cancel()
+		e.runMu.Lock()
+		delete(e.activeRuns, runID)
+		e.runMu.Unlock()
+	}()
+
+	return e.runWithContext(ctx, nodesJSON, edgesJSON, prevStates, fromNode, persist)
+}
+
+// downstreamClosure 计算 fromNode 及其所有下游（沿边正向可达）
+func downstreamClosure(edges []model.EdgeInstance, from string) map[string]bool {
+	if from == "" {
+		return nil
+	}
+	succ := make(map[string][]string)
+	for _, eg := range edges {
+		succ[eg.Source] = append(succ[eg.Source], eg.Target)
+	}
+	seen := map[string]bool{}
+	queue := []string{from}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		queue = append(queue, succ[id]...)
+	}
+	return seen
 }
 
 // run 引擎主循环
-func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
-	return e.runWithContext(context.Background(), nodesJSON, edgesJSON, prev, persist)
+func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, fromNode string, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	return e.runWithContext(context.Background(), nodesJSON, edgesJSON, prev, fromNode, persist)
 }
 
-func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []byte, prev []model.NodeInstance, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []byte, prev []model.NodeInstance, fromNode string, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
 	var nodes []model.NodeInstance
 	var edges []model.EdgeInstance
 
@@ -192,6 +284,9 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 		return nodes, fmt.Errorf("%s (code=%s)", first.Message, first.Code)
 	}
 
+	// runID 来自 context：0 表示独立执行（Execute/Resume），不入事件日志
+	runID := runIDFrom(ctx)
+
 	// 构建邻接表
 	adj := make(map[string][]model.EdgeInstance)
 	nodeMap := make(map[string]*model.NodeInstance)
@@ -203,6 +298,8 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 
 	// 断点回填：上次 success 的节点复用输出；skipped 重置为 pending
 	// （由本轮执行重新裁剪分支）；failed/running/pending 重跑
+	// fromNode 模式：从指定节点（含下游）重跑，闭包内的节点即使上次成功也强制重算
+	rerunSet := downstreamClosure(edges, fromNode)
 	prevMap := make(map[string]model.NodeInstance, len(prev))
 	for _, pn := range prev {
 		prevMap[pn.ID] = pn
@@ -210,14 +307,19 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 	for i := range nodes {
 		n := &nodes[i]
 		if pn, ok := prevMap[n.ID]; ok {
-			switch pn.Status {
-			case "success":
+			if pn.Status == "success" && !rerunSet[n.ID] {
 				n.Status = "success"
 				n.Output = pn.Output
 				n.StartedAt = pn.StartedAt
 				n.EndedAt = pn.EndedAt
-			default:
+			} else {
+				// 重算节点：清空上次结果与错误标记，避免旧状态污染本轮判定
 				n.Status = "pending"
+				n.Output = nil
+				n.Error = ""
+				n.ErrorCode = ""
+				n.StartedAt = nil
+				n.EndedAt = nil
 			}
 		} else {
 			n.Status = "pending"
@@ -397,9 +499,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				execNode := &nodeCopy
 				mu.Unlock()
 
-				if e.wsHub != nil {
-					e.wsHub.Broadcast(Event{Type: "node_started", NodeID: nid, Data: map[string]interface{}{"type": node.Type}})
-				}
+				e.emit(runID, Event{Type: "node_started", NodeID: nid, Data: map[string]interface{}{"type": node.Type}})
 
 				// 带超时 + 重试执行节点（retry / retry_delay_ms 数据驱动，重试上限 5）
 				type execResult struct {
@@ -446,10 +546,8 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 						}
 						propagate(nid, cached, branchCached)
 						mu.Unlock()
-						if e.wsHub != nil {
-							e.wsHub.Broadcast(Event{Type: "node_finished", NodeID: nid,
-								Data: map[string]interface{}{"output": cached, "cache_hit": true}})
-						}
+						e.emit(runID, Event{Type: "node_finished", NodeID: nid,
+							Data: map[string]interface{}{"output": cached, "cache_hit": true}})
 						return
 					}
 				}
@@ -459,13 +557,11 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				for attempt := 0; attempt <= retryCount; attempt++ {
 					if attempt > 0 {
 						time.Sleep(retryDelay)
-						if e.wsHub != nil {
-							e.wsHub.Broadcast(Event{Type: "node_retry", NodeID: nid, Message: fmt.Sprintf("attempt %d/%d", attempt+1, retryCount+1)})
-						}
+						e.emit(runID, Event{Type: "node_retry", NodeID: nid, Message: fmt.Sprintf("attempt %d/%d", attempt+1, retryCount+1)})
 					}
 					resCh := make(chan execResult, 1)
 					go func() {
-						o, err := e.executeNode(execNode, upstream)
+						o, err := e.executeNode(ctx, execNode, upstream)
 						resCh <- execResult{o, err}
 					}()
 					select {
@@ -504,9 +600,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 						node.Output = failOut
 						propagate(nid, failOut, "")
 						mu.Unlock()
-						if e.wsHub != nil {
-							e.wsHub.Broadcast(Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
-						}
+						e.emit(runID, Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
 						return
 					}
 
@@ -515,9 +609,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					layerMu.Unlock()
 					markFailed(nid, execErr.Error())
 					mu.Unlock()
-					if e.wsHub != nil {
-						e.wsHub.Broadcast(Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
-					}
+					e.emit(runID, Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
 					return
 				}
 
@@ -528,9 +620,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					e.cache.Put(cacheKeyStr, out)
 				}
 				mu.Unlock()
-				if e.wsHub != nil {
-					e.wsHub.Broadcast(Event{Type: "node_finished", NodeID: nid, Data: map[string]interface{}{"output": out}})
-				}
+				e.emit(runID, Event{Type: "node_finished", NodeID: nid, Data: map[string]interface{}{"output": out}})
 
 				// 处理出边（if_else 需按命中分支裁剪未激活侧）
 				branchPath := ""
@@ -577,13 +667,15 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 }
 
 // executeNode 执行单个节点（支持所有节点类型）
-func (e *EngineV2) executeNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+// executeNode 执行单个节点。
+// ctx 透传 runID（事件日志归属性）与取消信号。
+func (e *EngineV2) executeNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
 	switch node.Type {
 	case "start":
 		return e.execStartNode(node, upstream)
 
 	case "llm":
-		return e.execLLMNode(node, upstream)
+		return e.execLLMNode(ctx, node, upstream)
 
 	case "text2image":
 		return e.execText2ImageNode(node, upstream)
@@ -610,10 +702,10 @@ func (e *EngineV2) executeNode(node *model.NodeInstance, upstream map[string]int
 		return e.execRAGNode(node, upstream)
 
 	case "sub_workflow":
-		return e.execSubWorkflowNode(node, upstream)
+		return e.execSubWorkflowNode(ctx, node, upstream)
 
 	case "loop":
-		return e.execLoopNode(node, upstream)
+		return e.execLoopNode(ctx, node, upstream)
 
 	case "end":
 		return e.execEndNode(node, upstream)
@@ -639,8 +731,9 @@ func (e *EngineV2) execStartNode(node *model.NodeInstance, upstream map[string]i
 	return map[string]interface{}{"text": ""}, nil
 }
 
-func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
 	// 节点级提示词 = 指令前缀；上游文本 = 输入主体。两者拼接，缺一不可丢
+	runID := runIDFrom(ctx)
 	instruction := ""
 	if p, ok := node.Data["prompt"].(string); ok {
 		instruction = p
@@ -683,7 +776,7 @@ func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]int
 
 	// 工具调用：节点声明了 tools 时走「工具轮（非流式）+ 最终答案轮（流式）」
 	if toolNames := nodeToolNames(node); len(toolNames) > 0 && e.llm != nil {
-		return e.execLLMWithTools(node, prompt, reqModel, toolNames)
+		return e.execLLMWithTools(ctx, node, prompt, reqModel, toolNames)
 	}
 
 	// 流式优先：token 经 WS 实时推送前端（打字机效果）
@@ -693,24 +786,32 @@ func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]int
 			return nil, err
 		}
 		var sb strings.Builder
+		usage := LLMUsage{}
 		for chunk := range ch {
 			if chunk.Done {
+				// Done 块携带本次请求的完整 token 用量
+				usage = chunk.Usage
 				break
 			}
 			sb.WriteString(chunk.Content)
-			if e.wsHub != nil {
-				e.wsHub.Broadcast(Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
-			}
+			e.emit(runID, Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
 		}
-		return map[string]interface{}{"text": sb.String()}, nil
+		out := map[string]interface{}{"text": sb.String()}
+		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
+			out["_usage"] = usage // 供事件日志汇总 token 消耗
+		}
+		return out, nil
 	}
 
-	result, err := e.llm.ChatWithModel(prompt, reqModel)
+	result, u, err := e.llm.ChatWithModelUsage(prompt, reqModel)
 	if err != nil {
 		return nil, err
 	}
-
-	return map[string]interface{}{"text": result}, nil
+	out := map[string]interface{}{"text": result}
+	if u.PromptTokens > 0 || u.CompletionTokens > 0 {
+		out["_usage"] = u
+	}
+	return out, nil
 }
 
 // nodeToolNames 读取节点声明的工具名列表（data.tools，支持数组或逗号串）
@@ -749,8 +850,10 @@ func nodeToolNames(node *model.NodeInstance) []string {
 //  3. 模型给出最终答案 → 流式重放一次以保留打字机效果
 //
 // 轮次上限 4，防止模型无限索要工具
-func (e *EngineV2) execLLMWithTools(node *model.NodeInstance, prompt, reqModel string, toolNames []string) (interface{}, error) {
+func (e *EngineV2) execLLMWithTools(ctx context.Context, node *model.NodeInstance, prompt, reqModel string, toolNames []string) (interface{}, error) {
 	const maxRounds = 4
+	runID := runIDFrom(ctx)
+	usage := LLMUsage{} // 累计所有工具轮与最终答案轮的 token 消耗
 
 	if e.tools == nil {
 		e.tools = NewToolExecutor(e.http, e.rag)
@@ -764,10 +867,11 @@ func (e *EngineV2) execLLMWithTools(node *model.NodeInstance, prompt, reqModel s
 	trace := make([]map[string]interface{}, 0, 4)
 
 	for round := 0; round < maxRounds; round++ {
-		msg, err := e.llm.ChatWithTools(messages, specs, reqModel)
+		msg, u, err := e.llm.ChatWithToolsUsage(messages, specs, reqModel)
 		if err != nil {
 			return nil, err
 		}
+		usage = usage.add(u)
 
 		calls := msg.ToolCalls
 		textMode := false
@@ -780,14 +884,18 @@ func (e *EngineV2) execLLMWithTools(node *model.NodeInstance, prompt, reqModel s
 				final := msg.Content
 				if e.llmStream != nil {
 					messages = append(messages, toolChatMessage{Role: "assistant", Content: msg.Content})
-					if streamed, serr := e.streamFinalAnswer(node, messages, reqModel); serr == nil && streamed != "" {
+					if streamed, answerUsage, serr := e.streamFinalAnswer(ctx, node, messages, reqModel); serr == nil && streamed != "" {
 						final = streamed
+						usage = usage.add(answerUsage)
 					}
 				}
 				out := map[string]interface{}{"text": final}
 				if len(trace) > 0 {
 					out["tool_calls"] = trace
 					out["tool_rounds"] = len(trace)
+				}
+				if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
+					out["_usage"] = usage
 				}
 				return out, nil
 			}
@@ -802,13 +910,11 @@ func (e *EngineV2) execLLMWithTools(node *model.NodeInstance, prompt, reqModel s
 		}
 
 		for _, tc := range calls {
-			if e.wsHub != nil {
-				e.wsHub.Broadcast(Event{
-					Type:   "tool_call",
-					NodeID: node.ID,
-					Data:   map[string]interface{}{"tool": tc.Function.Name, "arguments": tc.Function.Arguments},
-				})
-			}
+			e.emit(runID, Event{
+				Type:   "tool_call",
+				NodeID: node.ID,
+				Data:   map[string]interface{}{"tool": tc.Function.Name, "arguments": tc.Function.Arguments},
+			})
 			result, runErr := e.tools.Run(tc.Function.Name, tc.Function.Arguments)
 			status := "ok"
 			if runErr != nil {
@@ -842,22 +948,23 @@ func (e *EngineV2) execLLMWithTools(node *model.NodeInstance, prompt, reqModel s
 }
 
 // streamFinalAnswer 用完整消息历史再做一次流式补全（保留打字机效果）
-func (e *EngineV2) streamFinalAnswer(node *model.NodeInstance, messages []toolChatMessage, reqModel string) (string, error) {
+func (e *EngineV2) streamFinalAnswer(ctx context.Context, node *model.NodeInstance, messages []toolChatMessage, reqModel string) (string, LLMUsage, error) {
+	runID := runIDFrom(ctx)
 	ch, err := e.llmStream.ChatStreamMessages(messages, reqModel)
 	if err != nil {
-		return "", err
+		return "", LLMUsage{}, err
 	}
 	var sb strings.Builder
+	usage := LLMUsage{}
 	for chunk := range ch {
 		if chunk.Done {
+			usage = chunk.Usage
 			break
 		}
 		sb.WriteString(chunk.Content)
-		if e.wsHub != nil {
-			e.wsHub.Broadcast(Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
-		}
+		e.emit(runID, Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
 	}
-	return sb.String(), nil
+	return sb.String(), usage, nil
 }
 
 func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
@@ -1151,7 +1258,9 @@ func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]int
 // executeInnerWorkflow 解析并内联执行一个内层工作流
 // injectText 非空时注入内层 start：overwrite=true 强制覆盖（循环每轮迭代用），
 // false 仅在 start 未配置 prompt 时注入（子工作流节点语义）
-func (e *EngineV2) executeInnerWorkflow(wfID uint, injectText string, overwrite bool) (interface{}, error) {
+// executeInnerWorkflow 解析并内联执行一个内层工作流。
+// ctx 透传使内层节点的事件也归属同一次运行（否则子工作流执行过程不可追溯）。
+func (e *EngineV2) executeInnerWorkflow(ctx context.Context, wfID uint, injectText string, overwrite bool) (interface{}, error) {
 	nodesJSON, edgesJSON, err := e.resolveWorkflow(wfID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workflow %d failed: %w", wfID, err)
@@ -1173,7 +1282,7 @@ func (e *EngineV2) executeInnerWorkflow(wfID uint, injectText string, overwrite 
 		return nil, err
 	}
 
-	states, err := e.run(subNodesJSON, edgesJSON, nil, nil)
+	states, err := e.runWithContext(ctx, subNodesJSON, edgesJSON, nil, "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("workflow %d failed: %w", wfID, err)
 	}
@@ -1191,7 +1300,7 @@ func (e *EngineV2) executeInnerWorkflow(wfID uint, injectText string, overwrite 
 }
 
 // execSubWorkflowNode 子工作流：解析 workflow_id → 注入上游文本到内层 start → 嵌套执行 → 返回内层 end 输出
-func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+func (e *EngineV2) execSubWorkflowNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
 	if e.resolveWorkflow == nil {
 		return nil, fmt.Errorf("sub_workflow resolver not configured")
 	}
@@ -1207,7 +1316,7 @@ func (e *EngineV2) execSubWorkflowNode(node *model.NodeInstance, upstream map[st
 	}
 	defer e.depth.Add(-1)
 
-	out, err := e.executeInnerWorkflow(wfID, upstreamText(upstream), false)
+	out, err := e.executeInnerWorkflow(ctx, wfID, upstreamText(upstream), false)
 	if err != nil {
 		return nil, fmt.Errorf("sub workflow %d: %w", wfID, err)
 	}
@@ -1249,7 +1358,8 @@ func upstreamText(upstream map[string]interface{}) string {
 //	mode=until  至少跑一轮，直到 stop_condition 命中后停止
 //
 // 安全阀：max_iterations（默认 20，硬上限 100）
-func (e *EngineV2) execLoopNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+func (e *EngineV2) execLoopNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	runID := runIDFrom(ctx)
 	if e.resolveWorkflow == nil {
 		return nil, fmt.Errorf("loop resolver not configured")
 	}
@@ -1342,7 +1452,7 @@ func (e *EngineV2) execLoopNode(node *model.NodeInstance, upstream map[string]in
 			input = items[iter]
 		}
 
-		out, err := e.executeInnerWorkflow(wfID, input, true)
+		out, err := e.executeInnerWorkflow(ctx, wfID, input, true)
 		if err != nil {
 			return nil, fmt.Errorf("loop iteration %d failed: %w", iter+1, err)
 		}
@@ -1360,18 +1470,15 @@ func (e *EngineV2) execLoopNode(node *model.NodeInstance, upstream map[string]in
 		iter++
 
 		// 每轮广播进度（低频事件，前端可显示迭代计数）
-		if e.wsHub != nil {
-			e.wsHub.Broadcast(Event{
-				Type:   "loop_iteration",
-				NodeID: node.ID,
-				Data: map[string]interface{}{
-					"iteration": iter,
-					"max":       maxIter,
-					"output":    truncateRunes(text, 120),
-				},
-			})
-		}
-
+		e.emit(runID, Event{
+			Type:   "loop_iteration",
+			NodeID: node.ID,
+			Data: map[string]interface{}{
+				"iteration": iter,
+				"max":       maxIter,
+				"output":    truncateRunes(text, 120),
+			},
+		})
 		if mode == "until" && matchCondition(condType, text, condValue) {
 			stoppedBy = "condition"
 			break

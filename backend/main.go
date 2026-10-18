@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,7 +51,7 @@ func main() {
 	// 连接数据库（默认本地 SQLite，零外部依赖；DB_DRIVER=postgres 时使用 PostgreSQL）
 	db := initDB(cfg)
 	if db != nil {
-		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}); err != nil {
+		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}); err != nil {
 			log.Printf("Warning: auto migrate failed: %v", err)
 		} else {
 			log.Println("Database migrated")
@@ -59,6 +60,14 @@ func main() {
 
 	// 事件中心
 	wsHub := service.NewWSHub()
+
+	// 事件日志持久化：事件不再「广播即丢」，落库后可回放、统计 token、生成 trace。
+	// 批量异步写入，落库失败只记日志，不影响引擎执行。
+	var eventLogger *service.EventLogger
+	if db != nil {
+		eventLogger = service.NewEventLogger(db)
+		defer eventLogger.Close()
+	}
 
 	// 模型选择：环境变量优先；未指定则自动探测本地已装模型（换机器部署不用改配置）
 	llmModel := cfg.OllamaModel
@@ -116,6 +125,11 @@ func main() {
 	// 流式 LLM（token 经 WS 推送前端打字机效果）
 	engine.SetLLMStream(llmStreamService)
 
+	// 事件日志：广播与落库并行（node_token 不入库，避免写放大）
+	if eventLogger != nil {
+		engine.SetEventLog(eventLogger)
+	}
+
 	// GPU 真实遥测轮询（缓存 nvidia-smi 结果，避免每请求拉子进程）
 	gpuSched.StartTelemetry(5 * time.Second)
 
@@ -126,9 +140,51 @@ func main() {
 	// 初始化路由
 	r := gin.Default()
 
-	// CORS
+	// 安全边界：
+	//  - 默认只监听 127.0.0.1。其他机器要访问必须显式 FLOWEDGE_HOST=0.0.0.0，
+	//    且必须同时设置 FLOWEDGE_API_TOKEN，否则任何拿到地址的人都能删除全部工作流
+	//  - CORS 不再无条件放 *：仅本机源或显式配置的 FLOWEDGE_CORS_ORIGIN
+	bindAddr := getEnv("FLOWEDGE_HOST", "127.0.0.1")
+	apiToken := getEnv("FLOWEDGE_API_TOKEN", "")
+	openToLan := bindAddr != "127.0.0.1" && bindAddr != "localhost"
+	if openToLan && apiToken == "" {
+		log.Println("⚠️  FLOWEDGE_HOST 暴露到局域网但未设置 FLOWEDGE_API_TOKEN：所有 /api 接口（含删除）对外裸奔，已自动拒绝启动")
+		log.Println("    请补上 FLOWEDGE_API_TOKEN=<随机长字符串>，或把 FLOWEDGE_HOST 改回 127.0.0.1")
+		os.Exit(2)
+	}
+
+	if apiToken != "" {
+		r.Use(func(c *gin.Context) {
+			// 这几个端点维持开放：公开触发器吃的是自己的随机 token，健康检查用于探活
+			p := c.Request.URL.Path
+			if p == "/api/health" || p == "/api/capabilities" ||
+				(len(p) > 10 && p[:10] == "/api/hooks") {
+				c.Next()
+				return
+			}
+			if c.GetHeader("Authorization") != "Bearer "+apiToken {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid API token"})
+				return
+			}
+			c.Next()
+		})
+		log.Println("🔒 API token 已启用：除 /api/hooks/*、/api/health、/api/capabilities 外均需 Authorization: Bearer <token>")
+	}
+
+	corsAllow := getEnv("FLOWEDGE_CORS_ORIGIN", "")
 	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		origin := c.Request.Header.Get("Origin")
+		allow := corsAllow
+		if allow == "" {
+			// 未显式配置时仅放行本机源（file:// 的 Origin 为空也算本机）
+			if origin == "" || strings.HasPrefix(origin, "http://127.0.0.1") || strings.HasPrefix(origin, "http://localhost") {
+				allow = origin
+			}
+		}
+		if allow != "" {
+			c.Header("Access-Control-Allow-Origin", allow)
+			c.Header("Vary", "Origin")
+		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if c.Request.Method == "OPTIONS" {
@@ -139,7 +195,12 @@ func main() {
 	})
 
 	// handlers（cron 调度器也要用到 wfHandler，故在路由组之前构造）
-	wfHandler := handler.NewWorkflowHandler(db, engine)
+	// 任务队列：默认并发 2（单 GPU 上并行跑两个 flux 只会互相抢显存）
+	jobQueue := service.NewJobQueue(db, getQueueConcurrency())
+	if n := jobQueue.RecoverInterrupted(); n > 0 {
+		log.Printf("上次异常退出的运行任务 %d 个，已标记为 interrupted（可在执行记录里续跑）", n)
+	}
+	wfHandler := handler.NewWorkflowHandler(db, engine, jobQueue)
 	triggerHandler := handler.NewTriggerHandler(db, wfHandler)
 
 	// 定时触发器：每 20 秒扫描一次启用了 cron 的工作流（分钟级去重）
@@ -148,7 +209,7 @@ func main() {
 		if err := db.First(&wf, id).Error; err != nil {
 			return err
 		}
-		wfHandler.StartRun(&wf)
+		wfHandler.StartRun(&wf, "cron")
 		return nil
 	})
 	cronScheduler.Start(20 * time.Second)
@@ -168,7 +229,14 @@ func main() {
 		api.GET("/workflows/:id/runs", wfHandler.ListRuns)
 		api.GET("/runs/:runId", wfHandler.GetRun)
 		api.POST("/runs/:runId/resume", wfHandler.ResumeRun)
+		api.POST("/runs/:runId/rerun-from", wfHandler.ResumeFromRun)
 		api.POST("/runs/:runId/cancel", wfHandler.CancelRun)
+
+		// 运行维度：全局列表（分页/状态过滤）、事件回放、trace 与 token 统计
+		runHandler := handler.NewRunHandler(db, eventLogger)
+		api.GET("/runs", runHandler.ListAll)
+		api.GET("/runs/:runId/events", runHandler.Events)
+		api.GET("/runs/:runId/trace", runHandler.Trace)
 
 		// 项目专属知识库
 		kbHandler := handler.NewKBHandler(ragService)
@@ -234,8 +302,13 @@ func main() {
 	if getEnv("FLOWEDGE_OPEN_BROWSER", "") == "1" {
 		openBrowser(browserURL)
 	}
-	if err := r.Run(":" + cfg.Port); err != nil {
-		log.Fatalf("启动失败：%v（端口 %s 可能已被占用，可用 PORT 环境变量改端口）", err, cfg.Port)
+	// 绑定地址：默认 127.0.0.1（仅本机）。FLOWEDGE_HOST=0.0.0.0 时按上面的规则强制要求 API token
+	if err := r.Run(bindAddr + ":" + cfg.Port); err != nil {
+		if openToLan {
+			log.Printf("启动失败：%v\n    如需局域网访问，请检查 FLOWEDGE_HOST=%s 是否为合法地址（0.0.0.0 或本机网卡 IP）", err, bindAddr)
+		} else {
+			log.Printf("启动失败：%v（端口 %s 可能已被占用，可用 PORT 环境变量改端口）", err, cfg.Port)
+		}
 	}
 }
 
@@ -244,6 +317,17 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getQueueConcurrency 队列并发上限（默认 2：本地多模态任务多为显存密集，并行反而慢）
+func getQueueConcurrency() int {
+	c := 2
+	if v := os.Getenv("FLOWEDGE_QUEUE_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c = n
+		}
+	}
+	return c
 }
 
 // initDB 初始化数据库；默认 SQLite（开箱即用），DB_DRIVER=postgres 时切换 PostgreSQL

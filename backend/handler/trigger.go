@@ -133,7 +133,7 @@ func (h *TriggerHandler) Webhook(c *gin.Context) {
 		return
 	}
 
-	run := h.wf.StartRun(&wf)
+	run := h.wf.StartRun(&wf, "webhook")
 	now := time.Now()
 	h.db.Model(&model.Workflow{}).Where("id = ?", wf.ID).Update("last_triggered_at", &now)
 

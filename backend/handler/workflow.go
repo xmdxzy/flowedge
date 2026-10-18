@@ -16,10 +16,11 @@ import (
 type WorkflowHandler struct {
 	db     *gorm.DB
 	engine *service.EngineV2
+	queue  *service.JobQueue // nil 时退化为直接 goroutine 起跑（保持向后兼容）
 }
 
-func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2) *WorkflowHandler {
-	return &WorkflowHandler{db: db, engine: engine}
+func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue) *WorkflowHandler {
+	return &WorkflowHandler{db: db, engine: engine, queue: queue}
 }
 
 // List 获取所有工作流
@@ -118,8 +119,9 @@ func (h *WorkflowHandler) Delete(c *gin.Context) {
 }
 
 // Run 执行工作流
-// StartRun 创建执行记录并异步跑完（触发器与手动运行共用同一条路径）
-func (h *WorkflowHandler) StartRun(wf *model.Workflow) *model.WorkflowRun {
+// StartRun 创建执行记录并异步跑完（触发器与手动运行共用同一条路径）。
+// trigger 可选：manual / webhook / cron；留空按 manual 记录。
+func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model.WorkflowRun {
 	nodesJSON := []byte(wf.Nodes)
 	edgesJSON := []byte(wf.Edges)
 
@@ -131,6 +133,21 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow) *model.WorkflowRun {
 	}
 	h.db.Create(&run)
 
+	// 任务落库：进程崩溃后 DB 里仍保留「曾受理过」的事实，
+	// 下次启动由 JobQueue.RecoverInterrupted 把残留 running 标记为 interrupted
+	jobTrigger := "manual"
+	if len(trigger) > 0 && trigger[0] != "" {
+		jobTrigger = trigger[0]
+	}
+	job := model.Job{
+		RunID:      run.ID,
+		WorkflowID: wf.ID,
+		Status:     "pending",
+		Trigger:    jobTrigger,
+		CreatedAt:  now,
+	}
+	h.db.Create(&job)
+
 	// 增量落库：每层完成后更新 node_states（断点续跑依据）
 	persist := func(states []model.NodeInstance) {
 		statesJSON, err := json.Marshal(states)
@@ -141,22 +158,36 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow) *model.WorkflowRun {
 			Update("node_states", json.RawMessage(statesJSON))
 	}
 
-	go func() {
+	exec := func() {
 		// 走可取消入口：前端可对进行中的运行发起中止
 		nodeStates, err := h.engine.ExecuteWithRunID(nodesJSON, edgesJSON, run.ID, persist)
 
 		endNow := time.Now()
 		run.EndedAt = &endNow
+		job.EndedAt = &endNow
 		if err != nil {
 			run.Status = "failed"
 			run.Error = err.Error()
+			job.Status = "failed"
+			job.Error = err.Error()
 		} else {
 			run.Status = "success"
+			job.Status = "done"
 		}
 		statesJSON, _ := json.Marshal(nodeStates)
 		run.NodeStates = json.RawMessage(statesJSON)
 		h.db.Save(&run)
-	}()
+		h.db.Save(&job)
+	}
+
+	if h.queue != nil {
+		job.Status = "running"
+		job.StartedAt = &now
+		h.db.Save(&job)
+		h.queue.Enqueue(job, exec)
+	} else {
+		go exec()
+	}
 
 	return &run
 }
@@ -186,8 +217,26 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"run_id": run.ID, "status": "running"})
 }
 
-// ResumeRun 断点续跑：复用上次成功节点的输出，只重跑失败/未执行节点
+// ResumeRun 断点续跑：复用已完成节点输出，只重跑失败 / 未执行节点
 func (h *WorkflowHandler) ResumeRun(c *gin.Context) {
+	h.resumeFrom(c, "")
+}
+
+// ResumeFromRun 从指定节点开始重跑（单节点重跑 / 「从这继续」）
+// body: {"node_id": "b"}
+func (h *WorkflowHandler) ResumeFromRun(c *gin.Context) {
+	var body struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.NodeID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing node_id"})
+		return
+	}
+	h.resumeFrom(c, body.NodeID)
+}
+
+// resumeFrom 断点续跑公共实现；fromNode 为空时等同整体续跑
+func (h *WorkflowHandler) resumeFrom(c *gin.Context, fromNode string) {
 	runID := c.Param("runId")
 	var run model.WorkflowRun
 	if err := h.db.First(&run, runID).Error; err != nil {
@@ -212,6 +261,21 @@ func (h *WorkflowHandler) ResumeRun(c *gin.Context) {
 		}
 	}
 
+	// fromNode 必须存在于本次运行的节点里，否则 400（避免拼写错误的节点 id 被静默忽略）
+	if fromNode != "" {
+		found := false
+		for _, n := range prev {
+			if n.ID == fromNode {
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "node not found in this run", "node_id": fromNode})
+			return
+		}
+	}
+
 	now := time.Now()
 	run.Status = "running"
 	run.Error = ""
@@ -228,8 +292,19 @@ func (h *WorkflowHandler) ResumeRun(c *gin.Context) {
 			Update("node_states", json.RawMessage(statesJSON))
 	}
 
-	go func() {
-		nodeStates, err := h.engine.Resume([]byte(wf.Nodes), []byte(wf.Edges), prev, persist)
+	job := model.Job{
+		RunID:      run.ID,
+		WorkflowID: run.WorkflowID,
+		Status:     "running",
+		Trigger:    "resume",
+		CreatedAt:  time.Now(),
+		StartedAt:  run.StartedAt,
+	}
+	h.db.Create(&job)
+
+	exec := func() {
+		// 走带 runID 的可取消入口：续跑的事件也要归属性，否则执行面板看不到重跑过程
+		nodeStates, err := h.engine.ResumeFromWithRunID([]byte(wf.Nodes), []byte(wf.Edges), prev, fromNode, run.ID, persist)
 
 		endNow := time.Now()
 		run.EndedAt = &endNow
@@ -244,7 +319,24 @@ func (h *WorkflowHandler) ResumeRun(c *gin.Context) {
 		statesJSON, _ := json.Marshal(nodeStates)
 		run.NodeStates = json.RawMessage(statesJSON)
 		h.db.Save(&run)
-	}()
+
+		job := model.Job{
+			RunID: run.ID, WorkflowID: run.WorkflowID,
+			Status: "done", Trigger: "resume", CreatedAt: *run.StartedAt,
+			StartedAt: run.StartedAt, EndedAt: &endNow,
+		}
+		if err != nil {
+			job.Status = "failed"
+			job.Error = err.Error()
+		}
+		h.db.Save(&job)
+	}
+
+	if h.queue != nil {
+		h.queue.Enqueue(job, exec)
+	} else {
+		go exec()
+	}
 
 	c.JSON(http.StatusAccepted, gin.H{
 		"run_id":     run.ID,
@@ -265,10 +357,22 @@ func (h *WorkflowHandler) GetRun(c *gin.Context) {
 	c.JSON(http.StatusOK, run)
 }
 
-// ListRuns 列出执行记录
+// ListRuns 列出某工作流的执行记录。
+// 保持返回数组以兼容前端执行面板；分页与状态过滤见 ?limit=&offset=&status=（默认 50，上限 200）
 func (h *WorkflowHandler) ListRuns(c *gin.Context) {
 	wfID := c.Param("id")
+	limit := parseIntDefault(c.Query("limit"), 50)
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	status := c.Query("status")
+
+	q := h.db.Model(&model.WorkflowRun{}).Where("workflow_id = ?", wfID)
+	if status != "" {
+		q = q.Where("status = ?", status)
+	}
 	var runs []model.WorkflowRun
-	h.db.Where("workflow_id = ?", wfID).Order("created_at DESC").Limit(20).Find(&runs)
+	q.Order("created_at DESC").Limit(limit).Find(&runs)
+
 	c.JSON(http.StatusOK, runs)
 }
