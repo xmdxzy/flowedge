@@ -49,7 +49,7 @@ func main() {
 	ttsService := service.NewTTSService(ttsURL)
 	videoService := service.NewVideoService()
 	httpService := service.NewHTTPService()
-	ragService := service.NewRAGService("./data/rag")
+	ragService := service.NewRAGServiceV3(getEnv("KB_DIR", "./data/kb"), cfg.OllamaBaseURL, getEnv("EMBED_MODEL", "bge-m3"))
 
 	// GPU 调度器
 	gpuSched := service.NewGPUScheduler(24576) // 3090 24GB
@@ -113,6 +113,14 @@ func main() {
 		api.GET("/workflows/:id/runs", wfHandler.ListRuns)
 		api.GET("/runs/:runId", wfHandler.GetRun)
 		api.POST("/runs/:runId/resume", wfHandler.ResumeRun)
+
+		// 项目专属知识库
+		kbHandler := handler.NewKBHandler(ragService)
+		api.POST("/kb/documents", kbHandler.AddDocument)
+		api.GET("/kb/documents", kbHandler.ListDocuments)
+		api.DELETE("/kb/documents/:id", kbHandler.DeleteDocument)
+		api.POST("/kb/query", kbHandler.Query)
+		api.GET("/kb/status", kbHandler.Status)
 
 		// 版本管理
 		api.GET("/workflows/:id/versions", versionHandler.ListVersions)

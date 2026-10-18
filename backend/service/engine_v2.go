@@ -23,7 +23,7 @@ type EngineV2 struct {
 	tts             *TTSService
 	video           *VideoService
 	http            *HTTPService
-	rag             *RAGService
+	rag             *RAGServiceV3
 	gpuSched        *GPUScheduler
 	wsHub           *WSHub
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
@@ -47,7 +47,7 @@ func NewEngineV2(
 	tts *TTSService,
 	video *VideoService,
 	http *HTTPService,
-	rag *RAGService,
+	rag *RAGServiceV3,
 	gpuSched *GPUScheduler,
 	wsHub *WSHub,
 ) *EngineV2 {
@@ -726,8 +726,12 @@ func (e *EngineV2) execRAGNode(node *model.NodeInstance, upstream map[string]int
 		return nil, fmt.Errorf("rag node has no query")
 	}
 
-	// 检索知识库
-	context, err := e.rag.GetContext(query)
+	// 检索知识库（top_k 可由节点数据配置，默认 3）
+	topK := 3
+	if tk, ok := node.Data["top_k"].(float64); ok && tk > 0 {
+		topK = int(tk)
+	}
+	context, err := e.rag.GetContext(query, topK)
 	if err != nil {
 		return nil, err
 	}
