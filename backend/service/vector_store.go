@@ -1,12 +1,16 @@
 package service
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 // VectorRecord 向量记录
@@ -197,6 +201,16 @@ func cosineSimilarity(a, b []float64) float64 {
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
+// generateID 生成记录 ID。
+//
+// 旧实现是 2 个字母 + 1 个数字，实际只有 26*26/2*10 ≈ 3380 个不同取值，
+// 超过后必然碰撞；而 Delete 按 ID 匹配第一条即删除，碰撞后会误删无关记录。
+// 改为 64 位随机 hex，碰撞概率可忽略。
 func generateID(index int) string {
-	return string(rune('a'+index%26)) + string(rune('a'+(index/26)%26)) + "-" + string(rune('0'+index%10))
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// 随机数不可用时的兜底：纳秒时间戳 + 序号，同进程内保证唯一
+		return fmt.Sprintf("r%x-%d", time.Now().UnixNano(), index)
+	}
+	return hex.EncodeToString(b[:])
 }

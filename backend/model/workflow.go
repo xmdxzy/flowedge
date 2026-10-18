@@ -5,6 +5,17 @@ import (
 	"time"
 )
 
+// 节点失败原因的稳定错误码（前端与 API 直接消费，便于定位与告警）
+const (
+	ErrorCodeTimeout        = "timeout"         // 节点执行超时
+	ErrorCodeConfigMissing  = "config_missing"  // 依赖的外部服务未配置（如 ASR/TTS 未启动）
+	ErrorCodeUpstream       = "upstream_failed" // 上游节点失败导致本节点无法执行
+	ErrorCodeRetryExhausted = "retry_exhausted" // 重试次数耗尽
+	ErrorCodeCancelled      = "cancelled"       // 运行被中止
+	ErrorCodeCycle          = "cycle"           // 图存在循环依赖
+	ErrorCodeExecution      = "execution_error" // 其他执行错误
+)
+
 // Workflow 工作流定义
 type Workflow struct {
 	ID        uint            `gorm:"primaryKey" json:"id"`
@@ -39,9 +50,10 @@ type NodeInstance struct {
 	Type      string                 `json:"type"`
 	Position  map[string]float64     `json:"position"`
 	Data      map[string]interface{} `json:"data"`
-	Status    string                 `json:"status"` // pending, running, success, failed
+	Status    string                 `json:"status"` // pending, running, success, failed, skipped
 	Output    interface{}            `json:"output,omitempty"`
 	Error     string                 `json:"error,omitempty"`
+	ErrorCode string                 `json:"error_code,omitempty"` // 见 ErrorCode* 常量
 	StartedAt *time.Time             `json:"started_at,omitempty"`
 	EndedAt   *time.Time             `json:"ended_at,omitempty"`
 }

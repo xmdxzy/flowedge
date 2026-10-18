@@ -19,12 +19,14 @@
 - ✅ 画布空状态引导、节点图标体系、可用变量提示
 - ✅ Ollama 本地 LLM 集成（OpenAI 兼容接口 + 流式输出）
 - ✅ SQLite 零依赖持久化（工作流、执行记录、版本快照），可选 PostgreSQL
-- ✅ GPU 显存调度器（LRU 缓存 + 三级水位线 70%/85%/92%）
-- ✅ POPS 流水线重叠预加载调度算法
+- ✅ GPU 显存调度器（三级水位线 70%/85%/92%）
+- ✅ 图结构校验：环 / 自环 / 悬空边在保存与执行前拦截（Kahn 入度法，菱形 DAG 不误判）
+- ✅ 节点级超时（默认 180s，`timeout_ms` 覆盖，上限 30min）+ 结构化错误码（timeout / config_missing / cycle / retry_exhausted …）
+- ✅ 未配置的语音服务显式失败并标记 `config_missing`，绝不伪造转写文本或假音频
 - ✅ WebSocket 实时状态推送（节点状态实时更新）
 - ✅ 工作流版本管理与回滚
 - ✅ 预置模板库（文本总结、文生图、条件分支）
-- ✅ 快捷键支持（Cmd+Enter 运行、Delete 删除、Cmd+Z 撤销）
+- ✅ 快捷键（Ctrl/Cmd+S 保存、Ctrl+Enter 运行、Delete 删除、Ctrl+Z 撤销、Ctrl+Shift+Z 或 Ctrl+Y 重做）
 - ✅ 右键菜单（节点复制/删除、画布快捷操作）
 - ✅ 工作流导出/导入（JSON 文件）
 - ✅ 执行历史面板
@@ -298,7 +300,7 @@ flowedge/
 │   │   ├── hooks/        # 自定义 hooks
 │   │   │   ├── useHotkeys.ts      # 快捷键
 │   │   │   └── useWebSocket.ts   # WebSocket 客户端
-│   │   ├── nodes/       # 8 种自定义节点组件
+│   │   ├── nodes/       # 12 种自定义节点组件
 │   │   ├── templates/    # 预置工作流模板
 │   │   ├── App.tsx      # 主画布
 │   │   └── main.tsx     # 入口
@@ -313,7 +315,7 @@ flowedge/
 - [x] 显存调度器（LRU 缓存 + 水位线）
 - [x] 多模态节点（文生图、ASR、TTS、视频）
 - [x] 条件分支节点
-- [x] POPS 预加载算法
+- [x] 图结构校验（环 / 自环 / 悬空边拦截）+ 节点级超时 + 结构化错误码
 - [x] 流式输出
 - [x] 版本管理
 - [x] WebSocket 实时推送

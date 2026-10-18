@@ -170,9 +170,41 @@ function FlowEditor() {
   const [triggerOpen, setTriggerOpen] = useState(false)
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [cmdOpen, setCmdOpen] = useState(false)
+  const [propTab, setPropTab] = useState<'config' | 'output'>('config')
   const streamBufRef = useRef<Map<string, string>>(new Map())
   const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
+
+  // 撤销 / 重做：只记录用户主动的结构性变更。
+  // 运行期状态刷新（WS 事件）不入栈，否则一次运行会把历史刷爆。
+  const undoStack = useRef<{ nodes: Node[]; edges: Edge[] }[]>([])
+  const redoStack = useRef<{ nodes: Node[]; edges: Edge[] }[]>([])
+  const graphRef = useRef<{ nodes: Node[]; edges: Edge[] }>({ nodes, edges })
+  useEffect(() => {
+    graphRef.current = { nodes, edges }
+  }, [nodes, edges])
+
+  const pushHistory = useCallback(() => {
+    undoStack.current.push({ nodes: graphRef.current.nodes, edges: graphRef.current.edges })
+    if (undoStack.current.length > 50) undoStack.current.shift()
+    redoStack.current = []
+  }, [])
+
+  const undo = useCallback(() => {
+    const prev = undoStack.current.pop()
+    if (!prev) return
+    redoStack.current.push({ nodes: graphRef.current.nodes, edges: graphRef.current.edges })
+    setNodes(prev.nodes)
+    setEdges(prev.edges)
+  }, [setNodes, setEdges])
+
+  const redo = useCallback(() => {
+    const next = redoStack.current.pop()
+    if (!next) return
+    undoStack.current.push({ nodes: graphRef.current.nodes, edges: graphRef.current.edges })
+    setNodes(next.nodes)
+    setEdges(next.edges)
+  }, [setNodes, setEdges])
 
   // 命令面板：Ctrl/Cmd + K 随时唤起
   useEffect(() => {
@@ -326,6 +358,10 @@ function FlowEditor() {
                 data: {
                   ...n.data,
                   status: 'success',
+                  // 写入真实输出与空错误：属性面板「输出」Tab 依赖 data.output，
+                  // 此前 WS 回调从不写该字段，导致输出预览恒为空
+                  output: event.data?.output,
+                  error: undefined,
                   ...(typeof finalIter === 'number' ? { loop_iteration: finalIter } : {}),
                 },
               }
@@ -344,7 +380,7 @@ function FlowEditor() {
       setNodes((nds) =>
         nds.map((n) =>
           n.id === event.node_id
-            ? { ...n, data: { ...n.data, status: 'failed' } }
+            ? { ...n, data: { ...n.data, status: 'failed', error: event.message } }
             : n,
         ),
       )
@@ -392,8 +428,33 @@ function FlowEditor() {
   }, [])
 
   const onConnect = useCallback(
-    (params: Connection) => setEdges((eds) => addEdge(params, eds)),
-    [setEdges],
+    (params: Connection) => {
+      pushHistory()
+      setEdges((eds) => addEdge(params, eds))
+    },
+    [setEdges, pushHistory],
+  )
+
+  // 连线校验：禁自环、禁重复边、禁把 start 当下游。
+  // 没有它，用户可以连出成环的图——引擎侧会拒绝执行，但应在拖拽阶段就阻止。
+  const isValidConnection = useCallback(
+    (conn: Connection | Edge) => {
+      const source = conn.source ?? ''
+      const target = conn.target ?? ''
+      if (!source || !target || source === target) return false
+
+      const tgt = nodes.find((n) => n.id === target)
+      if (tgt?.type === 'start') return false
+
+      const dup = edges.some(
+        (e) =>
+          e.source === source &&
+          e.target === target &&
+          (e.sourceHandle ?? '') === (conn.sourceHandle ?? ''),
+      )
+      return !dup
+    },
+    [nodes, edges],
   )
 
   const onNodeClick = useCallback((_: React.MouseEvent, node: Node) => {
@@ -420,6 +481,7 @@ function FlowEditor() {
 
   // 删除节点
   const deleteNode = (nodeId: string) => {
+    pushHistory()
     setNodes((nds) => nds.filter((n) => n.id !== nodeId))
     setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId))
     setContextMenu(null)
@@ -429,6 +491,7 @@ function FlowEditor() {
   const duplicateNode = (nodeId: string) => {
     const node = nodes.find((n) => n.id === nodeId)
     if (!node) return
+    pushHistory()
     const newId = `node-${nodeIdRef.current++}`
     setNodes((nds) => [
       ...nds,
@@ -443,11 +506,13 @@ function FlowEditor() {
 
   // 添加节点
   const addNode = (type: string) => {
+    pushHistory()
     const id = `node-${nodeIdRef.current++}`
     const newNode: Node = {
       id,
       type,
-      position: { x: 200 + Math.random() * 200, y: 150 + Math.random() * 200 },
+      // 错开排布：此前用 Math.random() 落点，连续添加会重叠成一坨
+      position: { x: 200 + (nodeIdRef.current % 5) * 60, y: 150 + (nodeIdRef.current % 5) * 60 },
       data: getDefaultNodeData(type),
     }
     setNodes((nds) => [...nds, newNode])
@@ -478,9 +543,10 @@ function FlowEditor() {
         position,
         data: getDefaultNodeData(type),
       }
+      pushHistory()
       setNodes((nds) => [...nds, newNode])
     },
-    [screenToFlowPosition, setNodes],
+    [screenToFlowPosition, setNodes, pushHistory],
   )
 
   // 开始拖拽
@@ -636,7 +702,9 @@ function FlowEditor() {
   // 快捷键（必须在 runWorkflow 声明之后）
   useHotkeys({
     onRun: runWorkflow,
-    onSave: () => console.log('save'),
+    onSave: saveWorkflow,
+    onUndo: undo,
+    onRedo: redo,
     onDelete: () => {
       if (selectedNode) {
         setNodes((nds) => nds.filter((n) => n.id !== selectedNode.id))
@@ -910,6 +978,15 @@ function FlowEditor() {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
+              isValidConnection={isValidConnection}
+              snapToGrid
+              snapGrid={[16, 16]}
+              onNodeDragStop={pushHistory}
+              selectionOnDrag
+              multiSelectionKeyCode={['Control', 'Meta']}
+              deleteKeyCode={['Delete', 'Backspace']}
+              minZoom={0.2}
+              maxZoom={2.5}
               onNodeClick={onNodeClick}
               onNodeContextMenu={onNodeContextMenu}
               onPaneClick={onPaneClick}
@@ -976,20 +1053,52 @@ function FlowEditor() {
 
       {/* 右侧属性面板 */}
       <div className="w-72 border-l border-border bg-surface p-4 overflow-y-auto">
-        {/* Tab 切换 */}
+        {/* Tab 切换：此前三个按钮都没有 onClick，「输出」「日志」实际是死按钮 */}
         <div className="flex border-b border-border mb-4">
-          <button className="px-3 py-2 text-xs font-medium text-primary border-b-2 border-primary">
-            配置
-          </button>
-          <button className="px-3 py-2 text-xs font-medium text-gray-500 hover:text-gray-300">
-            输出
-          </button>
-          <button className="px-3 py-2 text-xs font-medium text-gray-500 hover:text-gray-300">
-            日志
-          </button>
+          {(
+            [
+              ['config', '配置'],
+              ['output', '输出'],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setPropTab(key)}
+              className={`px-3 py-2 text-xs font-medium border-b-2 transition-colors ${
+                propTab === key
+                  ? 'text-primary border-primary'
+                  : 'text-gray-500 hover:text-gray-300 border-transparent'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        {selectedNode ? (
+        {/* 输出 Tab：完整输出与错误（P1 事件日志就绪后再接回「日志」Tab） */}
+        {propTab === 'output' ? (
+          selectedNode ? (
+            <div className="flex flex-col gap-3">
+              <label className="text-xs text-gray-400 block">上一次运行的输出</label>
+              {selectedNode.data?.output != null ? (
+                <pre className="text-[11px] text-gray-300 font-mono bg-canvas border border-border rounded-lg p-2 whitespace-pre-wrap break-all max-h-[60vh] overflow-auto">
+                  {typeof selectedNode.data.output === 'string'
+                    ? selectedNode.data.output
+                    : JSON.stringify(selectedNode.data.output, null, 2)}
+                </pre>
+              ) : (
+                <p className="text-xs text-gray-500">暂无输出，运行工作流后显示</p>
+              )}
+              {selectedNode.data?.error != null && (
+                <div className="text-[11px] text-error border border-error/40 bg-error/10 rounded-lg p-2 whitespace-pre-wrap">
+                  {String(selectedNode.data.error)}
+                </div>
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-gray-500">点击画布中的节点查看输出</p>
+          )
+        ) : selectedNode ? (
           <div className="flex flex-col gap-4">
             <div>
               <label className="text-xs text-gray-400 block mb-1">节点类型</label>

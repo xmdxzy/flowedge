@@ -238,8 +238,8 @@ func NewASRService(baseURL string) *ASRService {
 // Transcribe 语音转文字
 func (s *ASRService) Transcribe(audioPath string) (string, error) {
 	if s.BaseURL == "" {
-		// 本地 faster-whisper 模拟
-		return fmt.Sprintf("[transcribed from %s]", filepath.Base(audioPath)), nil
+		// 未配置必须显式失败：伪造转写文本会让用户以为真的转写成功了
+		return "", fmt.Errorf("%w: ASR 服务未配置（设置 ASR_BASE_URL，或由桌面客户端自动拉起语音服务）", ErrServiceNotConfigured)
 	}
 
 	file, err := os.Open(audioPath)
@@ -295,8 +295,8 @@ func NewTTSService(baseURL string) *TTSService {
 // Synthesize 文字转语音
 func (s *TTSService) Synthesize(text string, outputPath string) error {
 	if s.BaseURL == "" {
-		// 模拟生成
-		return os.WriteFile(outputPath, []byte("fake audio data"), 0644)
+		// 未配置必须显式失败：写一个假音频文件会让下游节点「成功」产出垃圾
+		return fmt.Errorf("%w: TTS 服务未配置（设置 TTS_BASE_URL，或由桌面客户端自动拉起语音服务）", ErrServiceNotConfigured)
 	}
 
 	reqBody := map[string]interface{}{

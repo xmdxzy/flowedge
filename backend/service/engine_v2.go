@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +12,41 @@ import (
 
 	"flowedge/backend/model"
 )
+
+// 节点超时：默认 180s，节点可用 data.timeout_ms 覆盖，上限 30 分钟
+// （ComfyUI 首次加载 checkpoint 可达数分钟，硬编码短超时会误杀合法任务）
+const (
+	defaultNodeTimeout = 180 * time.Second
+	maxNodeTimeout     = 30 * time.Minute
+)
+
+// ErrServiceNotConfigured 依赖的外部服务未配置（ASR / TTS 等）。
+// 铁律：未配置必须显式失败，绝不能伪造成功结果——那会让用户以为真的跑通了。
+var ErrServiceNotConfigured = errors.New("service not configured")
+
+// nodeExecError 带稳定错误码的执行错误（超时、取消等）
+type nodeExecError struct {
+	Code string
+	Err  error
+}
+
+func (e *nodeExecError) Error() string { return e.Err.Error() }
+func (e *nodeExecError) Unwrap() error { return e.Err }
+
+// classifyError 把执行错误归类为稳定错误码，供 UI 与告警消费
+func classifyError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ne *nodeExecError
+	if errors.As(err, &ne) {
+		return ne.Code
+	}
+	if errors.Is(err, ErrServiceNotConfigured) {
+		return model.ErrorCodeConfigMissing
+	}
+	return model.ErrorCodeExecution
+}
 
 // maxSubWorkflowDepth 子工作流/循环最大嵌套深度
 const maxSubWorkflowDepth = 4
@@ -144,6 +180,18 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 		return nil, fmt.Errorf("parse edges failed: %w", err)
 	}
 
+	// 图结构校验：环 / 自环 / 悬空边必须显式报错。
+	// 没有这一步，成环时 remaining 永不归零 → 主循环零执行且不返回任何错误，
+	// 用户会以为工作流在正常运行（最恶劣的一类静默失败）。
+	if issues := ValidateDAG(nodes, edges); HasBlockingIssue(issues) {
+		first := FirstBlocking(issues)
+		for i := range nodes {
+			nodes[i].Status = "skipped"
+			nodes[i].ErrorCode = string(first.Code)
+		}
+		return nodes, fmt.Errorf("%s (code=%s)", first.Message, first.Code)
+	}
+
 	// 构建邻接表
 	adj := make(map[string][]model.EdgeInstance)
 	nodeMap := make(map[string]*model.NodeInstance)
@@ -269,8 +317,6 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 		persist(nodes)
 	}
 
-	const nodeTimeout = 180 * time.Second
-
 	for len(current) > 0 {
 		// 每层开始前检查取消：节点内部无法中断，但已完成的层不会浪费
 		select {
@@ -278,6 +324,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 			for _, id := range order {
 				if nodeMap[id].Status == "pending" {
 					nodeMap[id].Status = "skipped"
+					nodeMap[id].ErrorCode = model.ErrorCodeCancelled
 				}
 			}
 			return nodes, fmt.Errorf("运行已取消")
@@ -371,6 +418,15 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					retryDelay = time.Duration(d) * time.Millisecond
 				}
 
+				// 节点级超时：data.timeout_ms 覆盖默认 180s（上限 30 分钟）
+				timeout := defaultNodeTimeout
+				if ms, ok := node.Data["timeout_ms"].(float64); ok && ms > 0 {
+					timeout = time.Duration(ms) * time.Millisecond
+					if timeout > maxNodeTimeout {
+						timeout = maxNodeTimeout
+					}
+				}
+
 				// 节点缓存：命中则跳过执行（省 GPU / 网络）
 				cacheKeyStr := ""
 				if e.cache != nil && cacheableNode(execNode.Type, execNode.Data) {
@@ -415,8 +471,11 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					select {
 					case res := <-resCh:
 						out, execErr = res.out, res.err
-					case <-time.After(nodeTimeout):
-						execErr = fmt.Errorf("node timeout after %s", nodeTimeout)
+					case <-time.After(timeout):
+						execErr = &nodeExecError{
+							Code: model.ErrorCodeTimeout,
+							Err:  fmt.Errorf("node timeout after %s", timeout),
+						}
 					}
 					if execErr == nil {
 						break
@@ -430,6 +489,12 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				if execErr != nil {
 					node.Status = "failed"
 					node.Error = execErr.Error()
+					node.ErrorCode = classifyError(execErr)
+					// 重试耗尽：仅在无法归类的通用执行错误时标记，
+					// 保留 timeout / config_missing 等更具体的错误码
+					if node.ErrorCode == model.ErrorCodeExecution && retryCount > 0 {
+						node.ErrorCode = model.ErrorCodeRetryExhausted
+					}
 
 					// continue_on_error：节点失败但不中断工作流，向下游传播错误对象
 					// （与 join=any 组合即「任一成功即可，失败分支忽略」）

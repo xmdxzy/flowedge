@@ -142,12 +142,14 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBas
 		}
 		setOK(dst, c)
 	}
+	// 注意：未配置时 ASR/TTS 节点会显式失败（error_code=config_missing），
+	// 绝不伪造转写文本或假音频——提示文案必须如实说明这一点
 	wg.Add(1)
 	go probeLocal(&caps.ASR, asrBase, "ASR",
-		"可选能力。先运行 FlowEdge.exe --export-services 导出脚本到 local-services/，再装 Python 并执行 python asr_server.py（首次会自动下载 whisper 模型约 500MB）")
+		"未配置：ASR 节点会直接失败（不会伪造转写结果）。启用方式：先运行 FlowEdge.exe --export-services 导出脚本到 local-services/，再装 Python 并执行 python asr_server.py（首次会自动下载 whisper 模型约 500MB）")
 	wg.Add(1)
 	go probeLocal(&caps.TTS, ttsBase, "TTS",
-		"可选能力。先运行 FlowEdge.exe --export-services 导出脚本到 local-services/，再装 Python 并执行 python tts_server.py（用 Windows 自带语音引擎，无需下载模型）")
+		"未配置：TTS 节点会直接失败（不会写出假音频）。启用方式：先运行 FlowEdge.exe --export-services 导出脚本到 local-services/，再装 Python 并执行 python tts_server.py（用 Windows 自带语音引擎，无需下载模型）")
 
 	wg.Wait()
 

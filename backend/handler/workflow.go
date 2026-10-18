@@ -40,11 +40,39 @@ func (h *WorkflowHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, workflow)
 }
 
+// validateGraph 保存期图结构校验：阻止把非法 DAG 存进库。
+// 返回 (0, nil) 表示通过；否则返回 HTTP 状态码与错误体。
+// 只阻断 error 级问题（环 / 自环 / 悬空边），warn 级（重复边、孤立节点）随响应一并返回供前端提示。
+func validateGraph(nodes, edges json.RawMessage) (int, gin.H) {
+	issues, err := service.ValidateDAGJSON(nodes, edges)
+	if err != nil {
+		return http.StatusBadRequest, gin.H{"error": err.Error()}
+	}
+	blocking := make([]service.DAGIssue, 0)
+	for _, i := range issues {
+		if i.Level == "error" {
+			blocking = append(blocking, i)
+		}
+	}
+	if len(blocking) > 0 {
+		return http.StatusBadRequest, gin.H{
+			"error":  blocking[0].Message,
+			"code":   string(blocking[0].Code),
+			"issues": issues,
+		}
+	}
+	return 0, nil
+}
+
 // Create 创建工作流
 func (h *WorkflowHandler) Create(c *gin.Context) {
 	var wf model.Workflow
 	if err := c.ShouldBindJSON(&wf); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if code, body := validateGraph(wf.Nodes, wf.Edges); code != 0 {
+		c.JSON(code, body)
 		return
 	}
 	if err := h.db.Create(&wf).Error; err != nil {
@@ -66,6 +94,10 @@ func (h *WorkflowHandler) Update(c *gin.Context) {
 	var updates model.Workflow
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if code, body := validateGraph(updates.Nodes, updates.Edges); code != 0 {
+		c.JSON(code, body)
 		return
 	}
 
