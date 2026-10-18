@@ -2,7 +2,10 @@ package handler
 
 import (
 	"io"
+	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -144,11 +147,121 @@ func (h *KBHandler) ImportFile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
-		"file":    file.Filename,
-		"chunks":  len(ids),
-		"ids":     ids,
-		"total":   h.rag.Count(),
+		"file":     file.Filename,
+		"chunks":   len(ids),
+		"ids":      ids,
+		"total":    h.rag.Count(),
 		"embedder": h.rag.Backend(),
+	})
+}
+
+type kbImportDirRequest struct {
+	Dir       string `json:"dir"`
+	Recursive bool   `json:"recursive"`
+}
+
+// ImportDir 批量导入目录下的 .md/.txt（递归可选），跳过隐藏目录与常见噪音目录
+func (h *KBHandler) ImportDir(c *gin.Context) {
+	var req kbImportDirRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	dir := strings.TrimSpace(req.Dir)
+	if dir == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "dir is empty"})
+		return
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "dir not found or not a directory: " + dir})
+		return
+	}
+
+	skipDir := map[string]bool{
+		"node_modules": true, ".git": true, "dist": true, "build": true,
+		".venv": true, "venv": true, "data": true, "__pycache__": true,
+	}
+
+	type imported struct {
+		File   string `json:"file"`
+		Chunks int    `json:"chunks"`
+	}
+	var (
+		files    []imported
+		skipped  []string
+		total    int
+		scanned  int
+		readErrs []string
+	)
+
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			readErrs = append(readErrs, path+": "+err.Error())
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != dir && (skipDir[name] || strings.HasPrefix(name, ".")) {
+				return filepath.SkipDir
+			}
+			if !req.Recursive && path != dir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		scanned++
+		lower := strings.ToLower(d.Name())
+		if !strings.HasSuffix(lower, ".md") && !strings.HasSuffix(lower, ".txt") {
+			skipped = append(skipped, path)
+			return nil
+		}
+		st, statErr := d.Info()
+		if statErr != nil || st.Size() > 2<<20 {
+			skipped = append(skipped, path)
+			return nil
+		}
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			readErrs = append(readErrs, path+": "+readErr.Error())
+			return nil
+		}
+		content := strings.TrimSpace(string(raw))
+		if content == "" {
+			skipped = append(skipped, path)
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			rel = d.Name()
+		}
+		ids, addErr := h.rag.AddDocument(content, rel)
+		if addErr != nil {
+			readErrs = append(readErrs, rel+": "+addErr.Error())
+			return nil
+		}
+		files = append(files, imported{File: rel, Chunks: len(ids)})
+		total += len(ids)
+		return nil
+	})
+
+	if walkErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": walkErr.Error()})
+		return
+	}
+	if files == nil {
+		files = []imported{}
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"dir":       dir,
+		"files":     files,
+		"fileCount": len(files),
+		"chunks":    total,
+		"scanned":   scanned,
+		"skipped":   len(skipped),
+		"errors":    readErrs,
+		"total":     h.rag.Count(),
+		"embedder":  h.rag.Backend(),
 	})
 }
 

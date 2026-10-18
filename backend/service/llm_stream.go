@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 )
@@ -58,16 +57,36 @@ func (s *LLMStreamService) ChatStreamWithModel(prompt, model string) (<-chan Str
 	if model == "" {
 		model = s.Model
 	}
+	return s.streamRequest(streamChatRequest{
+		Model:    model,
+		Messages: []chatMessage{{Role: "user", Content: prompt}},
+		Stream:   true,
+	})
+}
 
-	reqBody := streamChatRequest{
-		Model: model,
-		Messages: []chatMessage{
-			{Role: "user", Content: prompt},
-		},
-		Stream: true,
+// ChatStreamMessages 带完整消息历史（含工具调用/工具结果）的流式补全，
+// 用于工具调用循环的最终答案轮——前面几轮要拿到完整 tool_calls 所以走非流式
+func (s *LLMStreamService) ChatStreamMessages(messages []toolChatMessage, model string) (<-chan StreamChunk, error) {
+	if model == "" {
+		model = s.Model
 	}
+	return s.streamRequest(streamMessagesRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   true,
+	})
+}
 
-	jsonBody, err := json.Marshal(reqBody)
+// streamMessagesRequest 带工具消息历史的流式请求体
+type streamMessagesRequest struct {
+	Model    string            `json:"model"`
+	Messages []toolChatMessage `json:"messages"`
+	Stream   bool              `json:"stream"`
+}
+
+// streamRequest 发起一次流式请求并解析 SSE
+func (s *LLMStreamService) streamRequest(payload interface{}) (<-chan StreamChunk, error) {
+	jsonBody, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request failed: %w", err)
 	}
@@ -90,12 +109,12 @@ func (s *LLMStreamService) ChatStreamWithModel(prompt, model string) (<-chan Str
 		defer close(ch)
 
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if line == "" {
 				continue
 			}
-
 			// SSE 格式：data: {...}
 			if len(line) > 6 && line[:6] == "data: " {
 				data := line[6:]
@@ -103,12 +122,10 @@ func (s *LLMStreamService) ChatStreamWithModel(prompt, model string) (<-chan Str
 					ch <- StreamChunk{Done: true}
 					return
 				}
-
 				var chunk streamChatResponse
 				if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 					continue
 				}
-
 				if len(chunk.Choices) > 0 {
 					content := chunk.Choices[0].Delta.Content
 					if content != "" {
@@ -121,31 +138,8 @@ func (s *LLMStreamService) ChatStreamWithModel(prompt, model string) (<-chan Str
 				}
 			}
 		}
-
-		// 流结束了
 		ch <- StreamChunk{Done: true}
 	}()
 
 	return ch, nil
 }
-
-// ReadAll 读取所有流式内容并拼接
-func (s *LLMStreamService) ReadAll(prompt string) (string, error) {
-	ch, err := s.ChatStream(prompt)
-	if err != nil {
-		return "", err
-	}
-
-	var result string
-	for chunk := range ch {
-		if chunk.Done {
-			break
-		}
-		result += chunk.Content
-	}
-
-	return result, nil
-}
-
-// 确保 io.Reader 被引用
-var _ io.Reader = (*bytes.Buffer)(nil)

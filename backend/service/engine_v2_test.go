@@ -622,3 +622,374 @@ func TestTransform_PlainInputKeepsUnknownPlaceholders(t *testing.T) {
 		t.Errorf("render = %q", got)
 	}
 }
+
+// 分支汇合：if_else 命中 false 后，true 分支被裁剪、汇合节点仍必须执行
+// （此前的缺陷：被跳过的前驱不会递减前驱计数 → 汇合节点永远等不到 remaining==0）
+func TestEngine_BranchMerge(t *testing.T) {
+	e := newTestEngine()
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "no-match"}},
+		{"id": "c1", "type": "if_else", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"condition_type": "contains", "compare_value": "HIT"}},
+		{"id": "t1", "type": "data_transform", "position": map[string]float64{"x": 2, "y": -1}, "data": map[string]interface{}{"template": "true-branch"}},
+		{"id": "f1", "type": "data_transform", "position": map[string]float64{"x": 2, "y": 1}, "data": map[string]interface{}{"template": "false-branch"}},
+		{"id": "m1", "type": "data_transform", "position": map[string]float64{"x": 3, "y": 0}, "data": map[string]interface{}{"template": "merged:{{input}}"}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 4, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "c1"},
+		{"id": "b", "source": "c1", "target": "t1", "sourceHandle": "true"},
+		{"id": "c", "source": "c1", "target": "f1", "sourceHandle": "false"},
+		{"id": "d", "source": "t1", "target": "m1"},
+		{"id": "f", "source": "f1", "target": "m1"},
+		{"id": "g", "source": "m1", "target": "e1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("branch merge execute failed: %v", err)
+	}
+	st := map[string]string{}
+	for _, n := range states {
+		st[n.ID] = n.Status
+	}
+	if st["t1"] != "skipped" {
+		t.Errorf("true branch = %s, want skipped", st["t1"])
+	}
+	if st["m1"] != "success" {
+		t.Errorf("merge node = %s, want success (skipped predecessor must release the count)", st["m1"])
+	}
+	if st["e1"] != "success" {
+		t.Errorf("end = %s, want success", st["e1"])
+	}
+}
+
+// join=any：深分支不必等另一条链的后续层，汇合节点可与其并行
+func TestEngine_JoinAny(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(250 * time.Millisecond)
+		fmt.Fprint(w, "slow-done")
+	}))
+	defer srv.Close()
+
+	run := func(join string) (jStart time.Time, bEnd time.Time) {
+		e := newTestEngine()
+		e.http = NewHTTPService()
+
+		data := map[string]interface{}{"template": "{{input}}"}
+		if join != "" {
+			data["join"] = join
+		}
+
+		nodes := marshalNodes(t, []map[string]interface{}{
+			{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
+			{"id": "x1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"template": "fast"}},
+			{"id": "a1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"template": "slow-seed"}},
+			{"id": "b1", "type": "http_request", "position": map[string]float64{"x": 2, "y": 1}, "data": map[string]interface{}{"method": "GET", "url": srv.URL}},
+			{"id": "j1", "type": "data_transform", "position": map[string]float64{"x": 3, "y": 0}, "data": data},
+			{"id": "e1", "type": "end", "position": map[string]float64{"x": 4, "y": 0}, "data": map[string]interface{}{}},
+		})
+		edges := marshalEdges(t, []map[string]interface{}{
+			{"id": "e1", "source": "s1", "target": "x1"},
+			{"id": "e2", "source": "s1", "target": "a1"},
+			{"id": "e3", "source": "a1", "target": "b1"},
+			{"id": "e4", "source": "x1", "target": "j1"},
+			{"id": "e5", "source": "b1", "target": "j1"},
+			{"id": "e6", "source": "j1", "target": "e1"},
+		})
+
+		states, err := e.Execute(nodes, edges)
+		if err != nil {
+			t.Fatalf("join=%q execute failed: %v", join, err)
+		}
+		for _, n := range states {
+			switch n.ID {
+			case "j1":
+				if n.Status != "success" || n.StartedAt == nil || n.EndedAt == nil {
+					t.Fatalf("join=%q merge node status=%s", join, n.Status)
+				}
+				jStart = *n.StartedAt
+			case "b1":
+				if n.Status != "success" || n.EndedAt == nil {
+					t.Fatalf("join=%q slow node status=%s err=%s", join, n.Status, n.Error)
+				}
+				bEnd = *n.EndedAt
+			}
+		}
+		return
+	}
+
+	allJ, allB := run("all")
+	anyJ, anyB := run("any")
+
+	if allJ.Before(allB) {
+		t.Errorf("join=all must not start before every predecessor finished: j1 started %v, b1 ended %v", allJ, allB)
+	}
+	if !anyJ.Before(anyB) {
+		t.Errorf("join=any should run without waiting: j1 started %v, b1 ended %v", anyJ, anyB)
+	}
+}
+
+// continue_on_error：节点失败不中断工作流，错误对象向下游传播
+func TestEngine_ContinueOnError(t *testing.T) {
+	e := newTestEngine()
+	e.http = NewHTTPService()
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "x"}},
+		{"id": "f1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"continue_on_error": true}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "f1"},
+		{"id": "b", "source": "f1", "target": "e1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("workflow must not fail when continue_on_error is set: %v", err)
+	}
+	st := map[string]string{}
+	var failOut interface{}
+	for _, n := range states {
+		st[n.ID] = n.Status
+		if n.ID == "f1" {
+			failOut = n.Output
+		}
+	}
+	if st["f1"] != "failed" {
+		t.Errorf("failing node status = %s, want failed (still recorded honestly)", st["f1"])
+	}
+	if st["e1"] != "success" {
+		t.Errorf("downstream = %s, want success", st["e1"])
+	}
+	if m, ok := failOut.(map[string]interface{}); !ok || m["error"] == nil {
+		t.Errorf("failed node should propagate an error object downstream, got %v", failOut)
+	}
+}
+
+// 工具调用：模型要求 calc → 本地执行 → 结果回填 → 模型给出最终答案
+func TestEngine_ToolCalling(t *testing.T) {
+	var (
+		callCount   int
+		sawToolMsg  bool
+		sawToolSpec bool
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role       string `json:"role"`
+				Content    string `json:"content"`
+				ToolCallID string `json:"tool_call_id"`
+			} `json:"messages"`
+			Tools []map[string]interface{} `json:"tools"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		callCount++
+		if len(req.Tools) > 0 {
+			sawToolSpec = true
+		}
+		for _, m := range req.Messages {
+			if m.Role == "tool" && m.Content == "14" && m.ToolCallID == "call_1" {
+				sawToolMsg = true
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if callCount == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"",
+				"tool_calls":[{"id":"call_1","type":"function","function":{"name":"calc","arguments":"{\"expression\":\"(2+5)*2\"}"}}]}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"计算结果是 14"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	e := newTestEngine()
+	e.llm = NewLLMService(srv.URL, "test-model")
+	e.http = NewHTTPService()
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "算一下 (2+5)*2"}},
+		{"id": "l1", "type": "llm", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"tools": []interface{}{"calc"}}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "l1"},
+		{"id": "b", "source": "l1", "target": "e1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("tool calling execute failed: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("model called %d times, want 2 (tool round + final answer)", callCount)
+	}
+	if !sawToolSpec {
+		t.Error("tools declaration was not sent to the model")
+	}
+	if !sawToolMsg {
+		t.Error("tool result was not fed back into the conversation")
+	}
+
+	for _, n := range states {
+		if n.ID != "l1" {
+			continue
+		}
+		m, ok := n.Output.(map[string]interface{})
+		if !ok {
+			t.Fatalf("llm output not a map: %v", n.Output)
+		}
+		if m["text"] != "计算结果是 14" {
+			t.Errorf("final text = %v", m["text"])
+		}
+		trace, _ := m["tool_calls"].([]map[string]interface{})
+		if trace == nil {
+			if raw, ok := m["tool_calls"].([]interface{}); ok {
+				if len(raw) != 1 {
+					t.Errorf("tool trace length = %d, want 1", len(raw))
+				}
+				return
+			}
+			t.Fatalf("tool_calls trace missing: %v", m)
+		}
+		if len(trace) != 1 || trace[0]["tool"] != "calc" {
+			t.Errorf("tool trace = %v", trace)
+		}
+	}
+}
+
+// calc 工具的四则运算求值器
+func TestTool_CalcExpression(t *testing.T) {
+	cases := map[string]float64{
+		"1+1":           2,
+		"(2+5)*2":       14,
+		"10/4":          2.5,
+		"-3+1":          -2,
+		"2*(3+(4-1))/3": 4,
+	}
+	for expr, want := range cases {
+		got, err := EvalExpression(expr)
+		if err != nil {
+			t.Errorf("eval %q failed: %v", expr, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("eval %q = %v, want %v", expr, got, want)
+		}
+	}
+	if _, err := EvalExpression("1/0"); err == nil {
+		t.Error("division by zero should error")
+	}
+	if _, err := EvalExpression("1+"); err == nil {
+		t.Error("incomplete expression should error")
+	}
+}
+
+// 文本形态工具调用：模型不支持 tool_calls 字段，把调用写进 content（qwen2.5 的真实行为）
+func TestEngine_ToolCallingTextMode(t *testing.T) {
+	var callCount int
+	var sawToolResult bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		callCount++
+		for _, m := range req.Messages {
+			if m.Role == "user" && strings.Contains(m.Content, "工具 calc 的执行结果：\n14") {
+				sawToolResult = true
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if callCount == 1 {
+			// 关键：tool_calls 缺失，调用被写进 content
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"{\"name\": \"calc\", \"arguments\": {\"expression\": \"(2+5)*2\"}}"},"finish_reason":"stop"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"(2+5)*2 等于 14"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	e := newTestEngine()
+	e.llm = NewLLMService(srv.URL, "test-model")
+	e.http = NewHTTPService()
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "算一下 (2+5)*2"}},
+		{"id": "l1", "type": "llm", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"tools": []interface{}{"calc"}}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "l1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("text-mode tool calling failed: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("model called %d times, want 2", callCount)
+	}
+	if !sawToolResult {
+		t.Error("tool result was not fed back as a user message")
+	}
+
+	for _, n := range states {
+		if n.ID != "l1" {
+			continue
+		}
+		m := n.Output.(map[string]interface{})
+		if m["text"] != "(2+5)*2 等于 14" {
+			t.Errorf("final text = %v", m["text"])
+		}
+		raw, ok := m["tool_calls"].([]map[string]interface{})
+		if !ok || len(raw) != 1 {
+			t.Fatalf("tool trace = %v (type %T)", m["tool_calls"], m["tool_calls"])
+		}
+		rec := raw[0]
+		if rec["mode"] != "text" {
+			t.Errorf("trace mode = %v, want text", rec["mode"])
+		}
+		if rec["result"] != "14" {
+			t.Errorf("tool result = %v, want 14", rec["result"])
+		}
+	}
+}
+
+// 文本调用解析：多种书写形态都要识别，未知工具必须忽略
+func TestParseTextToolCalls(t *testing.T) {
+	specs := []ToolSpec{}
+	e := NewToolExecutor(nil, nil)
+	specs = e.Specs([]string{"calc", "now"})
+
+	cases := []struct {
+		content string
+		want    string
+	}{
+		{`{"name":"calc","arguments":{"expression":"1+1"}}`, "calc"},
+		{"我来计算：\n```json\n{\"name\": \"calc\", \"arguments\": {\"expression\": \"1+1\"}}\n```", "calc"},
+		{`好的 {"tool":"now","parameters":{}} 马上`, "now"},
+		{`{"function":{"name":"calc"},"arguments":{"expression":"2*3"}}`, "calc"},
+		{`{"name":"unknown_tool","arguments":{}}`, ""},
+		{`这只是一段普通回答`, ""},
+	}
+	for _, c := range cases {
+		got := parseTextToolCalls(c.content, specs)
+		if c.want == "" {
+			if len(got) != 0 {
+				t.Errorf("content %q should not parse, got %v", c.content, got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0].Function.Name != c.want {
+			t.Errorf("content %q parsed %v, want %s", c.content, got, c.want)
+		}
+	}
+}

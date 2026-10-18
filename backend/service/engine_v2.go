@@ -17,6 +17,12 @@ const maxSubWorkflowDepth = 4
 // maxLoopIterations 循环节点硬迭代上限（安全阀，防止无限循环打爆资源）
 const maxLoopIterations = 100
 
+// joinIsAny 节点是否配置为「任一前驱完成即执行」（join=any）
+func joinIsAny(n *model.NodeInstance) bool {
+	j, _ := n.Data["join"].(string)
+	return j == "any"
+}
+
 // EngineV2 增强版工作流引擎
 type EngineV2 struct {
 	llm             *LLMService
@@ -29,6 +35,7 @@ type EngineV2 struct {
 	rag             *RAGServiceV3
 	gpuSched        *GPUScheduler
 	wsHub           *WSHub
+	tools           *ToolExecutor
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
 	depth           atomic.Int32                       // 当前嵌套深度
 }
@@ -100,6 +107,7 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 	order := make([]string, 0, len(nodes))
 	remaining := make(map[string]int)                     // 该节点尚未完成的前驱数
 	nodeInputs := make(map[string]map[string]interface{}) // nodeID -> {sourceID: output}
+	preds := make(map[string][]string)                    // nodeID -> 前驱列表（判断分支是否会合）
 
 	// 断点回填：上次 success 的节点复用输出；skipped 重置为 pending
 	// （由本轮执行重新裁剪分支）；failed/running/pending 重跑
@@ -147,18 +155,38 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 			}
 			seen[id] = true
 			n := nodeMap[id]
-			if n.Status == "success" || n.Status == "failed" {
+			if n.Status != "pending" {
+				continue // 只裁剪尚未执行的节点，重复调用安全
+			}
+			// 汇合节点保护：只要还有「尚未定局」的前驱（pending/running），
+			// 该节点就不属于死分支。已 success 的前驱不再传播（如 if_else
+			// 未命中的那一侧），不能算作活跃
+			active := false
+			for _, pid := range preds[id] {
+				if pn := nodeMap[pid]; pn != nil && (pn.Status == "pending" || pn.Status == "running") {
+					active = true
+					break
+				}
+			}
+			if len(preds[id]) > 0 && active {
 				continue
 			}
 			n.Status = "skipped"
 			for _, eg := range adj[id] {
+				// 被跳过的前驱永远不会完成，必须把它从下游的前驱计数里扣掉，
+				// 否则分支汇合节点会永远等不到 remaining==0（死等）
+				if remaining[eg.Target] > 0 {
+					remaining[eg.Target]--
+				}
 				queue = append(queue, eg.Target)
 			}
 		}
 	}
 
+	var skipSeeds []string // Resume 阶段的分支裁剪种子（须等 remaining 统计完成后再处理）
 	for _, edge := range edges {
 		adj[edge.Source] = append(adj[edge.Source], edge)
+		preds[edge.Target] = append(preds[edge.Target], edge.Source)
 		src := nodeMap[edge.Source]
 		switch {
 		case src != nil && src.Status == "success":
@@ -172,7 +200,7 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 					label = "true"
 				}
 				if branchPath != label {
-					skipBFS(edge.Target)
+					skipSeeds = append(skipSeeds, edge.Target)
 					continue
 				}
 			}
@@ -180,6 +208,9 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 		default:
 			remaining[edge.Target]++
 		}
+	}
+	for _, t := range skipSeeds {
+		skipBFS(t)
 	}
 
 	// 初始层：无未满足前驱的待执行节点
@@ -202,6 +233,39 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 		inNext := map[string]bool{}
 		layerFailed := false
 		var layerMu sync.Mutex
+
+		// propagate 写出边（调用方必须持有 mu）：
+		//   1. 写入下游输入槽（多前驱时天然形成汇合输入）
+		//   2. 递减前驱计数
+		//   3. 按 join 策略决定是否入队：all=等齐前驱；any=任一前驱完成即执行
+		propagate := func(nid string, out interface{}, branchPath string) {
+			for _, eg := range adj[nid] {
+				if branchPath != "" {
+					label := eg.SourceHandle
+					if label == "" {
+						label = "true"
+					}
+					if label != branchPath {
+						skipBFS(eg.Target)
+						continue
+					}
+				}
+
+				nodeInputs[eg.Target][nid] = out
+				if remaining[eg.Target] > 0 {
+					remaining[eg.Target]--
+				}
+
+				tgt := nodeMap[eg.Target]
+				if tgt == nil || tgt.Status != "pending" || inNext[eg.Target] {
+					continue
+				}
+				if remaining[eg.Target] <= 0 || joinIsAny(tgt) {
+					inNext[eg.Target] = true
+					next = append(next, eg.Target)
+				}
+			}
+		}
 
 		// 同一层内所有节点并行执行
 		for _, id := range current {
@@ -274,6 +338,21 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 				if execErr != nil {
 					node.Status = "failed"
 					node.Error = execErr.Error()
+
+					// continue_on_error：节点失败但不中断工作流，向下游传播错误对象
+					// （与 join=any 组合即「任一成功即可，失败分支忽略」）
+					cont, _ := node.Data["continue_on_error"].(bool)
+					if cont {
+						failOut := map[string]interface{}{"text": "", "error": execErr.Error()}
+						node.Output = failOut
+						propagate(nid, failOut, "")
+						mu.Unlock()
+						if e.wsHub != nil {
+							e.wsHub.Broadcast(Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
+						}
+						return
+					}
+
 					layerMu.Lock()
 					layerFailed = true
 					layerMu.Unlock()
@@ -292,38 +371,14 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 					e.wsHub.Broadcast(Event{Type: "node_finished", NodeID: nid, Data: map[string]interface{}{"output": out}})
 				}
 
-				// 处理出边
-				mu.Lock()
-				outEdges := adj[nid]
+				// 处理出边（if_else 需按命中分支裁剪未激活侧）
+				branchPath := ""
 				if node.Type == "if_else" {
-					branch, _ := out.(map[string]interface{})
-					branchPath, _ := branch["branch"].(string)
-					for _, eg := range outEdges {
-						label := eg.SourceHandle
-						if label == "" {
-							label = "true"
-						}
-						if branchPath == label {
-							nodeInputs[eg.Target][nid] = out
-							remaining[eg.Target]--
-							if remaining[eg.Target] == 0 && nodeMap[eg.Target].Status == "pending" && !inNext[eg.Target] {
-								inNext[eg.Target] = true
-								next = append(next, eg.Target)
-							}
-						} else {
-							skipBFS(eg.Target)
-						}
-					}
-				} else {
-					for _, eg := range outEdges {
-						nodeInputs[eg.Target][nid] = out
-						remaining[eg.Target]--
-						if remaining[eg.Target] == 0 && nodeMap[eg.Target].Status == "pending" && !inNext[eg.Target] {
-							inNext[eg.Target] = true
-							next = append(next, eg.Target)
-						}
-					}
+					b, _ := out.(map[string]interface{})
+					branchPath, _ = b["branch"].(string)
 				}
+				mu.Lock()
+				propagate(nid, out, branchPath)
 				mu.Unlock()
 			}(id)
 		}
@@ -337,6 +392,16 @@ func (e *EngineV2) run(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, p
 				}
 			}
 			return nodes, wfErr
+		}
+
+		// 扫尾：skipBFS 扣减前驱计数后，可能有节点已经就绪却没被入队
+		// （分支汇合、continue_on_error 传播、孤立节点）
+		for _, id := range order {
+			n := nodeMap[id]
+			if n.Status == "pending" && !inNext[id] && remaining[id] <= 0 {
+				inNext[id] = true
+				next = append(next, id)
+			}
 		}
 
 		// 每层完成后增量落库（断点续跑依据）
@@ -455,6 +520,11 @@ func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]int
 		defer e.gpuSched.ReleaseModel(schedName)
 	}
 
+	// 工具调用：节点声明了 tools 时走「工具轮（非流式）+ 最终答案轮（流式）」
+	if toolNames := nodeToolNames(node); len(toolNames) > 0 && e.llm != nil {
+		return e.execLLMWithTools(node, prompt, reqModel, toolNames)
+	}
+
 	// 流式优先：token 经 WS 实时推送前端（打字机效果）
 	if e.llmStream != nil {
 		ch, err := e.llmStream.ChatStreamWithModel(prompt, reqModel)
@@ -480,6 +550,153 @@ func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]int
 	}
 
 	return map[string]interface{}{"text": result}, nil
+}
+
+// nodeToolNames 读取节点声明的工具名列表（data.tools，支持数组或逗号串）
+func nodeToolNames(node *model.NodeInstance) []string {
+	raw, ok := node.Data["tools"]
+	if !ok {
+		return nil
+	}
+	var names []string
+	switch v := raw.(type) {
+	case []interface{}:
+		for _, it := range v {
+			if str, ok := it.(string); ok && str != "" {
+				names = append(names, str)
+			}
+		}
+	case []string:
+		for _, str := range v {
+			if str != "" {
+				names = append(names, str)
+			}
+		}
+	case string:
+		for _, part := range strings.Split(v, ",") {
+			if t := strings.TrimSpace(part); t != "" {
+				names = append(names, t)
+			}
+		}
+	}
+	return names
+}
+
+// execLLMWithTools 工具调用循环：
+//  1. 带 tools 声明请求模型（非流式，需要完整 tool_calls）
+//  2. 模型要工具 → 本地执行 → 结果回填 messages → 再请求
+//  3. 模型给出最终答案 → 流式重放一次以保留打字机效果
+//
+// 轮次上限 4，防止模型无限索要工具
+func (e *EngineV2) execLLMWithTools(node *model.NodeInstance, prompt, reqModel string, toolNames []string) (interface{}, error) {
+	const maxRounds = 4
+
+	if e.tools == nil {
+		e.tools = NewToolExecutor(e.http, e.rag)
+	}
+	specs := e.tools.Specs(toolNames)
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("LLM node declares tools %v but none are known", toolNames)
+	}
+
+	messages := []toolChatMessage{{Role: "user", Content: prompt}}
+	trace := make([]map[string]interface{}, 0, 4)
+
+	for round := 0; round < maxRounds; round++ {
+		msg, err := e.llm.ChatWithTools(messages, specs, reqModel)
+		if err != nil {
+			return nil, err
+		}
+
+		calls := msg.ToolCalls
+		textMode := false
+		if len(calls) == 0 {
+			// 兼容不支持 tool_calls 字段的模型（如 qwen2.5 会把调用写成 content 里的 JSON）
+			if parsed := parseTextToolCalls(msg.Content, specs); len(parsed) > 0 {
+				calls = parsed
+				textMode = true
+			} else {
+				final := msg.Content
+				if e.llmStream != nil {
+					messages = append(messages, toolChatMessage{Role: "assistant", Content: msg.Content})
+					if streamed, serr := e.streamFinalAnswer(node, messages, reqModel); serr == nil && streamed != "" {
+						final = streamed
+					}
+				}
+				out := map[string]interface{}{"text": final}
+				if len(trace) > 0 {
+					out["tool_calls"] = trace
+					out["tool_rounds"] = len(trace)
+				}
+				return out, nil
+			}
+		}
+
+		// 标准 tool_calls：assistant 消息带工具请求入历史
+		// 文本形态：把模型原始输出作为 assistant 内容，工具结果用 user 消息回填（模型无关）
+		if textMode {
+			messages = append(messages, toolChatMessage{Role: "assistant", Content: msg.Content})
+		} else {
+			messages = append(messages, *msg)
+		}
+
+		for _, tc := range calls {
+			if e.wsHub != nil {
+				e.wsHub.Broadcast(Event{
+					Type:   "tool_call",
+					NodeID: node.ID,
+					Data:   map[string]interface{}{"tool": tc.Function.Name, "arguments": tc.Function.Arguments},
+				})
+			}
+			result, runErr := e.tools.Run(tc.Function.Name, tc.Function.Arguments)
+			status := "ok"
+			if runErr != nil {
+				result = "工具执行失败: " + runErr.Error()
+				status = "error"
+			}
+			rec := map[string]interface{}{
+				"tool":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+				"result":    truncateRunes(result, 500),
+				"status":    status,
+			}
+			if textMode {
+				rec["mode"] = "text"
+			}
+			trace = append(trace, rec)
+
+			if textMode {
+				messages = append(messages, toolChatMessage{
+					Role: "user",
+					Content: "工具 " + tc.Function.Name + " 的执行结果：\n" + result +
+						"\n\n请基于这个结果直接给出最终回答，不要再输出工具调用的 JSON。",
+				})
+			} else {
+				messages = append(messages, toolChatMessage{Role: "tool", ToolCallID: tc.ID, Content: result})
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("tool calling exceeded %d rounds", maxRounds)
+}
+
+// streamFinalAnswer 用完整消息历史再做一次流式补全（保留打字机效果）
+func (e *EngineV2) streamFinalAnswer(node *model.NodeInstance, messages []toolChatMessage, reqModel string) (string, error) {
+	ch, err := e.llmStream.ChatStreamMessages(messages, reqModel)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for chunk := range ch {
+		if chunk.Done {
+			break
+		}
+		sb.WriteString(chunk.Content)
+		if e.wsHub != nil {
+			e.wsHub.Broadcast(Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
+		}
+	}
+	return sb.String(), nil
 }
 
 func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
@@ -865,9 +1082,10 @@ func upstreamText(upstream map[string]interface{}) string {
 }
 
 // execLoopNode 循环节点：迭代执行内层工作流
-//   mode=count  固定次数（iterations），每轮以上一轮输出为输入（链式精炼）
-//   mode=foreach 遍历 items（或按 separator 切分上游文本），逐项输入
-//   mode=until  至少跑一轮，直到 stop_condition 命中后停止
+//
+//	mode=count  固定次数（iterations），每轮以上一轮输出为输入（链式精炼）
+//	mode=foreach 遍历 items（或按 separator 切分上游文本），逐项输入
+//	mode=until  至少跑一轮，直到 stop_condition 命中后停止
 //
 // 安全阀：max_iterations（默认 20，硬上限 100）
 func (e *EngineV2) execLoopNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {

@@ -118,6 +118,7 @@ func main() {
 		kbHandler := handler.NewKBHandler(ragService)
 		api.POST("/kb/documents", kbHandler.AddDocument)
 		api.POST("/kb/import", kbHandler.ImportFile)
+		api.POST("/kb/import-dir", kbHandler.ImportDir)
 		api.GET("/kb/documents", kbHandler.ListDocuments)
 		api.DELETE("/kb/documents/:id", kbHandler.DeleteDocument)
 		api.POST("/kb/query", kbHandler.Query)
