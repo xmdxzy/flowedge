@@ -50,8 +50,17 @@ type streamChatResponse struct {
 
 // ChatStream 流式聊天，通过 channel 逐块返回
 func (s *LLMStreamService) ChatStream(prompt string) (<-chan StreamChunk, error) {
+	return s.ChatStreamWithModel(prompt, "")
+}
+
+// ChatStreamWithModel 流式聊天（model 为空回落服务级默认）
+func (s *LLMStreamService) ChatStreamWithModel(prompt, model string) (<-chan StreamChunk, error) {
+	if model == "" {
+		model = s.Model
+	}
+
 	reqBody := streamChatRequest{
-		Model: s.Model,
+		Model: model,
 		Messages: []chatMessage{
 			{Role: "user", Content: prompt},
 		},

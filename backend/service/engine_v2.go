@@ -17,6 +17,7 @@ const maxSubWorkflowDepth = 4
 // EngineV2 增强版工作流引擎
 type EngineV2 struct {
 	llm             *LLMService
+	llmStream       *LLMStreamService
 	t2i             *Text2ImageService
 	asr             *ASRService
 	tts             *TTSService
@@ -27,6 +28,11 @@ type EngineV2 struct {
 	wsHub           *WSHub
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
 	depth           atomic.Int32                       // 当前嵌套深度
+}
+
+// SetLLMStream 注入流式 LLM 服务（nil 则 LLM 节点走非流式）
+func (e *EngineV2) SetLLMStream(s *LLMStreamService) {
+	e.llmStream = s
 }
 
 // SetResolver 注入子工作流解析器（由 main 用 DB 实现）
@@ -432,6 +438,25 @@ func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]int
 		}
 		_ = e.gpuSched.AcquireModel(schedName)
 		defer e.gpuSched.ReleaseModel(schedName)
+	}
+
+	// 流式优先：token 经 WS 实时推送前端（打字机效果）
+	if e.llmStream != nil {
+		ch, err := e.llmStream.ChatStreamWithModel(prompt, reqModel)
+		if err != nil {
+			return nil, err
+		}
+		var sb strings.Builder
+		for chunk := range ch {
+			if chunk.Done {
+				break
+			}
+			sb.WriteString(chunk.Content)
+			if e.wsHub != nil {
+				e.wsHub.Broadcast(Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
+			}
+		}
+		return map[string]interface{}{"text": sb.String()}, nil
 	}
 
 	result, err := e.llm.ChatWithModel(prompt, reqModel)

@@ -99,6 +99,10 @@ function FlowEditor() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId?: string } | null>(null)
   const [isDebugMode, setIsDebugMode] = useState(false)
   const [pausedNodeId, setPausedNodeId] = useState<string | null>(null)
+  const [lastRunId, setLastRunId] = useState<number | null>(null)
+  const [canResume, setCanResume] = useState(false)
+  const streamBufRef = useRef<Map<string, string>>(new Map())
+  const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
 
   // 加载已保存的工作流列表
@@ -206,10 +210,11 @@ function FlowEditor() {
   // WebSocket 实时事件处理
   const handleWSEvent = (event: WSEvent) => {
     if (event.type === 'node_started' && event.node_id) {
+      streamBufRef.current.set(event.node_id, '')
       setNodes((nds) =>
         nds.map((n) =>
           n.id === event.node_id
-            ? { ...n, data: { ...n.data, status: 'running' } }
+            ? { ...n, data: { ...n.data, status: 'running', streamText: '' } }
             : n,
         ),
       )
@@ -252,6 +257,23 @@ function FlowEditor() {
             : e,
         ),
       )
+    } else if (event.type === 'node_token' && event.node_id) {
+      // LLM 流式打字机：缓冲 120ms 批量刷入节点，避免逐 token 重渲染
+      const prev = streamBufRef.current.get(event.node_id) || ''
+      streamBufRef.current.set(event.node_id, prev + ((event.data?.delta as string) || ''))
+      if (streamFlushTimer.current == null) {
+        streamFlushTimer.current = window.setTimeout(() => {
+          streamFlushTimer.current = null
+          const buf = new Map(streamBufRef.current)
+          setNodes((nds) =>
+            nds.map((n) =>
+              buf.has(n.id)
+                ? { ...n, data: { ...n.data, streamText: buf.get(n.id) } }
+                : n,
+            ),
+          )
+        }, 120)
+      }
     }
   }
 
@@ -409,6 +431,7 @@ function FlowEditor() {
         method: 'POST',
       })
       const runData = await runResp.json()
+      setLastRunId(runData.run_id)
 
       const pollInterval = setInterval(async () => {
         const statusResp = await fetch(`/api/runs/${runData.run_id}`)
@@ -420,6 +443,7 @@ function FlowEditor() {
 
           if (statusData.status === 'success') {
             setRunResult('执行成功')
+            setCanResume(false)
             setNodes((nds) =>
               nds.map((n) => ({
                 ...n,
@@ -428,12 +452,48 @@ function FlowEditor() {
             )
           } else {
             setRunResult(`执行失败: ${statusData.error}`)
+            setCanResume(true)
             setNodes((nds) =>
               nds.map((n) => ({
                 ...n,
-                data: { ...n.data, status: 'failed' },
+                data: { ...n.data, status: n.data.status === 'failed' ? 'failed' : n.data.status },
               })),
             )
+          }
+        }
+      }, 1000)
+    } catch (err) {
+      setIsRunning(false)
+      setRunResult(`错误: ${err}`)
+    }
+  }
+
+  // 断点续跑：复用已完成节点输出，只重跑失败部分
+  const resumeWorkflow = async () => {
+    if (!lastRunId) return
+    setIsRunning(true)
+    setRunResult('断点续跑中...')
+
+    try {
+      await fetch(`/api/runs/${lastRunId}/resume`, { method: 'POST' })
+
+      const pollInterval = setInterval(async () => {
+        const statusResp = await fetch(`/api/runs/${lastRunId}`)
+        const statusData = await statusResp.json()
+
+        if (statusData.status === 'success' || statusData.status === 'failed') {
+          clearInterval(pollInterval)
+          setIsRunning(false)
+
+          if (statusData.status === 'success') {
+            setRunResult('续跑成功')
+            setCanResume(false)
+            setNodes((nds) =>
+              nds.map((n) => ({ ...n, data: { ...n.data, status: 'success' } })),
+            )
+          } else {
+            setRunResult(`续跑失败: ${statusData.error}`)
+            setCanResume(true)
           }
         }
       }, 1000)
@@ -685,6 +745,16 @@ function FlowEditor() {
               onStep={() => setPausedNodeId(null)}
               onStop={() => { setIsDebugMode(false); setPausedNodeId(null) }}
             />
+
+            {canResume && !isRunning && (
+              <button
+                onClick={resumeWorkflow}
+                className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+                title="复用已完成节点的输出，只重跑失败部分"
+              >
+                ⟲ 断点续跑
+              </button>
+            )}
 
             <button
               onClick={runWorkflow}

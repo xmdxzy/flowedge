@@ -3,6 +3,9 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,4 +358,79 @@ func TestEngine_SubWorkflow(t *testing.T) {
 		}
 	}
 	t.Fatalf("outer end node did not succeed")
+}
+
+// 测试 LLM 流式：token 经 WS 广播、model 覆盖传导、最终输出完整
+func TestEngine_LLMStreaming(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotModel = req.Model
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n")
+		f.Flush()
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"世界\"}}]}\n\n")
+		f.Flush()
+		fmt.Fprint(w, "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n")
+		f.Flush()
+	}))
+	defer srv.Close()
+
+	hub := NewWSHub()
+	events := hub.Subscribe()
+	e := &EngineV2{
+		llmStream: NewLLMStreamService(srv.URL, "default-model"),
+		wsHub:     hub,
+	}
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "输入"}},
+		{"id": "l1", "type": "llm", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"model": "node-model"}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "l1"},
+		{"id": "b", "source": "l1", "target": "e1"},
+	})
+
+	states, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("streaming execute failed: %v", err)
+	}
+
+	var tokenText strings.Builder
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == "node_token" {
+				if d, ok := ev.Data["delta"].(string); ok {
+					tokenText.WriteString(d)
+				}
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+	if tokenText.String() != "你好世界" {
+		t.Errorf("token deltas = %q, want %q", tokenText.String(), "你好世界")
+	}
+	if gotModel != "node-model" {
+		t.Errorf("stream request model = %q, want node-model", gotModel)
+	}
+	for _, n := range states {
+		if n.ID == "l1" {
+			if m, ok := n.Output.(map[string]interface{}); ok {
+				if m["text"] != "你好世界" {
+					t.Errorf("final text = %v, want 你好世界", m["text"])
+				}
+			} else {
+				t.Fatalf("llm output missing: %v", n.Output)
+			}
+		}
+	}
 }

@@ -37,6 +37,7 @@ func main() {
 
 	// 初始化服务
 	llmService := service.NewLLMService(cfg.OllamaBaseURL, cfg.OllamaModel)
+	llmStreamService := service.NewLLMStreamService(cfg.OllamaBaseURL, cfg.OllamaModel)
 
 	// 多模态服务
 	comfyURL := getEnv("COMFYUI_BASE_URL", "http://localhost:8188")
@@ -70,6 +71,9 @@ func main() {
 		}
 		return []byte(wf.Nodes), []byte(wf.Edges), nil
 	})
+
+	// 流式 LLM（token 经 WS 推送前端打字机效果）
+	engine.SetLLMStream(llmStreamService)
 
 	// GPU 真实遥测轮询（缓存 nvidia-smi 结果，避免每请求拉子进程）
 	gpuSched.StartTelemetry(5 * time.Second)

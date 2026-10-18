@@ -31,6 +31,14 @@ function LLMNode({ data, selected }: NodeProps) {
         <p className="text-sm text-white truncate max-w-[180px]">
           {(data.prompt as string) || '使用上游输入'}
         </p>
+        {(data.streamText as string) && (
+          <div className="mt-2 max-h-24 overflow-y-auto rounded-md bg-black/40 border border-accent/20 px-2 py-1.5">
+            <p className="text-[11px] text-cyan-300 font-mono whitespace-pre-wrap leading-snug">
+              {data.streamText as string}
+              <span className="animate-pulse text-accent">▊</span>
+            </p>
+          </div>
+        )}
       </div>
 
       {/* 输入锚点 */}

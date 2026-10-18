@@ -52,7 +52,9 @@ func (h *WSHub) Broadcast(event Event) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	log.Printf("[Event] %s: %s", event.Type, event.NodeID)
+	if event.Type != "node_token" { // token 事件高频，不刷日志
+		log.Printf("[Event] %s: %s", event.Type, event.NodeID)
+	}
 
 	for _, ch := range h.subscribers {
 		select {
