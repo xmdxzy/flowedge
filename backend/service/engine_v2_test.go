@@ -1070,3 +1070,84 @@ func TestEngine_VariablesAcrossBranches(t *testing.T) {
 	}
 	t.Fatal("merge node state missing")
 }
+
+// 节点缓存：相同配置 + 输入的第二次执行不应再打外部请求
+func TestEngine_NodeCache(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		fmt.Fprint(w, "cached-body")
+	}))
+	defer srv.Close()
+
+	e := newTestEngine()
+	e.http = NewHTTPService()
+	cache := NewNodeCache(10)
+	e.SetCache(cache)
+
+	nodes := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
+		{"id": "h1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"method": "GET", "url": srv.URL, "cache": true}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	edges := marshalEdges(t, []map[string]interface{}{
+		{"id": "a", "source": "s1", "target": "h1"},
+		{"id": "b", "source": "h1", "target": "e1"},
+	})
+
+	states1, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("external calls after first run = %d, want 1", calls)
+	}
+
+	states2, err := e.Execute(nodes, edges)
+	if err != nil {
+		t.Fatalf("second run failed: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("cache miss: external calls = %d after second run, want 1", calls)
+	}
+
+	// 两次输出必须一致，说明命中后复用的是同一结果
+	var out1, out2 interface{}
+	for _, n := range states1 {
+		if n.ID == "h1" {
+			out1 = n.Output
+		}
+	}
+	for _, n := range states2 {
+		if n.ID == "h1" {
+			out2 = n.Output
+		}
+	}
+	if fmt.Sprintf("%v", out1) != fmt.Sprintf("%v", out2) {
+		t.Errorf("cached output differs: %v vs %v", out1, out2)
+	}
+
+	stats := cache.Stats()
+	if stats["hits"].(int) != 1 {
+		t.Errorf("cache hits = %v, want 1", stats["hits"])
+	}
+
+	// 没声明 cache 的节点不应被缓存
+	e2 := newTestEngine()
+	e2.http = NewHTTPService()
+	e2.SetCache(NewNodeCache(10))
+	before := calls
+	nodesNoCache := marshalNodes(t, []map[string]interface{}{
+		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
+		{"id": "h1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"method": "GET", "url": srv.URL}},
+		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := e2.Execute(nodesNoCache, edges); err != nil {
+			t.Fatalf("no-cache run %d failed: %v", i+1, err)
+		}
+	}
+	if calls-before != 2 {
+		t.Errorf("node without cache flag made %d calls, want 2", calls-before)
+	}
+}

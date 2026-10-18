@@ -37,6 +37,7 @@ type EngineV2 struct {
 	gpuSched        *GPUScheduler
 	wsHub           *WSHub
 	tools           *ToolExecutor
+	cache           *NodeCache
 	runMu           sync.Mutex
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
@@ -52,6 +53,9 @@ func (e *EngineV2) SetLLMStream(s *LLMStreamService) {
 func (e *EngineV2) SetResolver(fn func(uint) ([]byte, []byte, error)) {
 	e.resolveWorkflow = fn
 }
+
+// SetCache 注入节点缓存（nil 表示不启用）
+func (e *EngineV2) SetCache(c *NodeCache) { e.cache = c }
 
 func NewEngineV2(
 	llm *LLMService,
@@ -367,6 +371,33 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					retryDelay = time.Duration(d) * time.Millisecond
 				}
 
+				// 节点缓存：命中则跳过执行（省 GPU / 网络）
+				cacheKeyStr := ""
+				if e.cache != nil && cacheableNode(execNode.Type, execNode.Data) {
+					cacheKeyStr = cacheKey(execNode.Type, execNode.Data, upstream)
+					if cached, ok := e.cache.Get(cacheKeyStr); ok {
+						mu.Lock()
+						endCached := time.Now()
+						node.EndedAt = &endCached
+						node.Status = "success"
+						node.Output = cached
+						runCtx[nid] = cached
+						branchCached := ""
+						if node.Type == "if_else" {
+							if b, ok := cached.(map[string]interface{}); ok {
+								branchCached, _ = b["branch"].(string)
+							}
+						}
+						propagate(nid, cached, branchCached)
+						mu.Unlock()
+						if e.wsHub != nil {
+							e.wsHub.Broadcast(Event{Type: "node_finished", NodeID: nid,
+								Data: map[string]interface{}{"output": cached, "cache_hit": true}})
+						}
+						return
+					}
+				}
+
 				var out interface{}
 				var execErr error
 				for attempt := 0; attempt <= retryCount; attempt++ {
@@ -428,6 +459,9 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				node.Status = "success"
 				node.Output = out
 				runCtx[nid] = out // 供下游节点以 {{nid.field}} 引用
+				if e.cache != nil && cacheKeyStr != "" {
+					e.cache.Put(cacheKeyStr, out)
+				}
 				mu.Unlock()
 				if e.wsHub != nil {
 					e.wsHub.Broadcast(Event{Type: "node_finished", NodeID: nid, Data: map[string]interface{}{"output": out}})

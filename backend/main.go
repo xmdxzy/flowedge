@@ -109,6 +109,10 @@ func main() {
 		return []byte(wf.Nodes), []byte(wf.Edges), nil
 	})
 
+	// 节点级缓存（节点声明 cache: true 时生效）
+	nodeCache := service.NewNodeCache(200)
+	engine.SetCache(nodeCache)
+
 	// 流式 LLM（token 经 WS 推送前端打字机效果）
 	engine.SetLLMStream(llmStreamService)
 
