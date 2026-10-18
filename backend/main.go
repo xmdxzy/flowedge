@@ -41,7 +41,7 @@ func main() {
 	asrURL := getEnv("ASR_BASE_URL", "")
 	ttsURL := getEnv("TTS_BASE_URL", "")
 
-	t2iService := service.NewText2ImageService(comfyURL)
+	t2iService := service.NewText2ImageService(comfyURL, getEnv("COMFYUI_CHECKPOINT", "flux1-schnell-fp8.safetensors"))
 	asrService := service.NewASRService(asrURL)
 	ttsService := service.NewTTSService(ttsURL)
 	videoService := service.NewVideoService()

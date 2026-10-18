@@ -42,8 +42,17 @@ type chatResponse struct {
 }
 
 func (s *LLMService) Chat(prompt string) (string, error) {
+	return s.ChatWithModel(prompt, "")
+}
+
+// ChatWithModel 执行一次补全；model 为空时回落到服务级默认模型
+func (s *LLMService) ChatWithModel(prompt, model string) (string, error) {
+	if model == "" {
+		model = s.Model
+	}
+
 	reqBody := chatRequest{
-		Model: s.Model,
+		Model: model,
 		Messages: []chatMessage{
 			{Role: "user", Content: prompt},
 		},

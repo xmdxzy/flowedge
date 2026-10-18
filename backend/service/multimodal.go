@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,76 +15,208 @@ import (
 
 // Text2ImageService 文生图服务（ComfyUI 兼容）
 type Text2ImageService struct {
-	BaseURL string
-	client  *http.Client
+	BaseURL    string
+	Checkpoint string
+	client     *http.Client
 }
 
-func NewText2ImageService(baseURL string) *Text2ImageService {
+func NewText2ImageService(baseURL, checkpoint string) *Text2ImageService {
+	if checkpoint == "" {
+		checkpoint = "flux1-schnell-fp8.safetensors"
+	}
 	return &Text2ImageService{
-		BaseURL: baseURL,
+		BaseURL:    baseURL,
+		Checkpoint: checkpoint,
 		client: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 300 * time.Second,
 		},
 	}
 }
 
-// GenerateImage 生成图片
+// GenerateImage 生成图片：POST /prompt → 轮询 /history → GET /view 下载落盘，返回本地文件路径
 func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (string, error) {
 	if s.BaseURL == "" {
 		return "", fmt.Errorf("comfyui not configured")
 	}
+	if width <= 0 {
+		width = 1024
+	}
+	if height <= 0 {
+		height = 1024
+	}
 
-	// ComfyUI API 格式
+	link := func(id string, slot int) []interface{} { return []interface{}{id, slot} }
+
+	// flux1-schnell fp8 checkpoint 标准 txt2img API 图（4 步 / cfg 1.0 / euler+simple）
 	workflow := map[string]interface{}{
-		"3": map[string]interface{}{
-			"class_type": "KSampler",
-			"inputs": map[string]interface{}{
-				"seed":     123456789,
-				"steps":    20,
-				"cfg":      7.5,
-				"sampler_name": "euler",
-				"scheduler": "normal",
-				"denoise":  1.0,
-			},
-		},
 		"4": map[string]interface{}{
 			"class_type": "CheckpointLoaderSimple",
 			"inputs": map[string]interface{}{
-				"ckpt_name": "sd_xl_base_1.0.safetensors",
-			},
-		},
-		"5": map[string]interface{}{
-			"class_type": "EmptyLatentImage",
-			"inputs": map[string]interface{}{
-				"width":  width,
-				"height": height,
-				"batch_size": 1,
+				"ckpt_name": s.Checkpoint,
 			},
 		},
 		"6": map[string]interface{}{
 			"class_type": "CLIPTextEncode",
 			"inputs": map[string]interface{}{
 				"text": prompt,
+				"clip": link("4", 1),
+			},
+		},
+		"33": map[string]interface{}{
+			"class_type": "CLIPTextEncode",
+			"inputs": map[string]interface{}{
+				"text": "",
+				"clip": link("4", 1),
+			},
+		},
+		"5": map[string]interface{}{
+			"class_type": "EmptyLatentImage",
+			"inputs": map[string]interface{}{
+				"width":      width,
+				"height":     height,
+				"batch_size": 1,
+			},
+		},
+		"3": map[string]interface{}{
+			"class_type": "KSampler",
+			"inputs": map[string]interface{}{
+				"seed":         time.Now().UnixNano(),
+				"steps":        4,
+				"cfg":          1.0,
+				"sampler_name": "euler",
+				"scheduler":    "simple",
+				"denoise":      1.0,
+				"model":        link("4", 0),
+				"positive":     link("6", 0),
+				"negative":     link("33", 0),
+				"latent_image": link("5", 0),
+			},
+		},
+		"8": map[string]interface{}{
+			"class_type": "VAEDecode",
+			"inputs": map[string]interface{}{
+				"samples": link("3", 0),
+				"vae":     link("4", 2),
+			},
+		},
+		"9": map[string]interface{}{
+			"class_type": "SaveImage",
+			"inputs": map[string]interface{}{
+				"images":          link("8", 0),
+				"filename_prefix": "flowedge",
 			},
 		},
 	}
 
-	jsonBody, _ := json.Marshal(workflow)
+	// ComfyUI /prompt 协议要求 {"prompt": <graph>} 包裹
+	payload := map[string]interface{}{"prompt": workflow}
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal workflow failed: %w", err)
+	}
+
 	resp, err := s.client.Post(s.BaseURL+"/prompt", "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("comfyui request failed: %w", err)
 	}
-	defer resp.Body.Close()
-
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("comfyui returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("comfyui rejected prompt (status %d): %.300s", resp.StatusCode, string(respBody))
 	}
 
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	var queued struct {
+		PromptID string `json:"prompt_id"`
+	}
+	if err := json.Unmarshal(respBody, &queued); err != nil || queued.PromptID == "" {
+		return "", fmt.Errorf("comfyui returned no prompt_id: %.300s", string(respBody))
+	}
 
-	promptID, _ := result["prompt_id"].(string)
-	return fmt.Sprintf("generated://%s", promptID), nil
+	// 轮询执行结果（首次运行含模型冷加载，给足 7 分钟）
+	deadline := time.Now().Add(7 * time.Minute)
+	for time.Now().Before(deadline) {
+		time.Sleep(1500 * time.Millisecond)
+
+		hresp, err := s.client.Get(s.BaseURL + "/history/" + queued.PromptID)
+		if err != nil {
+			continue
+		}
+		hbody, _ := io.ReadAll(hresp.Body)
+		hresp.Body.Close()
+		if hresp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		var hist map[string]comfyHistoryEntry
+		if json.Unmarshal(hbody, &hist) != nil {
+			continue
+		}
+		entry, ok := hist[queued.PromptID]
+		if !ok {
+			continue // 尚未开始执行
+		}
+		if entry.Status.StatusStr == "error" {
+			return "", fmt.Errorf("comfyui generation failed (prompt_id=%s)", queued.PromptID)
+		}
+
+		var imgFile, imgSub, imgType string
+		for _, out := range entry.Outputs {
+			for _, im := range out.Images {
+				imgFile, imgSub, imgType = im.Filename, im.Subfolder, im.Type
+				break
+			}
+			if imgFile != "" {
+				break
+			}
+		}
+		if imgFile == "" {
+			continue // 仍在生成
+		}
+
+		viewURL := fmt.Sprintf("%s/view?filename=%s&subfolder=%s&type=%s",
+			s.BaseURL, url.QueryEscape(imgFile), url.QueryEscape(imgSub), url.QueryEscape(imgType))
+		dresp, err := s.client.Get(viewURL)
+		if err != nil {
+			return "", fmt.Errorf("comfyui download failed: %w", err)
+		}
+		data, err := io.ReadAll(dresp.Body)
+		dresp.Body.Close()
+		if err != nil {
+			return "", err
+		}
+		if dresp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("comfyui /view returned status %d", dresp.StatusCode)
+		}
+
+		dir := "data/generated"
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", err
+		}
+		outPath := filepath.Join(dir, fmt.Sprintf("flowedge-%d-%s", time.Now().Unix(), imgFile))
+		if err := os.WriteFile(outPath, data, 0644); err != nil {
+			return "", err
+		}
+		if abs, err := filepath.Abs(outPath); err == nil {
+			return abs, nil
+		}
+		return outPath, nil
+	}
+
+	return "", fmt.Errorf("comfyui generation timed out after 7m (prompt_id=%s)", queued.PromptID)
+}
+
+// comfyHistoryEntry ComfyUI /history 返回条目
+type comfyHistoryEntry struct {
+	Status struct {
+		StatusStr string `json:"status_str"`
+	} `json:"status"`
+	Outputs map[string]struct {
+		Images []struct {
+			Filename  string `json:"filename"`
+			Subfolder string `json:"subfolder"`
+			Type      string `json:"type"`
+		} `json:"images"`
+	} `json:"outputs"`
 }
 
 // ASRService 语音转写服务

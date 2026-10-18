@@ -321,17 +321,20 @@ func (e *EngineV2) execLLMNode(node *model.NodeInstance, upstream map[string]int
 		return nil, fmt.Errorf("LLM node has no input prompt")
 	}
 
+	// 节点级模型覆盖（空 = 使用服务级默认模型）
+	reqModel, _ := node.Data["model"].(string)
+
 	// 显存调度：请求加载 LLM
 	if e.gpuSched != nil {
-		modelName, _ := node.Data["model"].(string)
-		if modelName == "" {
-			modelName = "qwen2.5:7b"
+		schedName := reqModel
+		if schedName == "" {
+			schedName = "qwen2.5:7b"
 		}
-		_ = e.gpuSched.AcquireModel(modelName)
-		defer e.gpuSched.ReleaseModel(modelName)
+		_ = e.gpuSched.AcquireModel(schedName)
+		defer e.gpuSched.ReleaseModel(schedName)
 	}
 
-	result, err := e.llm.Chat(prompt)
+	result, err := e.llm.ChatWithModel(prompt, reqModel)
 	if err != nil {
 		return nil, err
 	}
