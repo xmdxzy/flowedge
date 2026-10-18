@@ -1,0 +1,12 @@
+{
+  "name": "flowedge-desktop",
+  "version": "1.0.0",
+  "description": "FlowEdge 私有化多模态工作流引擎 - 桌面客户端",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

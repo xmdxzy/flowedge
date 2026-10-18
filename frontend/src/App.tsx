@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ReactFlow,
+  ReactFlowProvider,
   Background,
   Controls,
   MiniMap,
@@ -76,7 +77,16 @@ const initialEdges: Edge[] = [
   { id: 'e2-3', source: 'llm-1', target: 'end-1' },
 ]
 
+// ReactFlowProvider 包裹：useReactFlow 需要 Provider 祖先
 export default function App() {
+  return (
+    <ReactFlowProvider>
+      <FlowEditor />
+    </ReactFlowProvider>
+  )
+}
+
+function FlowEditor() {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges)
   const [selectedNode, setSelectedNode] = useState<Node | null>(null)
@@ -463,12 +473,12 @@ export default function App() {
       <div className="w-56 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
         <h3 className="text-sm font-semibold text-gray-300 mb-2">节点库</h3>
 
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">控制（拖拽到画布）</div>
+        <div className="fe-section-label mb-1">控制（拖拽到画布）</div>
         <div
           draggable
           onDragStart={(e) => onDragStart(e, 'start')}
           onClick={() => addNode('start')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-control transition-all text-left cursor-grab active:cursor-grabbing"
+          className="fe-palette-item flex items-center gap-2 px-3 py-2 text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-control" />
           <span className="text-sm">开始</span>
@@ -477,7 +487,7 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'end')}
           onClick={() => addNode('end')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-output transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-output transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-output" />
           <span className="text-sm">结束</span>
@@ -486,18 +496,18 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'if_else')}
           onClick={() => addNode('if_else')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-warning" />
           <span className="text-sm">条件分支</span>
         </div>
 
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mt-3 mb-1">AI 推理</div>
+        <div className="fe-section-label mt-3 mb-1">AI 推理</div>
         <div
           draggable
           onDragStart={(e) => onDragStart(e, 'llm')}
           onClick={() => addNode('llm')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-ai transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-ai transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-ai" />
           <span className="text-sm">大语言模型</span>
@@ -506,7 +516,7 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'text2image')}
           onClick={() => addNode('text2image')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-data transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-data transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-data" />
           <span className="text-sm">文生图</span>
@@ -515,18 +525,18 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'rag_query')}
           onClick={() => addNode('rag_query')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-indigo-500 transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-indigo-500 transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-indigo-500" />
           <span className="text-sm">知识库检索</span>
         </div>
 
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mt-3 mb-1">多模态</div>
+        <div className="fe-section-label mt-3 mb-1">多模态</div>
         <div
           draggable
           onDragStart={(e) => onDragStart(e, 'asr')}
           onClick={() => addNode('asr')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-warning transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-warning" />
           <span className="text-sm">语音转写</span>
@@ -535,7 +545,7 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'tts')}
           onClick={() => addNode('tts')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-success transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-success transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-success" />
           <span className="text-sm">语音合成</span>
@@ -544,7 +554,7 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'video_compose')}
           onClick={() => addNode('video_compose')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-purple" />
           <span className="text-sm">视频合成</span>
@@ -553,18 +563,18 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'sub_workflow')}
           onClick={() => addNode('sub_workflow')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-purple transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-purple" />
           <span className="text-sm">子工作流</span>
         </div>
 
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mt-3 mb-1">数据处理</div>
+        <div className="fe-section-label mt-3 mb-1">数据处理</div>
         <div
           draggable
           onDragStart={(e) => onDragStart(e, 'http_request')}
           onClick={() => addNode('http_request')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-cyan-500 transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-cyan-500 transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-cyan-500" />
           <span className="text-sm">HTTP 请求</span>
@@ -573,19 +583,19 @@ export default function App() {
           draggable
           onDragStart={(e) => onDragStart(e, 'data_transform')}
           onClick={() => addNode('data_transform')}
-          className="flex items-center gap-2 px-3 py-2 rounded-lg bg-canvas border border-border hover:border-gray-500 transition-all text-left cursor-grab active:cursor-grabbing"
+          className="flex items-center gap-2 px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-gray-500 transition-all text-left cursor-grab active:cursor-grabbing"
         >
           <div className="w-3 h-3 rounded-full bg-gray-500" />
           <span className="text-sm">数据转换</span>
         </div>
 
         {/* 模板库 */}
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mt-3 mb-1">模板</div>
+        <div className="fe-section-label mt-3 mb-1">模板</div>
         {workflowTemplates.map((tpl) => (
           <button
             key={tpl.id}
             onClick={() => loadTemplate(tpl)}
-            className="w-full text-left px-3 py-2 rounded-lg bg-canvas border border-border hover:border-primary transition-all mb-1"
+            className="w-full text-left px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-primary transition-all mb-1"
           >
             <p className="text-xs font-medium text-white">{tpl.name}</p>
             <p className="text-[10px] text-gray-500 truncate">{tpl.description}</p>
@@ -593,7 +603,7 @@ export default function App() {
         ))}
 
         {/* 已保存工作流 */}
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mt-3 mb-1">已保存</div>
+        <div className="fe-section-label mt-3 mb-1">已保存</div>
         {savedWorkflows.length === 0 ? (
           <p className="text-[10px] text-gray-600 px-1">暂无保存的工作流</p>
         ) : (
@@ -613,7 +623,7 @@ export default function App() {
         <div className="mt-auto pt-4 border-t border-border">
           <button
             onClick={refreshGpuStatus}
-            className="w-full px-3 py-2 rounded-lg bg-canvas border border-border hover:border-primary text-xs"
+            className="w-full px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-primary text-xs"
           >
             刷新 GPU 状态
           </button>
@@ -629,17 +639,24 @@ export default function App() {
       {/* 中间画布区域 */}
       <div className="flex-1 flex flex-col">
         {/* 顶部工具栏 */}
-        <div className="h-14 border-b border-border bg-surface flex items-center px-4 gap-4">
-          <h1 className="text-base font-bold">FlowEdge</h1>
+        <div className="fe-topbar h-14 flex items-center px-4 gap-4">
+          <div className="flex items-center gap-2.5">
+            <div className="fe-logo-mark">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M9 1L3 9h4l-1 6 6-8H8l1-6z" fill="white" />
+              </svg>
+            </div>
+            <h1 className="fe-title text-lg font-bold">FlowEdge</h1>
+          </div>
 
           <input
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
-            className="px-3 py-1.5 rounded-lg bg-canvas border border-border text-sm w-48 focus:border-primary outline-none"
+            className="px-3 py-1.5 rounded-lg bg-[#0D111B] border border-border text-sm w-48 focus:border-primary outline-none"
             placeholder="工作流名称"
           />
 
-          <div className="flex items-center gap-1 ml-2">
+          <div className="flex items-center gap-1.5">
             <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-success' : 'bg-gray-500'}`} />
             <span className="text-[10px] text-gray-500">{wsConnected ? '实时' : '离线'}</span>
           </div>
@@ -648,25 +665,14 @@ export default function App() {
             {runResult && (
               <span className="text-xs text-gray-400">{runResult}</span>
             )}
-            <button
-              onClick={exportWorkflow}
-              className="px-3 py-1.5 rounded-lg bg-surface-hover hover:bg-border text-sm transition-all"
-            >
+            <button onClick={exportWorkflow} className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm">
               导出
             </button>
-            <label className="px-3 py-1.5 rounded-lg bg-surface-hover hover:bg-border text-sm transition-all cursor-pointer">
+            <label className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm cursor-pointer">
               导入
-              <input
-                type="file"
-                accept=".json"
-                onChange={importWorkflow}
-                className="hidden"
-              />
+              <input type="file" accept=".json" onChange={importWorkflow} className="hidden" />
             </label>
-            <button
-              onClick={saveWorkflow}
-              className="px-3 py-1.5 rounded-lg bg-surface-hover hover:bg-border text-sm transition-all"
-            >
+            <button onClick={saveWorkflow} className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm">
               保存
             </button>
 
@@ -683,9 +689,9 @@ export default function App() {
             <button
               onClick={runWorkflow}
               disabled={isRunning}
-              className="px-4 py-1.5 rounded-lg bg-primary hover:bg-primary/80 disabled:opacity-50 text-sm font-medium transition-all"
+              className="fe-btn-primary px-5 py-1.5 rounded-lg text-sm font-medium"
             >
-              {isRunning ? '执行中...' : '运行工作流'}
+              {isRunning ? '执行中...' : '▶ 运行工作流'}
             </button>
           </div>
         </div>
@@ -706,16 +712,18 @@ export default function App() {
               onDrop={onDrop}
               onDragOver={onDragOver}
               nodeTypes={nodeTypes}
+              defaultEdgeOptions={{ type: 'smoothstep' }}
               fitView
               className="bg-canvas"
             >
-              <Background color="#2E3340" gap={20} size={1} />
+              <Background color="#1C2436" gap={22} size={1.2} />
               <Controls />
               <MiniMap
                 pannable
                 zoomable
-                bgColor="#1A1D24"
-                nodeColor="#3B82F6"
+                bgColor="#0D111B"
+                nodeColor="#6366F1"
+                maskColor="rgba(10, 13, 20, 0.75)"
               />
             </ReactFlow>
           </div>
@@ -914,7 +922,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'tts':
       return { text: '' }
     case 'video_compose':
-      return { output_path: '/tmp/output.mp4' }
+      return { output_path: 'data/generated/video.mp4' }
     case 'if_else':
       return { condition_type: 'not_empty', compare_value: '' }
     case 'sub_workflow':

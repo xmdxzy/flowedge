@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -104,6 +105,20 @@ func main() {
 
 		// WebSocket 实时推送
 		api.GET("/ws", wsHandler.HandleWS)
+	}
+
+	// SPA 静态资源（桌面客户端 / Docker 部署共用同一后端入口）
+	distDir := getEnv("STATIC_DIR", "../frontend/dist")
+	if _, err := os.Stat(filepath.Join(distDir, "index.html")); err == nil {
+		r.Static("/assets", filepath.Join(distDir, "assets"))
+		r.NoRoute(func(c *gin.Context) {
+			if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+				c.JSON(404, gin.H{"error": "not found"})
+				return
+			}
+			c.File(filepath.Join(distDir, "index.html"))
+		})
+		log.Printf("Serving frontend from %s", distDir)
 	}
 
 	log.Printf("FlowEdge backend running on :%s", cfg.Port)

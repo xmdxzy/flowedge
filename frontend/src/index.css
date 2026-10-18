@@ -8,138 +8,245 @@
   box-sizing: border-box;
 }
 
+html, body, #root {
+  height: 100%;
+}
+
 body {
-  font-family: 'Inter', system-ui, sans-serif;
-  background: #0F1115;
-  color: #fff;
+  font-family: 'Inter', 'system-ui', 'Microsoft YaHei UI', sans-serif;
+  background: #0A0D14;
+  color: #E7EAF2;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* ===== React Flow 样式覆盖 ===== */
+::selection {
+  background: rgba(99, 102, 241, 0.35);
+}
+
+/* ============ React Flow 画布 ============ */
 .react-flow {
-  background: #0F1115;
+  background:
+    radial-gradient(1200px 600px at 70% -10%, rgba(99, 102, 241, 0.07), transparent 60%),
+    radial-gradient(900px 500px at 10% 110%, rgba(34, 211, 238, 0.05), transparent 55%),
+    #0A0D14;
 }
 
-.react-flow__background {
-  background: #0F1115;
-}
+.react-flow__attribution { display: none; }
 
-.react-flow__handle {
-  width: 8px;
-  height: 8px;
-  background: #3B82F6;
-  border: 2px solid #0F1115;
-  border-radius: 50%;
-  transition: all 0.2s ease;
-}
-
-.react-flow__handle:hover {
-  background: #60A5FA;
-  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.3);
-  transform: scale(1.2);
-}
-
-.react-flow__handle-connecting {
-  background: #F59E0B;
-}
-
-.react-flow__handle-valid {
-  background: #10B981;
-}
-
+/* 连线：冷灰蓝基础 + 流动时青色能量 */
 .react-flow__edge-path {
-  stroke: #3B82F6;
+  stroke: #3A4560;
   stroke-width: 2;
+  stroke-linecap: round;
 }
 
 .react-flow__edge:hover .react-flow__edge-path {
-  stroke: #60A5FA;
+  stroke: #22D3EE;
   stroke-width: 2.5;
+  filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.5));
 }
 
 .react-flow__edge.selected .react-flow__edge-path {
-  stroke: #8B5CF6;
+  stroke: #818CF8;
+  filter: drop-shadow(0 0 6px rgba(99, 102, 241, 0.55));
 }
 
-/* 执行中连线流动画 */
 @keyframes flow-dash {
-  to {
-    stroke-dashoffset: -20;
-  }
+  to { stroke-dashoffset: -22; }
 }
 
 .react-flow__edge.animated .react-flow__edge-path {
-  stroke-dasharray: 5;
-  animation: flow-dash 1s linear infinite;
+  stroke: #22D3EE;
+  stroke-dasharray: 6 8;
+  animation: flow-dash 0.9s linear infinite;
+  filter: drop-shadow(0 0 5px rgba(34, 211, 238, 0.55));
 }
 
+/* 连接锚点 */
+.react-flow__handle {
+  width: 9px;
+  height: 9px;
+  background: #6366F1;
+  border: 2px solid #0A0D14;
+  border-radius: 50%;
+  transition: all 0.18s ease;
+}
+
+.react-flow__handle:hover {
+  background: #22D3EE;
+  box-shadow: 0 0 0 4px rgba(34, 211, 238, 0.25);
+  transform: scale(1.25);
+}
+
+.react-flow__handle-connecting { background: #FBBF24; }
+.react-flow__handle-valid { background: #34D399; }
+
+/* ============ 节点卡片（玻璃拟态） ============ */
+.react-flow__node > div {
+  border-radius: 14px !important;
+  background: linear-gradient(180deg, #161C2D 0%, #10141F 100%) !important;
+  border: 1px solid #263045 !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+  transition: box-shadow 0.2s ease, transform 0.2s ease, border-color 0.2s ease;
+}
+
+.react-flow__node > div:hover {
+  transform: translateY(-2px);
+  border-color: #33405E !important;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+}
+
+.react-flow__node.selected > div {
+  border-color: rgba(99, 102, 241, 0.65) !important;
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.5), 0 0 24px rgba(99, 102, 241, 0.25) !important;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.45), 0 8px 24px rgba(0, 0, 0, 0.35); }
+  50% { box-shadow: 0 0 0 10px rgba(99, 102, 241, 0), 0 8px 24px rgba(0, 0, 0, 0.35); }
+}
+
+.node-running { animation: pulse-glow 1.4s ease-in-out infinite; }
+
+/* ============ 控件 / 小地图（玻璃） ============ */
 .react-flow__controls {
-  background: #1A1D24;
-  border-radius: 8px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-  border: 1px solid #2E3340;
+  background: rgba(16, 20, 31, 0.85);
+  backdrop-filter: blur(12px);
+  border-radius: 10px;
+  border: 1px solid #232B3D;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
   overflow: hidden;
 }
 
 .react-flow__controls button {
   background: transparent;
-  border-bottom: 1px solid #2E3340;
-  color: #9CA3AF;
+  border-bottom: 1px solid rgba(35, 43, 61, 0.7);
+  color: #8A93A8;
   transition: all 0.15s ease;
 }
 
-.react-flow__controls button:hover {
-  background: #242832;
-  color: #fff;
-}
-
-.react-flow__controls button:last-child {
-  border-bottom: none;
-}
+.react-flow__controls button:hover { background: rgba(99, 102, 241, 0.15); color: #fff; }
+.react-flow__controls button:last-child { border-bottom: none; }
 
 .react-flow__minimap {
-  background: #1A1D24;
-  border-radius: 8px;
-  border: 1px solid #2E3340;
+  background: rgba(13, 17, 27, 0.9) !important;
+  border-radius: 10px;
+  border: 1px solid #232B3D;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
   overflow: hidden;
 }
 
-/* ===== 节点状态动画 ===== */
-@keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
-  50% { box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }
+/* ============ 顶栏（玻璃 + 渐变饰线） ============ */
+.fe-topbar {
+  background: rgba(13, 17, 27, 0.85);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid #1D2536;
+  position: relative;
 }
 
-.node-running {
-  animation: pulse-glow 1.5s ease-in-out infinite;
+.fe-topbar::after {
+  content: '';
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(99, 102, 241, 0.55) 30%, rgba(34, 211, 238, 0.55) 70%, transparent 100%);
+  pointer-events: none;
 }
 
-/* ===== 滚动条美化 ===== */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+.fe-logo-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #6366F1 0%, #22D3EE 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.45);
 }
 
-::-webkit-scrollbar-track {
-  background: #1A1D24;
+.fe-title {
+  background: linear-gradient(90deg, #A5B4FC 0%, #67E8F9 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  letter-spacing: 0.02em;
 }
 
-::-webkit-scrollbar-thumb {
-  background: #2E3340;
-  border-radius: 3px;
+/* 主操作按钮 */
+.fe-btn-primary {
+  background: linear-gradient(90deg, #6366F1 0%, #4F7CF7 55%, #22D3EE 130%);
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
+  border: none;
+  color: #fff;
+  transition: all 0.18s ease;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #3B82F6;
+.fe-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.12);
+  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.55);
+  transform: translateY(-1px);
 }
 
-/* ===== 输入框聚焦效果 ===== */
+.fe-btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.fe-btn-ghost {
+  background: rgba(26, 34, 51, 0.6);
+  border: 1px solid #232B3D;
+  color: #B7C0D4;
+  transition: all 0.16s ease;
+}
+
+.fe-btn-ghost:hover {
+  background: rgba(35, 43, 61, 0.8);
+  border-color: #33405E;
+  color: #fff;
+}
+
+/* 侧栏节点库条目 */
+.fe-palette-item {
+  background: rgba(16, 20, 31, 0.7);
+  border: 1px solid #202941;
+  border-radius: 10px;
+  transition: all 0.16s ease;
+}
+
+.fe-palette-item:hover {
+  background: rgba(26, 34, 51, 0.85);
+  border-color: #33405E;
+  transform: translateX(3px);
+}
+
+.fe-palette-item:active { transform: translateX(3px) scale(0.98); }
+
+.fe-section-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #5B657C;
+  font-weight: 600;
+}
+
+/* ============ 表单控件 ============ */
 input:focus, textarea:focus, select:focus {
-  border-color: #3B82F6 !important;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  border-color: #6366F1 !important;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15) !important;
+  outline: none;
 }
 
-/* ===== 选中节点效果 ===== */
-.react-flow__node.selected {
-  filter: drop-shadow(0 0 8px rgba(59, 130, 246, 0.4));
+input, textarea, select {
+  color-scheme: dark;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
 }
+
+/* ============ 滚动条 ============ */
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #263045;
+  border-radius: 4px;
+  border: 2px solid #0A0D14;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #3A4560; background-clip: padding-box; border: 2px solid #0A0D14; }
