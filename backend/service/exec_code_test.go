@@ -1,0 +1,227 @@
+package service
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"flowedge/backend/model"
+)
+
+// TestNodeRegistry_HasAllBuiltins 注册表必须包含全部内置类型
+func TestNodeRegistry_HasAllBuiltins(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	types := eng.NodeTypes()
+	want := []string{
+		"asr", "code", "data_transform", "end", "http_request", "if_else", "llm",
+		"loop", "rag_query", "start", "sub_workflow", "text2image", "tts", "video_compose",
+	}
+	if len(types) != len(want) {
+		t.Fatalf("registered %d types, want %d: %v", len(types), len(want), types)
+	}
+	for i, w := range want {
+		if types[i] != w {
+			t.Fatalf("index %d got %q want %q (list=%v)", i, types[i], w, types)
+		}
+	}
+}
+
+// TestEngine_RegisterNodeType 注册新类型后引擎无需改一行即可执行
+func TestEngine_RegisterNodeType(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	eng.RegisterNodeType("upper_test", func(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+		in := ""
+		for _, out := range upstream {
+			if m, ok := out.(map[string]interface{}); ok {
+				if t, ok := m["text"].(string); ok {
+					in = t
+				}
+			}
+		}
+		return map[string]interface{}{"text": strings.ToUpper(in)}, nil
+	})
+
+	nodesJSON := []byte(`[
+		{"id":"s","type":"start","data":{"prompt":"hi"}},
+		{"id":"u","type":"upper_test","data":{}},
+		{"id":"e","type":"end","data":{}}
+	]`)
+	edgesJSON := []byte(`[
+		{"id":"e1","source":"s","target":"u"},
+		{"id":"e2","source":"u","target":"e"}
+	]`)
+
+	states, err := eng.Execute(nodesJSON, edgesJSON)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	for _, n := range states {
+		if n.ID == "u" {
+			m, _ := n.Output.(map[string]interface{})
+			if m["text"] != "HI" {
+				t.Fatalf("custom node output = %v", m["text"])
+			}
+			return
+		}
+	}
+	t.Fatal("custom node u did not produce output")
+}
+
+// TestEngine_UnknownNodeTypeFails 未注册类型必须显式失败
+func TestEngine_UnknownNodeTypeFails(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	states, err := eng.Execute(
+		[]byte(`[{"id":"s","type":"start","data":{}},{"id":"x","type":"no_such_node","data":{}}]`),
+		[]byte(`[{"id":"e1","source":"s","target":"x"}]`),
+	)
+	if err == nil {
+		t.Fatal("unknown node type must fail")
+	}
+	if !strings.Contains(err.Error(), "unknown node type") {
+		t.Fatalf("error should mention unknown node type, got: %v", err)
+	}
+	for _, n := range states {
+		if n.ID == "x" && n.Status != "failed" {
+			t.Fatalf("node x should be failed, got %s", n.Status)
+		}
+	}
+}
+
+// ===== 代码节点 =====
+
+func codeNode(code string) model.NodeInstance {
+	return model.NodeInstance{ID: "c", Type: "code", Data: map[string]interface{}{"code": code}}
+}
+
+func runOneCode(t *testing.T, eng *EngineV2, code string, upstream map[string]interface{}) (interface{}, error) {
+	t.Helper()
+	node := codeNode(code)
+	return eng.executeNode(contextBackground(), &node, upstream)
+}
+
+func TestCodeNode_StringResult(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	out, err := runOneCode(t, eng, `result = strings.ToUpper(inputText)`, map[string]interface{}{
+		"s": map[string]interface{}{"text": "hello flowedge"},
+	})
+	if err != nil {
+		t.Fatalf("code node failed: %v", err)
+	}
+	m, ok := out.(map[string]interface{})
+	if !ok {
+		t.Fatalf("output should be a map, got %T", out)
+	}
+	if m["text"] != "HELLO FLOWEDGE" {
+		t.Fatalf("text = %v", m["text"])
+	}
+}
+
+func TestCodeNode_StructuredResult(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	code := `
+	type row struct { Name string; Score int }
+	rows := []row{{"a", 1}, {"b", 2}}
+	result = map[string]interface{}{"count": len(rows), "names": []string{rows[0].Name, rows[1].Name}}
+`
+	out, err := runOneCode(t, eng, code, nil)
+	if err != nil {
+		t.Fatalf("code node failed: %v", err)
+	}
+	m := out.(map[string]interface{})
+	if m["count"].(int) != 2 {
+		t.Fatalf("count = %v", m["count"])
+	}
+	switch names := m["names"].(type) {
+	case []interface{}:
+		if names[0].(string) != "a" {
+			t.Fatalf("names = %v", names)
+		}
+	case []string:
+		if names[0] != "a" {
+			t.Fatalf("names = %v", names)
+		}
+	default:
+		t.Fatalf("unexpected names type %T: %v", names, names)
+	}
+}
+
+func TestCodeNode_InputJSON(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	// 多前驱时 input 是完整 JSON，代码可按结构读取
+	code := `
+	var v map[string]interface{}
+	if err := json.Unmarshal([]byte(input), &v); err != nil {
+		result = "parse error: " + err.Error()
+	} else {
+		result = fmt.Sprintf("got %d keys", len(v))
+	}
+`
+	up := map[string]interface{}{
+		"a": map[string]interface{}{"text": "x"},
+		"b": map[string]interface{}{"text": "y"},
+	}
+	out, err := runOneCode(t, eng, code, up)
+	if err != nil {
+		t.Fatalf("code node failed: %v", err)
+	}
+	if m := out.(map[string]interface{}); m["text"] != "got 2 keys" {
+		t.Fatalf("text = %v", m["text"])
+	}
+}
+
+// TestCodeNode_ForbiddenImport 危险 import 必须被静态拒绝
+func TestCodeNode_ForbiddenImport(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	for _, bad := range []string{
+		`import "os/exec"`,
+		`import "net/http"`,
+		`import "os"`,
+		`import ( "syscall" )`,
+	} {
+		code := bad + "\nresult = \"should not run\""
+		_, err := runOneCode(t, eng, code, nil)
+		if err == nil {
+			t.Fatalf("forbidden import %q must be rejected", bad)
+		}
+	}
+}
+
+// TestCodeNode_EmptyCodeFails 空代码显式报错而非返回空成功
+func TestCodeNode_EmptyCodeFails(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	if _, err := runOneCode(t, eng, "   \n  ", nil); err == nil {
+		t.Fatal("empty code must fail")
+	}
+}
+
+// TestCodeNode_TimeoutTimeoutMs 死循环 + 短超时必须以 timeout 错误码失败
+func TestCodeNode_Timeout(t *testing.T) {
+	eng := NewEngineV2(nil, nil, nil, nil, nil, NewHTTPService(), nil, nil, nil)
+	node := model.NodeInstance{
+		ID:   "c",
+		Type: "code",
+		Data: map[string]interface{}{
+			"code":       "for { }",
+			"timeout_ms": 150.0,
+		},
+	}
+	_, err := eng.executeNode(contextBackground(), &node, nil)
+	if err == nil {
+		t.Fatal("infinite loop must be timed out")
+	}
+	if classifyError(err) != model.ErrorCodeTimeout {
+		t.Fatalf("error code = %q, want timeout", classifyError(err))
+	}
+}
+
+// TestCheckCodeSafety 静态预检
+func TestCheckCodeSafety(t *testing.T) {
+	if err := checkCodeSafety(`result = strings.ToUpper(inputText)`); err != nil {
+		t.Fatalf("safe code must pass: %v", err)
+	}
+	if err := checkCodeSafety(`import "os/exec"`); err == nil {
+		t.Fatal("os/exec must be rejected")
+	}
+}
+
+func contextBackground() context.Context { return context.Background() }

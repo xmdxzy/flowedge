@@ -26,6 +26,32 @@ interface Props {
   onClose: () => void
 }
 
+interface VRAMEvent {
+  at: string
+  action: string
+  model?: string
+  vram_mb?: number
+  free_mb?: number
+  detail?: string
+}
+
+interface SchedModel {
+  name: string
+  type: string
+  vram_mb: number
+  refs: number
+  status: string
+}
+
+const ACTION_STYLE: Record<string, { label: string; cls: string }> = {
+  reserve: { label: '占用', cls: 'text-primary' },
+  release: { label: '释放引用', cls: 'text-gray-400' },
+  unload: { label: '卸载', cls: 'text-warning' },
+  unload_failed: { label: '卸载失败', cls: 'text-error' },
+  reject: { label: '拒绝', cls: 'text-error' },
+  telemetry_unavailable: { label: '遥测不可用', cls: 'text-gray-500' },
+}
+
 const ITEMS: { key: keyof Capabilities; label: string; need: string; effect: string }[] = [
   { key: 'gpu', label: 'NVIDIA GPU', need: '显卡驱动', effect: 'CUDA 推理' },
   { key: 'ollama', label: 'Ollama', need: 'ollama.com 安装包', effect: 'LLM 推理 / 知识库向量化' },
@@ -40,6 +66,9 @@ export default function CapabilityPanel({ onClose }: Props) {
   const [meta, setMeta] = useState<{ version?: string; uptime_seconds?: number }>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [vramEvents, setVramEvents] = useState<VRAMEvent[]>([])
+  const [schedModels, setSchedModels] = useState<SchedModel[]>([])
+  const [gpuInfo, setGpuInfo] = useState<any>(null)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -50,6 +79,19 @@ export default function CapabilityPanel({ onClose }: Props) {
       if (!resp.ok) throw new Error(data.error || 'probe failed')
       setCaps(data.capabilities)
       setMeta({ version: data.version, uptime_seconds: data.uptime_seconds })
+
+      // 显存时间线（失败不影响主面板）
+      try {
+        const tl = await fetch('/api/gpu/timeline?limit=40')
+        if (tl.ok) {
+          const d = await tl.json()
+          setVramEvents(Array.isArray(d.events) ? d.events : [])
+          setSchedModels(Array.isArray(d.status?.models) ? d.status.models : [])
+          setGpuInfo(d.status?.gpu || null)
+        }
+      } catch {
+        /* 忽略 */
+      }
     } catch (err: any) {
       setError(`检测失败：${err.message}`)
     } finally {
@@ -159,6 +201,67 @@ export default function CapabilityPanel({ onClose }: Props) {
                 </div>
               )
             })}
+          </div>
+
+          {/* 显存调度：谁占着显存、有没有被驱逐 */}
+          <div className="mt-4 pt-3 border-t border-border">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-gray-300">显存调度</span>
+              {gpuInfo && (
+                <span className="text-[10px] text-gray-500 font-mono">
+                  {gpuInfo.used_mb}/{gpuInfo.total_mb} MB · {gpuInfo.utilization}%
+                </span>
+              )}
+            </div>
+
+            {schedModels.length > 0 && (
+              <div className="flex flex-col gap-1 mb-2">
+                {schedModels.map((m) => (
+                  <div key={m.name} className="flex items-center gap-1.5 text-[10px]">
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        m.refs > 0 ? 'bg-primary animate-pulse' : 'bg-gray-600'
+                      }`}
+                    />
+                    <span className="text-gray-300 font-mono truncate max-w-[190px]">{m.name}</span>
+                    <span className="text-gray-600">{m.type}</span>
+                    <span className="ml-auto text-gray-500 font-mono">{m.vram_mb} MB</span>
+                    <span className="text-gray-600">refs {m.refs}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="max-h-40 overflow-y-auto rounded-lg bg-canvas/70 border border-border/60 px-2 py-1.5">
+              {vramEvents.length === 0 ? (
+                <p className="text-[10px] text-gray-500">暂无调度事件（运行工作流后记录）</p>
+              ) : (
+                vramEvents
+                  .slice()
+                  .reverse()
+                  .map((e, i) => {
+                    const st = ACTION_STYLE[e.action] || { label: e.action, cls: 'text-gray-500' }
+                    return (
+                      <div key={`${e.at}-${i}`} className="flex items-center gap-1.5 text-[10px] leading-5">
+                        <span className={st.cls}>{st.label}</span>
+                        <span className="text-gray-500 font-mono truncate max-w-[170px]">
+                          {e.model || e.detail || ''}
+                        </span>
+                        {e.vram_mb ? (
+                          <span className="ml-auto text-gray-700 font-mono">{e.vram_mb} MB</span>
+                        ) : null}
+                        <span className="text-gray-700 shrink-0 pl-1">
+                          {new Date(e.at).toLocaleTimeString()}
+                        </span>
+                      </div>
+                    )
+                  })
+              )}
+            </div>
+            <p className="text-[10px] text-gray-600 mt-1.5 leading-relaxed">
+              refs&gt;0 的模型不会被驱逐；显存不足时按最久未使用卸载，并真正调用
+              Ollama / ComfyUI 释放显存。文生图任务串行执行（并行只会互相 OOM）。
+            </p>
           </div>
 
           <div className="mt-4 pt-3 border-t border-border">

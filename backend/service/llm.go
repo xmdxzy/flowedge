@@ -107,6 +107,31 @@ func (s *LLMService) ChatWithModelUsage(prompt, model string) (string, LLMUsage,
 	return chatResp.Choices[0].Message.Content, chatResp.Usage, nil
 }
 
+// UnloadModel 让 Ollama 把模型从显存里卸掉。
+//
+// 用 /api/generate + keep_alive:0（Ollama 文档做法）比 OpenAI 兼容端点可靠：
+// 兼容端点不一定透传 keep_alive。请求本身 1 秒内返回。
+func (s *LLMService) UnloadModel(model string) error {
+	if model == "" {
+		model = s.Model
+	}
+	body := map[string]interface{}{
+		"model":      model,
+		"keep_alive": 0,
+	}
+	b, _ := json.Marshal(body)
+	cl := &http.Client{Timeout: 10 * time.Second}
+	resp, err := cl.Post(s.BaseURL+"/api/generate", "application/json", bytes.NewBuffer(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ollama unload status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // toolChatMessage OpenAI 兼容消息（支持工具调用与工具结果回填）
 type toolChatMessage struct {
 	Role       string     `json:"role"`

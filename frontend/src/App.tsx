@@ -29,6 +29,7 @@ import LoopNode from './nodes/LoopNode'
 import HTTPNode from './nodes/HTTPNode'
 import TransformNode from './nodes/TransformNode'
 import RAGNode from './nodes/RAGNode'
+import CodeNode from './nodes/CodeNode'
 import { workflowTemplates, type WorkflowTemplate } from './templates/workflowTemplates'
 import { useHotkeys } from './hooks/useHotkeys'
 import { useWebSocket, type WSEvent } from './hooks/useWebSocket'
@@ -55,6 +56,7 @@ const nodeTypes: NodeTypes = {
   http_request: HTTPNode,
   data_transform: TransformNode,
   rag_query: RAGNode,
+  code: CodeNode,
 }
 
 // 节点库（数据驱动：新增节点类型只需在这里加一行）
@@ -89,6 +91,7 @@ const PALETTE: { label: string; items: { type: string; label: string; icon: stri
     label: '数据处理',
     items: [
       { type: 'http_request', label: 'HTTP 请求', icon: '⇄', tone: 'tone-data' },
+      { type: 'code', label: '代码执行', icon: '{ }', tone: 'tone-data' },
       { type: 'data_transform', label: '数据转换', icon: '⇋', tone: 'tone-muted' },
     ],
   },
@@ -103,7 +106,8 @@ const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   video_compose: ['video'],
   tts: ['audio'],
   asr: ['text'],
-  rag_query: ['text'],
+  rag_query: ['text', 'context', 'sources', 'hits'],
+  code: ['text', 'code_out'],
 }
 
 // LLM 节点可用的内置工具（后端 service/tools.go 实现，全部本地执行）
@@ -1157,6 +1161,72 @@ function FlowEditor() {
               </div>
             )}
 
+            {/* 代码执行节点：Go 子集沙箱（yaegi 解释执行，stdlib 白名单） */}
+            {selectedNode.type === 'code' && (
+              <>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">
+                    Go 代码（把结果赋给 result）
+                  </label>
+                  <textarea
+                    value={(selectedNode.data.code as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('code', e.target.value)}
+                    className="w-full h-52 px-3 py-2 rounded-lg bg-canvas border border-border text-[11px] font-mono resize-y focus:border-primary outline-none"
+                    placeholder="result = strings.ToUpper(inputText)  // 可用变量：input、inputText"
+                  />
+                  <p className="text-[10px] text-gray-600 mt-1 leading-relaxed">
+                    可用变量：<code className="text-data">input</code>（上游输出
+                    JSON）、<code className="text-data">inputText</code>（上游文本）。可用包：
+                    strings、encoding/json、fmt、sort、strconv、math、time、regexp、bytes、
+                    sha256、path。禁止 import 危险包（os/exec、net、syscall 等）。
+                  </p>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">超时（毫秒）</label>
+                  <input
+                    type="number"
+                    value={(selectedNode.data.timeout_ms as number) ?? 30000}
+                    onChange={(e) =>
+                      updateSelectedNodeData('timeout_ms', Number(e.target.value) || 0)
+                    }
+                    className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
+                    placeholder="30000"
+                  />
+                  <p className="text-[10px] text-gray-600 mt-1">
+                    yaegi 无法硬中断死循环，超时只会放弃等待，默认 30 秒。
+                  </p>
+                </div>
+              </>
+            )}
+
+            {/* 知识库检索：此前属性面板完全没有配置项，靠默认值盲跑 */}
+            {selectedNode.type === 'rag_query' && (
+              <>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">检索问题</label>
+                  <textarea
+                    value={(selectedNode.data.query as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('query', e.target.value)}
+                    className="w-full h-20 px-3 py-2 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
+                    placeholder="留空则使用上游输入..."
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">返回条数 top_k</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={(selectedNode.data.top_k as number) ?? 3}
+                    onChange={(e) =>
+                      updateSelectedNodeData('top_k', Number(e.target.value) || 3)
+                    }
+                    className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
+                  />
+                </div>
+              </>
+            )}
+
             {selectedNode.type === 'llm' && (
               <>
                 <div>
@@ -1454,7 +1524,12 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'data_transform':
       return { template: '' }
     case 'rag_query':
-      return { query: '' }
+      return { query: '', top_k: 3 }
+    case 'code':
+      return {
+        code: 'result = strings.ToUpper(inputText)',
+        timeout_ms: 30000,
+      }
     default:
       return {}
   }

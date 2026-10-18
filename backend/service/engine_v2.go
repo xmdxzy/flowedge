@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,7 @@ type EngineV2 struct {
 	tools           *ToolExecutor
 	cache           *NodeCache
 	eventLog        *EventLogger
+	nodes           nodeRegistry // 节点类型注册表（内置 14 种 + 可注册自定义）
 	runMu           sync.Mutex
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
@@ -139,7 +141,7 @@ func NewEngineV2(
 	gpuSched *GPUScheduler,
 	wsHub *WSHub,
 ) *EngineV2 {
-	return &EngineV2{
+	e := &EngineV2{
 		llm:      llm,
 		t2i:      t2i,
 		asr:      asr,
@@ -150,6 +152,9 @@ func NewEngineV2(
 		gpuSched: gpuSched,
 		wsHub:    wsHub,
 	}
+	// 注册表在构造时装配：保持 NewEngineV2 签名不变（26 个既有测试直接调用它）
+	e.registerBuiltinNodes()
+	return e
 }
 
 // Execute 执行工作流（按层并行 DAG + 按边传递输入 + 分支级联跳过 + 节点超时）
@@ -666,53 +671,75 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 	return nodes, nil
 }
 
-// executeNode 执行单个节点（支持所有节点类型）
-// executeNode 执行单个节点。
-// ctx 透传 runID（事件日志归属性）与取消信号。
-func (e *EngineV2) executeNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	switch node.Type {
-	case "start":
-		return e.execStartNode(node, upstream)
+// NodeExecutor 节点执行函数。ctx 透传 runID（事件归属性）与取消信号。
+type NodeExecutor func(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error)
 
-	case "llm":
-		return e.execLLMNode(ctx, node, upstream)
+// nodeRegistry 节点类型 → 执行函数。用 map 取代 switch：
+// 新增节点类型（插件、测试替身）不必改引擎分发逻辑，engine_v2.go 从此只负责编排。
+type nodeRegistry map[string]NodeExecutor
 
-	case "text2image":
-		return e.execText2ImageNode(node, upstream)
-
-	case "asr":
-		return e.execASRNode(node, upstream)
-
-	case "tts":
-		return e.execTTSNode(node, upstream)
-
-	case "video_compose":
-		return e.execVideoNode(node, upstream)
-
-	case "if_else":
-		return e.execIfElseNode(node, upstream)
-
-	case "http_request":
-		return e.execHTTPNode(node, upstream)
-
-	case "data_transform":
-		return e.execTransformNode(node, upstream)
-
-	case "rag_query":
-		return e.execRAGNode(node, upstream)
-
-	case "sub_workflow":
-		return e.execSubWorkflowNode(ctx, node, upstream)
-
-	case "loop":
-		return e.execLoopNode(ctx, node, upstream)
-
-	case "end":
-		return e.execEndNode(node, upstream)
-
-	default:
-		return nil, fmt.Errorf("unknown node type: %s", node.Type)
+// registerBuiltinNodes 注册全部内置节点类型
+func (e *EngineV2) registerBuiltinNodes() {
+	// 不需要 ctx 的节点统一包一层，避免逐个给执行函数改签名
+	plain := func(fn func(*model.NodeInstance, map[string]interface{}) (interface{}, error)) NodeExecutor {
+		return func(_ context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+			return fn(node, upstream)
+		}
 	}
+
+	e.nodes = nodeRegistry{
+		"start":          plain(e.execStartNode),
+		"llm":            e.execLLMNode,
+		"text2image":     plain(e.execText2ImageNode),
+		"asr":            plain(e.execASRNode),
+		"tts":            plain(e.execTTSNode),
+		"video_compose":  plain(e.execVideoNode),
+		"if_else":        plain(e.execIfElseNode),
+		"http_request":   plain(e.execHTTPNode),
+		"data_transform": plain(e.execTransformNode),
+		"rag_query":      plain(e.execRAGNode),
+		"sub_workflow":   e.execSubWorkflowNode,
+		"loop":           e.execLoopNode,
+		"end":            plain(e.execEndNode),
+		"code":           e.execCodeNode,
+	}
+}
+
+// executeNode 查注册表执行节点；未注册类型显式报错
+func (e *EngineV2) executeNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	// 懒装配：调用方若用结构体字面量构造（既有测试 / 旧调用路径），
+	// 这里补齐注册表，行为与走 NewEngineV2 完全一致。
+	// 双重检查 + 复用 runMu：同层节点并行执行时会并发走到这里。
+	if e.nodes == nil {
+		e.runMu.Lock()
+		if e.nodes == nil {
+			e.registerBuiltinNodes()
+		}
+		e.runMu.Unlock()
+	}
+
+	if fn, ok := e.nodes[node.Type]; ok {
+		return fn(ctx, node, upstream)
+	}
+	return nil, fmt.Errorf("unknown node type: %s", node.Type)
+}
+
+// RegisterNodeType 注册自定义节点类型（插件 / 测试替身入口）
+func (e *EngineV2) RegisterNodeType(typ string, fn NodeExecutor) {
+	if e.nodes == nil {
+		e.nodes = make(nodeRegistry)
+	}
+	e.nodes[typ] = fn
+}
+
+// NodeTypes 已注册的节点类型（供能力自检端点下发到前端）
+func (e *EngineV2) NodeTypes() []string {
+	out := make([]string, 0, len(e.nodes))
+	for k := range e.nodes {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ===== 各节点执行逻辑 =====
@@ -968,6 +995,17 @@ func (e *EngineV2) streamFinalAnswer(ctx context.Context, node *model.NodeInstan
 }
 
 func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	// 显存调度：flux 与 LLM 抢同一块 24GB 显存，不纳入调度就会出现
+	// 「LLM 已加载 + 直接起 flux」→ OOM。此前只有 LLM 节点走调度。
+	if e.gpuSched != nil && e.t2i != nil && e.t2i.Checkpoint != "" {
+		// 串行门：同层多个文生图节点不会同时进 ComfyUI（并行只会互相 OOM）
+		e.gpuSched.LockText2Image()
+		defer e.gpuSched.UnlockText2Image()
+
+		_ = e.gpuSched.AcquireModel(e.t2i.Checkpoint)
+		defer e.gpuSched.ReleaseModel(e.t2i.Checkpoint)
+	}
+
 	prompt := ""
 	if p, ok := node.Data["prompt"].(string); ok {
 		prompt = p

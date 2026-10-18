@@ -133,6 +133,21 @@ func main() {
 	// GPU 真实遥测轮询（缓存 nvidia-smi 结果，避免每请求拉子进程）
 	gpuSched.StartTelemetry(5 * time.Second)
 
+	// 真实卸载钩子：没注入之前，调度器只会把内存里的状态改成 idle，
+	// 模型仍占着显存，下一次 Acquire 照样失败。这里把「卸载」接到推理服务自己身上。
+	gpuSched.SetUnloader(func(name, modelType string) error {
+		switch modelType {
+		case "llm":
+			return llmService.UnloadModel(name)
+		case "text2image":
+			return t2iService.UnloadModels()
+		}
+		return nil
+	})
+
+	// 注册显存占用档案：flux fp8 实测约 11GB、whisper-large-v3 约 6GB
+	gpuSched.RegisterModel("flux1-schnell-fp8", "text2image", 11000)
+
 	if getEnv("FLOWEDGE_MODE", "release") == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -258,6 +273,13 @@ func main() {
 		api.GET("/gpu/status", func(c *gin.Context) {
 			c.JSON(200, gpuSched.GetSchedulerStatus())
 		})
+		// 显存时间线：谁在什么时候占了显存、有没有被驱逐
+		api.GET("/gpu/timeline", func(c *gin.Context) {
+			c.JSON(200, gin.H{
+				"events": gpuSched.Timeline(parseLimit(c.Query("limit"), 60)),
+				"status": gpuSched.GetSchedulerStatus(),
+			})
+		})
 
 		// 产物管理（生成的图片 / 视频 / 音频）
 		artifactHandler := handler.NewArtifactHandler(getEnv("GENERATED_DIR", "data/generated"))
@@ -279,6 +301,7 @@ func main() {
 
 		// 健康检查与环境自检（部署排障用）
 		healthHandler := handler.NewHealthHandler(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, asrURL, ttsURL, version)
+		healthHandler.SetNodeTypeLister(engine)
 		api.GET("/health", healthHandler.Health)
 		api.GET("/capabilities", healthHandler.Capabilities)
 	}
@@ -522,4 +545,12 @@ func exportServices(baseDir string) {
 	fmt.Println("  4) .venv\\Scripts\\python tts_server.py    （语音合成，端口 8102）")
 	fmt.Println("  5) .venv\\Scripts\\python asr_server.py    （语音转写，端口 8101，首次会下载模型）")
 	fmt.Println("  然后重启 FlowEdge.exe，界面右上角「环境」会显示这两项已就绪。")
+}
+
+// parseLimit 解析查询串里的条数上限
+func parseLimit(s string, def int) int {
+	if v, err := strconv.Atoi(s); err == nil && v > 0 && v <= 200 {
+		return v
+	}
+	return def
 }

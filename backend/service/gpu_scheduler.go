@@ -32,10 +32,21 @@ type ModelInstance struct {
 	Name       string
 	Type       string // llm, text2image, asr, tts
 	VramMB     int    // 预估显存占用
+	Refs       int    // 正在使用中的引用数；>0 的模型禁止卸载
 	Status     ModelStatus
 	LoadedAt   time.Time
 	LastUsedAt time.Time
 	LoadCostMS int // 历史平均加载耗时
+}
+
+// TimelineEvent 显存时间线事件（前端可视化：谁在什么时候占了显存）
+type TimelineEvent struct {
+	At     time.Time `json:"at"`
+	Action string    `json:"action"` // reserve / release / unload / reject
+	Model  string    `json:"model,omitempty"`
+	VRAMMB int       `json:"vram_mb,omitempty"`
+	FreeMB int       `json:"free_mb,omitempty"`
+	Detail string    `json:"detail,omitempty"`
 }
 
 // SchedulerConfig 调度器配置
@@ -50,8 +61,10 @@ type SchedulerConfig struct {
 type GPUScheduler struct {
 	config            SchedulerConfig
 	models            map[string]*ModelInstance
+	unloader          func(name, modelType string) error // 真实卸载钩子（Ollama keep_alive:0 / ComfyUI /free）
 	mu                sync.Mutex
-	listening         bool
+	t2iGate           sync.Mutex // 文生图串行门：flux 单实例约 11GB，并行只会互相 OOM
+	timeline          []TimelineEvent
 	cachedGPU         *GPUInfo
 	cachedAt          time.Time
 	telemetryInterval time.Duration
@@ -69,8 +82,70 @@ func NewGPUScheduler(totalVramMB int) *GPUScheduler {
 			WarnThresholdMB: int(float64(totalVramMB) * 0.85), // 85% 预警线
 			RedThresholdMB:  int(float64(totalVramMB) * 0.92), // 92% 红线
 		},
-		models: make(map[string]*ModelInstance),
+		models:   make(map[string]*ModelInstance),
+		timeline: make([]TimelineEvent, 0, 64),
 	}
+}
+
+// SetUnloader 注入真实卸载函数。
+//
+// 在此之前，evictLRU 只把内存里的 Status 改成 idle，**模型仍留在显存里**
+// —— 显存实际没有释放，下一次 Acquire 又会失败。真实卸载由推理服务自己完成
+// （Ollama：发一次带 keep_alive:0 的请求；ComfyUI：调 /free），调度器只负责在
+// 该卸的时候调用。
+func (s *GPUScheduler) SetUnloader(fn func(name, modelType string) error) {
+	s.mu.Lock()
+	s.unloader = fn
+	s.mu.Unlock()
+}
+
+// recordTimeline 追加时间线事件（最近 200 条，调用方持锁）
+func (s *GPUScheduler) recordTimeline(ev TimelineEvent) {
+	if ev.At.IsZero() {
+		ev.At = time.Now()
+	}
+	s.timeline = append(s.timeline, ev)
+	if len(s.timeline) > 200 {
+		s.timeline = s.timeline[len(s.timeline)-200:]
+	}
+}
+
+// LockText2Image / UnlockText2Image 串行化文生图任务。
+//
+// 单卡 24GB 上并行跑两个 flux 并不会更快：两个 11GB 模型同时驻留会直接 OOM，
+// 或者被驱动换页到内存里慢十倍。串行是这里唯一正确的策略。
+// LLM 不在此列 —— 小模型可共存，靠 Acquire/Release + LRU 协调即可。
+func (s *GPUScheduler) LockText2Image()   { s.t2iGate.Lock() }
+func (s *GPUScheduler) UnlockText2Image() { s.t2iGate.Unlock() }
+
+// VRAMBudgetMB 当前可用显存预算（总显存 - 已用 - 安全余量）
+func (s *GPUScheduler) VRAMBudgetMB() int {
+	info, err := s.GetGPUInfo()
+	if err != nil || info == nil {
+		return s.config.TotalVramMB / 2
+	}
+	budget := info.FreeMB - 1024 // 留 1GB 余量给 CUDA context / 显示输出
+	if budget < 0 {
+		budget = 0
+	}
+	return budget
+}
+
+// Timeline 返回显存时间线（最近 N 条）
+func (s *GPUScheduler) Timeline(limit int) []TimelineEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 60
+	}
+	out := make([]TimelineEvent, 0, limit)
+	n := len(s.timeline)
+	start := 0
+	if n > limit {
+		start = n - limit
+	}
+	out = append(out, s.timeline[start:]...)
+	return out
 }
 
 // StartTelemetry 启动后台 nvidia-smi 轮询，缓存真实遥测
@@ -131,6 +206,21 @@ func (s *GPUScheduler) GetGPUInfo() (*GPUInfo, error) {
 	return info, nil
 }
 
+// gpuInfoLocked 供**已持锁**的调用方读取 GPU 状态。
+//
+// AcquireModel 持有 s.mu 时不能调用 GetGPUInfo —— 后者内部也会 s.mu.Lock()，
+// 而 sync.Mutex 不可重入，会直接自死锁。这个函数只读缓存 / 直接查 nvidia-smi。
+func (s *GPUScheduler) gpuInfoLocked() (*GPUInfo, error) {
+	interval := s.telemetryInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if s.cachedGPU != nil && time.Since(s.cachedAt) < 2*interval {
+		return s.cachedGPU, nil
+	}
+	return s.queryGPU()
+}
+
 // queryGPU 现场执行 nvidia-smi（无锁：调用方自行决定锁策略）
 func (s *GPUScheduler) queryGPU() (*GPUInfo, error) {
 	cmd := exec.Command("nvidia-smi",
@@ -176,66 +266,85 @@ func (s *GPUScheduler) RegisterModel(name, modelType string, vramMB int) {
 	}
 }
 
-// AcquireModel 请求加载模型
-// 返回是否需要等待、是否成功
+// AcquireModel 请求加载模型（引用计数：同一模型被多个节点并发使用时只算一次，卸载时不会被误卸）
 func (s *GPUScheduler) AcquireModel(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	model, exists := s.models[name]
+	m, exists := s.models[name]
 	if !exists {
 		return fmt.Errorf("model not registered: %s", name)
 	}
 
-	// 如果已经加载完成，直接返回
-	if model.Status == ModelStatusReady {
-		model.LastUsedAt = time.Now()
+	// 已加载：仅累加引用
+	if m.Status == ModelStatusReady {
+		m.Refs++
+		m.LastUsedAt = time.Now()
+		s.recordTimeline(TimelineEvent{Action: "reserve", Model: name, VRAMMB: m.VramMB})
 		return nil
 	}
 
-	// 检查显存是否足够
-	gpuInfo, err := s.GetGPUInfo()
+	gpuInfo, err := s.gpuInfoLocked()
 	if err != nil {
-		return fmt.Errorf("cannot get GPU info: %w", err)
+		// 遥测不可用（没装 nvidia-smi / 驱动异常 / 远程会话）：
+		// **不阻断执行**，按「假定显存充足」继续并记入时间线。
+		// 单机单卡场景下，宁可让它跑，也不要因为探测失败就让整个工作流失败。
+		s.recordTimeline(TimelineEvent{
+			Action: "telemetry_unavailable", Model: name, VRAMMB: m.VramMB, Detail: err.Error(),
+		})
+		m.Status = ModelStatusLoading
+		m.Refs++
+		m.LoadedAt = time.Now()
+		m.LastUsedAt = time.Now()
+		return nil
 	}
 
-	requiredMB := model.VramMB
+	requiredMB := m.VramMB
 	availableMB := gpuInfo.FreeMB
 
-	// 如果显存不足，触发 LRU 卸载
 	if availableMB < requiredMB {
-		s.evictLRU(requiredMB - availableMB)
-
-		// 重新检查
-		gpuInfo, _ = s.GetGPUInfo()
-		availableMB = gpuInfo.FreeMB
+		s.evictLRULocked(requiredMB - availableMB)
+		if gpuInfo, err = s.gpuInfoLocked(); err == nil {
+			availableMB = gpuInfo.FreeMB
+		}
 		if availableMB < requiredMB {
+			s.recordTimeline(TimelineEvent{
+				Action: "reject", Model: name, VRAMMB: requiredMB, FreeMB: availableMB,
+				Detail: fmt.Sprintf("显存不足：需要 %d MB，空闲 %d MB", requiredMB, availableMB),
+			})
 			return fmt.Errorf("insufficient VRAM: need %d MB, free %d MB", requiredMB, availableMB)
 		}
 	}
 
-	// 模拟加载过程（实际由推理服务完成）
-	model.Status = ModelStatusLoading
-	model.LoadedAt = time.Now()
-	model.LastUsedAt = time.Now()
-
+	m.Status = ModelStatusLoading
+	m.Refs++
+	m.LoadedAt = time.Now()
+	m.LastUsedAt = time.Now()
+	s.recordTimeline(TimelineEvent{Action: "reserve", Model: name, VRAMMB: m.VramMB, FreeMB: availableMB})
 	return nil
 }
 
-// ReleaseModel 释放模型（标记为可卸载）
+// ReleaseModel 释放一个引用。引用归零后模型进入「可被 LRU 淘汰」状态，
+// 但不立即卸载——缓存能加速后续节点重复使用。
 func (s *GPUScheduler) ReleaseModel(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if model, exists := s.models[name]; exists {
-		model.LastUsedAt = time.Now()
-		// 不立即卸载，交给 LRU 策略
+	if m, exists := s.models[name]; exists {
+		if m.Refs > 0 {
+			m.Refs--
+		}
+		m.LastUsedAt = time.Now()
+		s.recordTimeline(TimelineEvent{Action: "release", Model: name, VRAMMB: m.VramMB})
 	}
 }
 
-// evictLRU 按 LRU 策略卸载模型，释放 neededMB 显存
-func (s *GPUScheduler) evictLRU(neededMB int) {
-	// 收集所有可卸载的模型（idle 或 ready 状态）
+// evictLRULocked 按 LRU 卸载模型直到释放 neededMB（调用方必须持锁）。
+// 关键修正：
+//  1. Refs > 0（正在被节点使用）的模型绝不卸载，否则会把在跑的节点一脚踢翻
+//  2. 真正调用 unloader 释放显存，而不是只改内存里的 Status 字段
+//  3. 卸载失败时保留状态并继续尝试下一个模型
+func (s *GPUScheduler) evictLRULocked(neededMB int) {
 	type candidate struct {
 		name     string
 		lastUsed time.Time
@@ -244,16 +353,16 @@ func (s *GPUScheduler) evictLRU(neededMB int) {
 
 	var candidates []candidate
 	for name, m := range s.models {
-		if m.Status == ModelStatusReady || m.Status == ModelStatusIdle {
-			candidates = append(candidates, candidate{
-				name:     name,
-				lastUsed: m.LastUsedAt,
-				vramMB:   m.VramMB,
-			})
+		if m.Status != ModelStatusReady && m.Status != ModelStatusIdle {
+			continue // loading / unloading 状态不碰
 		}
+		if m.Refs > 0 {
+			continue // 正在使用，禁止卸载
+		}
+		candidates = append(candidates, candidate{name: name, lastUsed: m.LastUsedAt, vramMB: m.VramMB})
 	}
 
-	// 按最久未使用排序
+	// 最久未使用优先
 	for i := 0; i < len(candidates); i++ {
 		for j := i + 1; j < len(candidates); j++ {
 			if candidates[i].lastUsed.After(candidates[j].lastUsed) {
@@ -262,15 +371,31 @@ func (s *GPUScheduler) evictLRU(neededMB int) {
 		}
 	}
 
-	// 逐个卸载，直到释放足够显存
 	freedMB := 0
 	for _, c := range candidates {
 		if freedMB >= neededMB {
 			break
 		}
-		s.models[c.name].Status = ModelStatusIdle
+		m := s.models[c.name]
+		if s.unloader != nil {
+			if err := s.unloader(c.name, m.Type); err != nil {
+				s.recordTimeline(TimelineEvent{
+					Action: "unload_failed", Model: c.name, VRAMMB: c.vramMB, Detail: err.Error(),
+				})
+				continue // 卸载失败：不能把 status 改成 idle，否则账实不符
+			}
+		}
+		m.Status = ModelStatusIdle
 		freedMB += c.vramMB
+		s.recordTimeline(TimelineEvent{Action: "unload", Model: c.name, VRAMMB: c.vramMB})
 	}
+}
+
+// evictLRU 供外部调用的无锁包装
+func (s *GPUScheduler) evictLRU(neededMB int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evictLRULocked(neededMB)
 }
 
 // GetSchedulerStatus 获取调度器状态
@@ -290,6 +415,7 @@ func (s *GPUScheduler) GetSchedulerStatus() map[string]interface{} {
 			"name":      m.Name,
 			"type":      m.Type,
 			"vram_mb":   m.VramMB,
+			"refs":      m.Refs,
 			"status":    m.Status,
 			"loaded_at": m.LoadedAt,
 			"last_used": m.LastUsedAt,

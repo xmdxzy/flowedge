@@ -34,6 +34,24 @@ func NewText2ImageService(baseURL, checkpoint string) *Text2ImageService {
 	}
 }
 
+// UnloadModels 让 ComfyUI 释放已加载模型（POST /free）。
+// 没有这个，LLM 与 flux 抢显存时调度器只能记账，显存实际一点没让出来。
+func (s *Text2ImageService) UnloadModels() error {
+	if s.BaseURL == "" {
+		return fmt.Errorf("%w: ComfyUI 未配置", ErrServiceNotConfigured)
+	}
+	cl := &http.Client{Timeout: 10 * time.Second}
+	resp, err := cl.Post(s.BaseURL+"/free", "application/json", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("comfyui free status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // GenerateImage 生成图片：POST /prompt → 轮询 /history → GET /view 下载落盘，返回本地文件路径
 func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (string, error) {
 	if s.BaseURL == "" {
