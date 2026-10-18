@@ -59,6 +59,18 @@ func (r *PluginRegistry) Get(nodeType string) (NodePlugin, error) {
 }
 
 // ListAll 列出所有插件
+// All 返回全部插件实例（供引擎把它们注册成节点类型）
+func (r *PluginRegistry) All() []NodePlugin {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]NodePlugin, 0, len(r.plugins))
+	for _, p := range r.plugins {
+		out = append(out, p)
+	}
+	return out
+}
+
 func (r *PluginRegistry) ListAll() []map[string]interface{} {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -90,8 +102,8 @@ func (r *PluginRegistry) ExecutePlugin(nodeType string, input, config map[string
 type EchoPlugin struct{}
 
 func (p *EchoPlugin) Type() string        { return "echo" }
-func (p *EchoPlugin) Name() string       { return "回声" }
-func (p *EchoPlugin) Category() string   { return "utility" }
+func (p *EchoPlugin) Name() string        { return "回声" }
+func (p *EchoPlugin) Category() string    { return "utility" }
 func (p *EchoPlugin) Description() string { return "原样返回输入内容，用于测试" }
 
 func (p *EchoPlugin) Execute(input map[string]interface{}, config map[string]interface{}) (map[string]interface{}, error) {
@@ -104,14 +116,14 @@ func (p *EchoPlugin) Execute(input map[string]interface{}, config map[string]int
 type StringLengthPlugin struct{}
 
 func (p *StringLengthPlugin) Type() string        { return "string_length" }
-func (p *StringLengthPlugin) Name() string       { return "字符串长度" }
-func (p *StringLengthPlugin) Category() string   { return "utility" }
+func (p *StringLengthPlugin) Name() string        { return "字符串长度" }
+func (p *StringLengthPlugin) Category() string    { return "utility" }
 func (p *StringLengthPlugin) Description() string { return "计算输入文本的字符数" }
 
 func (p *StringLengthPlugin) Execute(input map[string]interface{}, config map[string]interface{}) (map[string]interface{}, error) {
 	text, _ := input["text"].(string)
 	return map[string]interface{}{
-		"text":  fmt.Sprintf("文本长度: %d 个字符", len([]rune(text))),
+		"text":   fmt.Sprintf("文本长度: %d 个字符", len([]rune(text))),
 		"length": len([]rune(text)),
 	}, nil
 }
@@ -120,8 +132,8 @@ func (p *StringLengthPlugin) Execute(input map[string]interface{}, config map[st
 type UpperCasePlugin struct{}
 
 func (p *UpperCasePlugin) Type() string        { return "uppercase" }
-func (p *UpperCasePlugin) Name() string       { return "转大写" }
-func (p *UpperCasePlugin) Category() string   { return "utility" }
+func (p *UpperCasePlugin) Name() string        { return "转大写" }
+func (p *UpperCasePlugin) Category() string    { return "utility" }
 func (p *UpperCasePlugin) Description() string { return "将文本转为大写" }
 
 func (p *UpperCasePlugin) Execute(input map[string]interface{}, config map[string]interface{}) (map[string]interface{}, error) {

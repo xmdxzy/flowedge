@@ -10,13 +10,38 @@ const path = require('path')
 const fs = require('fs')
 
 const ROOT = path.resolve(__dirname, '..')
-// 优先用 dist/FlowEdge.exe（单文件构建，前端已内嵌）；否则退回开发用后端
-const PACKAGED_EXE = path.join(ROOT, 'dist', 'FlowEdge.exe')
-const DEV_EXE = path.join(ROOT, 'backend', 'flowedge-backend.exe')
-const BACKEND_EXE = process.env.FLOWEDGE_BACKEND_EXE || (fs.existsSync(PACKAGED_EXE) ? PACKAGED_EXE : DEV_EXE)
+
+// 后端 exe 定位（三种运行形态）：
+//  1. 安装包：resources/backend/FlowEdge.exe
+//  2. 源码开发：../dist/FlowEdge.exe（单文件构建，前端已内嵌）
+//  3. 兜底：../backend/flowedge-backend.exe
+function resolveBackendExe() {
+  if (process.env.FLOWEDGE_BACKEND_EXE) return process.env.FLOWEDGE_BACKEND_EXE
+  const candidates = []
+  if (app.isPackaged) {
+    candidates.push(path.join(process.resourcesPath, 'backend', 'FlowEdge.exe'))
+  }
+  candidates.push(path.join(ROOT, 'dist', 'FlowEdge.exe'))
+  candidates.push(path.join(ROOT, 'backend', 'flowedge-backend.exe'))
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p
+  }
+  return candidates[candidates.length - 1]
+}
+
+// 本地语音脚本目录：安装包在 resources/local-services，开发在 backend/local-services
+function resolveLocalServices() {
+  if (app.isPackaged) {
+    const packed = path.join(process.resourcesPath, 'local-services')
+    if (fs.existsSync(packed)) return packed
+  }
+  return path.join(ROOT, 'backend', 'local-services')
+}
+
+const BACKEND_EXE = resolveBackendExe()
 const BACKEND_PORT = process.env.FLOWEDGE_PORT || '8080'
 const BASE_URL = `http://127.0.0.1:${BACKEND_PORT}`
-const LOCAL_SERVICES = path.join(ROOT, 'backend', 'local-services')
+const LOCAL_SERVICES = resolveLocalServices()
 
 let win = null
 let children = []

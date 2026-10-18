@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"log"
@@ -123,6 +124,30 @@ func main() {
 	// 节点级缓存（节点声明 cache: true 时生效）
 	nodeCache := service.NewNodeCache(200)
 	engine.SetCache(nodeCache)
+
+	// 插件注册表：把内置示例插件接进节点注册表。
+	// 这段代码此前从未被调用（plugin_system.go 是完整实现但零接线），
+	// 接入后新增节点类型确实可以不改引擎分发逻辑。
+	pluginRegistry := service.NewPluginRegistry()
+	service.RegisterBuiltinPlugins(pluginRegistry)
+	pluginCount := 0
+	for _, plugin := range pluginRegistry.All() {
+		p := plugin // 闭包捕获
+		engine.RegisterNodeType(p.Type(), func(_ context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+			out, err := p.Execute(upstream, node.Data)
+			if err != nil {
+				return nil, err
+			}
+			if out == nil {
+				return map[string]interface{}{}, nil
+			}
+			return out, nil
+		})
+		pluginCount++
+	}
+	if pluginCount > 0 {
+		log.Printf("已注册 %d 个插件节点类型", pluginCount)
+	}
 
 	// 流式 LLM（token 经 WS 推送前端打字机效果）
 	engine.SetLLMStream(llmStreamService)

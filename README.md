@@ -5,32 +5,57 @@
 ## 核心能力
 
 ### 已实现
-- ✅ 可视化拖拽编排（React Flow v12，支持侧边栏拖拽到画布）
-- ✅ DAG 拓扑排序执行引擎（Go，已含条件分支与菱形 DAG 单元测试）
-- ✅ 13 种节点类型：开始 / 结束 / LLM / 文生图 / 语音转写 / 语音合成 / 视频合成 / 条件分支 / **循环** / 子工作流 / HTTP 请求 / 数据转换 / 知识库检索
-- ✅ 并行汇合策略：`join: any`（任一前驱完成即执行）/ `continue_on_error`（失败不中断、错误对象向下游传播）
-- ✅ 工具调用：LLM 节点可挂内置工具（知识库检索 / HTTP 查询 / 计算器 / 当前时间），模型自行决定调用，全部本地执行
+
+**编排引擎**
+- ✅ 可视化拖拽编排（React Flow v12，侧边栏拖拽 + 吸附网格 + 连线校验）
+- ✅ 分层并行 DAG 执行引擎（Go），含菱形汇合、条件分支、`join: any`、`continue_on_error`
+- ✅ **14 种节点**：开始 / 结束 / LLM / 文生图 / 语音转写 / 语音合成 / 视频合成 / 条件分支 / 循环 / 子工作流 / HTTP / 数据转换 / 知识库检索 / **代码执行**
+- ✅ 代码执行节点：yaegi 解释 Go 子集，stdlib 白名单（strings/json/fmt/sort/regexp/time…），危险 import 静态拒绝
+- ✅ 图结构校验：环 / 自环 / 悬空边在**保存与执行前**拦截（Kahn 入度法，菱形 DAG 不误判）
+- ✅ 节点级超时（默认 180s，`timeout_ms` 覆盖，上限 30min）+ 结构化错误码（timeout / config_missing / cycle / retry_exhausted / cancelled）
+- ✅ 节点重试（上限 5）+ 节点级缓存（确定性节点 opt-in）
+- ✅ 循环 count / foreach / until，硬上限 100；子工作流嵌套深度 4
+
+**可观测与恢复**
+- ✅ 事件日志持久化（`run_events` 表，node_token 不入库避免写放大）→ 可回放
+- ✅ 运行 trace：节点耗时 + token 用量（`GET /api/runs/:id/trace`）
+- ✅ 单节点重跑 / 从指定节点继续（`rerun-from`，上游输出保持不变）
+- ✅ 断点续跑（分支感知，已成功节点复用时间戳不变）
+- ✅ 持久化任务队列（`jobs` 表 + 启动识别中断任务）
+- ✅ 全局运行列表（分页 + 状态过滤）
+- ✅ 执行面板：事件流回放、token 汇总、每节点「重跑」按钮
+
+**检索**
+- ✅ 混合检索：BM25（中文 bigram，零词典）+ 向量，RRF 融合
+- ✅ MMR 去重（硬切重叠产生的近似块不再挤占结果）
+- ✅ 语义阈值过滤；批量写入（导入 O(n²) → O(n)）
+- ✅ 结构化引用 `source#chunkN` + 语义相似度，可 `{{rag-1.sources[0].content}}` 精确引用
+- ✅ embedding 后端探测缓存；降级时关键词路兜底（不再静默降质）
 - ✅ 知识库目录批量导入（递归、自动跳过 node_modules/.git/.venv/data）
-- ✅ **变量系统**：节点可引用任意已完成节点的输出 `{{nodeId.field}}`，跨并行分支取值，面板一键复制
-- ✅ **触发器**：Webhook（外部 POST 即触发，token 即凭据）+ Cron 定时（五段式表达式 + 分钟级去重）
-- ✅ **执行控制**：取消进行中的运行（已完成的节点保留）、执行记录列表与节点耗时瀑布图
-- ✅ **产物画廊**：生成的图片 / 视频 / 音频统一浏览、预览、复制路径复用
-- ✅ **命令面板**：`Ctrl/Cmd + K` 搜索节点、模板、面板、动作
-- ✅ 画布空状态引导、节点图标体系、可用变量提示
-- ✅ Ollama 本地 LLM 集成（OpenAI 兼容接口 + 流式输出）
-- ✅ SQLite 零依赖持久化（工作流、执行记录、版本快照），可选 PostgreSQL
-- ✅ GPU 显存调度器（三级水位线 70%/85%/92%）
-- ✅ 图结构校验：环 / 自环 / 悬空边在保存与执行前拦截（Kahn 入度法，菱形 DAG 不误判）
-- ✅ 节点级超时（默认 180s，`timeout_ms` 覆盖，上限 30min）+ 结构化错误码（timeout / config_missing / cycle / retry_exhausted …）
-- ✅ 未配置的语音服务显式失败并标记 `config_missing`，绝不伪造转写文本或假音频
-- ✅ WebSocket 实时状态推送（节点状态实时更新）
-- ✅ 工作流版本管理与回滚
-- ✅ 预置模板库（文本总结、文生图、条件分支）
-- ✅ 快捷键（Ctrl/Cmd+S 保存、Ctrl+Enter 运行、Delete 删除、Ctrl+Z 撤销、Ctrl+Shift+Z 或 Ctrl+Y 重做）
-- ✅ 右键菜单（节点复制/删除、画布快捷操作）
-- ✅ 工作流导出/导入（JSON 文件）
-- ✅ 执行历史面板
-- ✅ 深色科技风 UI（三栏布局、节点状态指示灯、连线流动画）
+
+**多模态**
+- ✅ Ollama 本地 LLM（流式 + 工具调用 + 不支持 tool_calls 模型的文本兜底）
+- ✅ ComfyUI 文生图：内置 flux 图 + **自定义工作流模板**（`data/comfy_workflows/*.json`，占位符替换，可接 ControlNet/LoRA/img2img）
+- ✅ 视频合成：多图轮播（concat 一次转码）+ 10 分钟超时 + `image_duration`
+- ✅ ASR（faster-whisper）/ TTS（Windows SAPI）本地服务；**未配置时显式失败，不伪造结果**
+- ✅ `FFMPEG_PATH` 环境变量生效
+
+**GPU 调度（本项目的差异化能力）**
+- ✅ 引用计数：正在使用的模型禁止驱逐
+- ✅ **真实卸载**：Ollama `keep_alive:0` / ComfyUI `POST /free`（不是只改内存状态）
+- ✅ 文生图串行门：并行跑两个 flux 只会互相 OOM
+- ✅ 显存时间线（`/api/gpu/timeline`）+ 环境面板可视化
+- ✅ 遥测不可用时不阻断执行
+
+**其他**
+- ✅ 变量系统 `{{nodeId.path}}`，支持数组索引 `{{node.list[0].field}}`
+- ✅ 触发器：Webhook（token 即凭据）+ Cron（五段式，分钟级去重）
+- ✅ 工作流版本管理与回滚；导出/导入 JSON
+- ✅ 产物画廊；命令面板（Ctrl/Cmd+K）
+- ✅ 快捷键：Ctrl+S 保存、Ctrl+Enter 运行、Delete 删除、Ctrl+Z 撤销、Ctrl+Shift+Z / Ctrl+Y 重做
+- ✅ 安全：默认只监听 127.0.0.1；对外必须显式 `FLOWEDGE_HOST=0.0.0.0` + `FLOWEDGE_API_TOKEN`
+- ✅ 单文件 exe（前端与语音脚本内嵌）；SQLite 零依赖，数据始终跟随 exe 目录
+- ✅ 插件注册表（新增节点类型不需改引擎分发逻辑）
 
 ## 在 Windows 上运行（推荐：不需要 Docker / WSL）
 
@@ -91,10 +116,17 @@ ASR 首次会下载 whisper 模型约 500 MB）。
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PORT` | `8080` | 服务端口 |
+| `FLOWEDGE_HOST` | `127.0.0.1` | 监听地址。设 `0.0.0.0` 对外时**必须**同时设 `FLOWEDGE_API_TOKEN`，否则拒绝启动（避免删库接口裸奔） |
+| `FLOWEDGE_API_TOKEN` | 空 | 设置后除 `/api/hooks/*`、`/api/health`、`/api/capabilities` 外均需 `Authorization: Bearer <token>` |
+| `FLOWEDGE_CORS_ORIGIN` | 空 | 跨域白名单来源。留空时仅放行本机 origin |
+| `FLOWEDGE_QUEUE_CONCURRENCY` | `2` | 任务队列并发上限（单 GPU 上并行跑两个重任务只会互相抢显存） |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 地址 |
 | `OLLAMA_MODEL` | 自动探测 | 留空时自动使用本地已装的第一个模型 |
 | `COMFYUI_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI 地址 |
-| `ASR_BASE_URL` / `TTS_BASE_URL` | 空 | 指向本地语音服务（导出脚本后自行启动） |
+| `COMFYUI_CHECKPOINT` | `flux1-schnell-fp8.safetensors` | 默认 checkpoint |
+| `COMFYUI_TEMPLATE` | 空 | 用 `data/comfy_workflows/<name>.json` 自定义工作流（占位符 `__PROMPT__` / `__WIDTH__` / `__HEIGHT__` / `__SEED__` / `__CHECKPOINT__`） |
+| `FFMPEG_PATH` | `ffmpeg` | ffmpeg 可执行文件路径 |
+| `ASR_BASE_URL` / `TTS_BASE_URL` | 空 | 指向本地语音服务（导出脚本后自行启动）。**未配置时 ASR/TTS 节点显式失败**，不会伪造结果 |
 | `FLOWEDGE_OPEN_BROWSER` | `0` | 设为 `1` 启动后自动打开浏览器 |
 | `STATIC_DIR` | 空 | 指定外部前端目录（想替换界面时用） |
 | `DB_DRIVER` | `sqlite` | 设为 `postgres` 且配置 `DB_*` 可切换 PostgreSQL |
