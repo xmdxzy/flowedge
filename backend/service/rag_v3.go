@@ -219,13 +219,15 @@ func chunkByParagraph(text string, chunkSize, overlap int) []string {
 // projectManual FlowEdge 项目手册（专属知识库种子内容）
 const projectManual = `FlowEdge 是一个面向消费级单 GPU（RTX 3090 24GB）的私有化多模态 AI 工作流引擎，对标 Dify、n8n、ComfyUI、vLLM、Temporal。全部推理在本地完成：LLM 走 Ollama，文生图走 ComfyUI，语音走 SAPI 与 faster-whisper，视频走 FFmpeg，不依赖任何云端 API。
 
-FlowEdge 支持 12 种节点类型：开始、结束、大语言模型（LLM）、文生图、语音转写（ASR）、语音合成（TTS）、视频合成、条件分支（if_else）、子工作流、HTTP 请求、数据转换、知识库检索（RAG）。节点从左侧节点库拖拽到画布，连线即数据流，同一层无依赖的节点会并行执行。
+FlowEdge 支持 13 种节点类型：开始、结束、大语言模型（LLM）、文生图、语音转写（ASR）、语音合成（TTS）、视频合成、条件分支（if_else）、循环（loop）、子工作流、HTTP 请求、数据转换、知识库检索（RAG）。节点从左侧节点库拖拽到画布，连线即数据流，同一层无依赖的节点会并行执行。
 
 断点续跑：每次执行会逐层增量保存节点状态。当某次运行失败后，修复工作流定义，再点击顶栏的「断点续跑」按钮（或调用 POST /runs/<runId>/resume），引擎会复用已成功节点的输出，只重新执行失败或未执行的节点。已成功的节点时间戳保持不变，证明其输出被直接复用。
 
 节点级重试：在节点的数据里配置 retry（重试次数，上限 5）与 retry_delay_ms（重试间隔毫秒，默认 1000）。执行失败时会自动按间隔重试，并通过 WebSocket 推送 node_retry 事件。
 
 模型与环境：LLM 使用 Ollama（本机可用 qwen2.5-coder:32b，19.9GB，首次冷装载约 6 分钟，之后常驻显存推理约 16 token/s）；文生图使用 ComfyUI 的 flux1-schnell-fp8 checkpoint（4 步、cfg 1.0，768x768 约 8 秒）；知识库 embedding 使用 bge-m3。桌面客户端为 Electron 壳，由 Go 后端统一托管 API 与前端静态资源。
+
+循环：loop 节点迭代执行另一个工作流（同样用 workflow_id 引用），有三种模式。固定次数（count）按指定次数跑，每一轮以上一轮的输出作为下一轮的输入，适合反复打磨、逐轮精炼；遍历列表（foreach）把上游文本按分隔符切成多条（默认换行），逐项喂给内层工作流，适合批量处理；条件循环（until）至少执行一轮，每轮检查输出是否满足停止条件（包含、不包含、等于、不为空），满足即停，适合「跑到成功为止」。为防止死循环，最大迭代默认 20、硬上限 100，达到上限会中止并返回已有结果，结果的 stopped_by 字段说明是哪一种停止方式（completed / exhausted / condition / max_iterations）。
 
 子工作流：sub_workflow 节点通过 workflow_id 引用另一个工作流，执行时会把上游文本注入内层的开始节点，内层结束节点的输出回传给外层下游。嵌套深度上限为 4 层，防止无限递归。`
 
