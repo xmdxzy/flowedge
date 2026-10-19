@@ -22,7 +22,9 @@
 - ✅ **显存单侧驻留**：扩散 / 语言 / 语音三类任务同一时刻只让一类驻留，换侧自动卸载并等显存真正归还
 - ✅ 代码执行节点：yaegi 解释 Go 子集，stdlib 白名单（strings/json/fmt/sort/regexp/time…），危险 import 静态拒绝
 - ✅ 图结构校验：环 / 自环 / 悬空边在**保存与执行前**拦截（Kahn 入度法，菱形 DAG 不误判）
-- ✅ 节点级超时（默认 180s，`timeout_ms` 覆盖，上限 30min）+ 结构化错误码（timeout / config_missing / cycle / retry_exhausted / cancelled）
+- ✅ 节点级超时（默认 180s，`timeout_ms` 覆盖，上限 30min；**分镜执行器按帧预算，上限 8h**）+ 结构化错误码（timeout / config_missing / cycle / retry_exhausted / cancelled）
+- ✅ **镜头级作业**：`shotlist` 每镜成功即落盘，重跑按「提示词哈希」复用已完成的镜头；
+  只重拍指定镜用 `reroll=3`（或 `1,3` / `1-3`）；每镜广播 `shot_progress`，取消会 `POST /interrupt` 打断 ComfyUI
 - ✅ 节点重试（上限 5）+ 节点级缓存（确定性节点 opt-in）
 - ✅ 循环 count / foreach / until，硬上限 100；子工作流嵌套深度 4
 
