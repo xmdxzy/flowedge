@@ -16,6 +16,7 @@ type HealthHandler struct {
 	baseDir    string
 	ollamaBase string
 	comfyBase  string
+	h3Base     string
 	asrBase    string
 	ttsBase    string
 	version    string
@@ -27,12 +28,13 @@ type NodeTypeLister interface {
 	NodeTypes() []string
 }
 
-func NewHealthHandler(gpu *service.GPUScheduler, baseDir, ollamaBase, comfyBase, asrBase, ttsBase, version string) *HealthHandler {
+func NewHealthHandler(gpu *service.GPUScheduler, baseDir, ollamaBase, comfyBase, h3Base, asrBase, ttsBase, version string) *HealthHandler {
 	return &HealthHandler{
 		gpu:        gpu,
 		baseDir:    baseDir,
 		ollamaBase: ollamaBase,
 		comfyBase:  comfyBase,
+		h3Base:     h3Base,
 		asrBase:    asrBase,
 		ttsBase:    ttsBase,
 		version:    version,
@@ -50,7 +52,7 @@ func (h *HealthHandler) Health(c *gin.Context) {
 
 // Capabilities 部署环境能力矩阵：缺什么、怎么补，一目了然
 func (h *HealthHandler) Capabilities(c *gin.Context) {
-	caps := service.ProbeCapabilities(h.gpu, h.baseDir, h.ollamaBase, h.comfyBase, h.asrBase, h.ttsBase)
+	caps := service.ProbeCapabilities(h.gpu, h.baseDir, h.ollamaBase, h.comfyBase, h.h3Base, h.asrBase, h.ttsBase)
 	payload := gin.H{
 		"capabilities":   caps,
 		"version":        h.version,

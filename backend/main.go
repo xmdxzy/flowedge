@@ -89,6 +89,9 @@ func main() {
 
 	// 多模态服务
 	comfyURL := getEnv("COMFYUI_BASE_URL", "http://localhost:8188")
+	// H3 是独立工作树 + 独立 venv，端口 8189；与主实例互斥。
+	// 能力面板必须分开探测，否则「H3 在跑」会被显示成「文生图缺失」（AGENTS §0.6）。
+	h3URL := getEnv("H3_BASE_URL", "http://127.0.0.1:8189")
 	asrURL := getEnv("ASR_BASE_URL", "")
 	ttsURL := getEnv("TTS_BASE_URL", "")
 
@@ -414,7 +417,7 @@ func main() {
 		api.GET("/ws", wsHandler.HandleWS)
 
 		// 健康检查与环境自检（部署排障用）
-		healthHandler := handler.NewHealthHandler(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, asrURL, ttsURL, version)
+		healthHandler := handler.NewHealthHandler(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL, version)
 		healthHandler.SetNodeTypeLister(engine)
 		api.GET("/health", healthHandler.Health)
 		api.GET("/capabilities", healthHandler.Capabilities)
@@ -426,7 +429,7 @@ func main() {
 	// 启动后打印一次环境自检（用户看控制台就知道还缺什么）
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		caps := service.ProbeCapabilities(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, asrURL, ttsURL)
+		caps := service.ProbeCapabilities(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
 		log.Printf("环境自检  GPU %s | LLM(Ollama) %s | 文生图(ComfyUI) %s | 视频(ffmpeg) %s | 音频(ASR+TTS) %s",
 			mark(caps.GPU.OK), mark(caps.Ollama.OK), mark(caps.ComfyUI.OK), mark(caps.FFmpeg.OK), mark(caps.ASR.OK && caps.TTS.OK))
 		if len(caps.Missing) > 0 {

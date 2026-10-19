@@ -101,17 +101,38 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
 }
 
 // 节点 → 依赖的环境能力（缺了就标灰；用户仍可先编排，环境补齐后直接跑）
+//
+// 语义必须与后端 ready 对齐（capabilities.go）：
+//   image = 主实例 8188（出图/重绘/超分）
+//   h3    = H3 实例 8189（音视频联合生成）
+//   comfy = 任一 ComfyUI 在跑（文生视频按 backend 选实例，运行期再判）
+// 把 text2video 绑在 image 上就是「H3 在跑却标灰」的根因；绑在 comfy 上才诚实。
 export const NODE_REQUIRES: Record<string, string> = {
   llm: 'llm',
+  storyboard: 'llm', // 分镜规划：纯 LLM
+  prompt_opt: 'llm', // 提示词优化：纯 LLM
+  rag_query: 'llm', // 检索需要 Ollama 做 embedding
   text2image: 'image',
+  image2image: 'image',
+  inpaint: 'image',
+  upscale: 'image',
   asr: 'audio',
   tts: 'audio',
   video_compose: 'video',
   vision: 'vision',
-  image2image: 'image',
-  inpaint: 'image',
-  upscale: 'image',
-  text2video: 'image',
+  text2video: 'comfy',
+  shotlist: 'comfy', // 分镜执行：H3 或 Wan 任一实例
+}
+
+// 能力键 → 人话（标灰时的提示文案，避免把 'image' / 'comfy' 这种键名直接甩给用户）
+export const ENV_LABEL: Record<string, string> = {
+  llm: '本地 LLM（Ollama）',
+  image: '文生图（ComfyUI 8188）',
+  h3: '音视频生成（ComfyUI-H3 8189）',
+  comfy: '任一 ComfyUI 实例',
+  audio: '语音（ASR + TTS）',
+  video: '视频合成（ffmpeg）',
+  vision: '视觉理解（VLM）',
 }
 
 // LLM 节点可用的内置工具（后端 service/tools.go 实现，全部本地执行）

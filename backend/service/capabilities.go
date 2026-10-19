@@ -27,18 +27,23 @@ type Capabilities struct {
 	GPU     Capability      `json:"gpu"`
 	Ollama  Capability      `json:"ollama"`
 	ComfyUI Capability      `json:"comfyui"`
+	ComfyH3 Capability      `json:"comfy_h3"` // H3 独立实例（音视频联合生成，端口 8189）
 	Vision  Capability      `json:"vision"`
 	FFmpeg  Capability      `json:"ffmpeg"`
 	ASR     Capability      `json:"asr"`
 	TTS     Capability      `json:"tts"`
-	Ready   map[string]bool `json:"ready"` // llm / image / audio / video
+	Ready   map[string]bool `json:"ready"` // llm / image / h3 / comfy / audio / video / vision
 	Missing []string        `json:"missing"`
 }
 
 var probeClient = &http.Client{Timeout: 1500 * time.Millisecond}
 
 // ProbeCapabilities 并发探测各项外部依赖（总耗时 ≈ 最慢一项，通常 < 1.5s）
-func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBase, ttsBase string) Capabilities {
+//
+// comfyH3Base 是 H3 工作树的独立实例（独立 venv / torch 2.14，端口 8189）。
+// 它与主实例靠 DepSpec.Exclusive 互斥，所以必须分开探测：只探 8188 会把
+// 「H3 在跑、出图不可用」误报成「出图缺失」，反方向则会把文生图标成可用。
+func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, comfyH3Base, asrBase, ttsBase string) Capabilities {
 	var (
 		wg    sync.WaitGroup
 		mu    sync.Mutex
@@ -114,6 +119,24 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBas
 			}
 		}
 		setOK(&caps.ComfyUI, c)
+	}()
+
+	// ComfyUI-H3（音视频联合生成）：另一个工作树 + 另一套 venv，端口 8189
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c := Capability{
+			Endpoint: comfyH3Base,
+			Hint:     "未连接到 ComfyUI-H3。音视频联合生成（文生视频/分镜执行）需要独立工作树 D:/AI/ComfyUI-H3：在「环境」面板一键启动，或设置 H3_BASE_URL（默认 http://127.0.0.1:8189）",
+		}
+		if comfyH3Base != "" {
+			if _, err := httpGetBody(comfyH3Base + "/system_stats"); err == nil {
+				c.OK = true
+				c.Hint = ""
+				c.Detail = "已连接（H3 音视频实例）"
+			}
+		}
+		setOK(&caps.ComfyH3, c)
 	}()
 
 	// 视觉理解（VLM）：从本地 Ollama 已装模型里找能看图的
@@ -195,10 +218,15 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBas
 
 	wg.Wait()
 
+	// image / h3 / comfy 三者语义必须分开，否则会重演两种假状态（AGENTS §0.6）：
+	//   ① H3 在 8189 跑着，界面却报「文生图缺失」；
+	//   ② 只有 H3、没有主实例，却把文生图标成可用（H3 不出图）。
 	caps.Ready = map[string]bool{
-		"llm":   caps.Ollama.OK && len(caps.Ollama.Models) > 0,
-		"image": caps.ComfyUI.OK,
-		"audio": caps.ASR.OK && caps.TTS.OK,
+		"llm":    caps.Ollama.OK && len(caps.Ollama.Models) > 0,
+		"image":  caps.ComfyUI.OK,                    // 出图/重绘/超分：必须主实例 8188
+		"h3":     caps.ComfyH3.OK,                    // 音视频联合生成：H3 实例 8189
+		"comfy":  caps.ComfyUI.OK || caps.ComfyH3.OK, // 任一实例在跑就算「有 ComfyUI」
+		"audio":  caps.ASR.OK && caps.TTS.OK,
 		"video":  caps.FFmpeg.OK,
 		"vision": caps.Vision.OK,
 	}

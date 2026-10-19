@@ -144,7 +144,7 @@ function FlowEditor() {
   // 环境就绪状态：用于把「当前跑不了」的节点标灰（仍可拖入画布，方便先编排）
   const [envReady, setEnvReady] = useState<Record<string, boolean> | null>(null)
 
-  useEffect(() => {
+  const refreshEnvReady = useCallback(() => {
     fetch('/api/capabilities')
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
@@ -152,6 +152,20 @@ function FlowEditor() {
       })
       .catch(() => {})
   }, [])
+
+  useEffect(() => {
+    refreshEnvReady()
+    // 依赖启停成功后由 DepsSection 派发事件 → 标灰状态当场刷新。
+    // 旧版只在挂载时取一次，于是「在面板里启动了 ComfyUI，左栏节点还是灰的」，
+    // 必须整页刷新才生效。窗口重新获得焦点时也补一次（应对外部手动起服务）。
+    const onEnv = () => refreshEnvReady()
+    window.addEventListener('flowedge:env-changed', onEnv)
+    window.addEventListener('focus', onEnv)
+    return () => {
+      window.removeEventListener('flowedge:env-changed', onEnv)
+      window.removeEventListener('focus', onEnv)
+    }
+  }, [refreshEnvReady])
 
   // 主题：切换写 data-theme，颜色由 CSS 变量接管
   useEffect(() => {

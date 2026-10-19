@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { PALETTE, NODE_REQUIRES } from '../config/graph'
+import { PALETTE, NODE_REQUIRES, ENV_LABEL } from '../config/graph'
 import {
   readCollapsed,
   topNodeTypes,
@@ -69,7 +69,7 @@ export default function NodePalette({ envReady, usage, onAdd, onDragStart }: Pro
       onClick={() => pick(item.type)}
       title={
         disabledOf(item.type)
-          ? `当前环境未就绪（缺 ${NODE_REQUIRES[item.type]}），可以先摆好节点，补齐环境后再运行`
+          ? `当前环境未就绪（缺 ${ENV_LABEL[NODE_REQUIRES[item.type]] ?? NODE_REQUIRES[item.type]}），可以先摆好节点，补齐环境后再运行`
           : `${item.label} · ${item.type}`
       }
       className={`fe-palette-item group flex items-center gap-2 px-2.5 py-1.5 text-left cursor-grab active:cursor-grabbing ${

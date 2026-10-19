@@ -37,6 +37,15 @@ export default function DepsSection({ onChanged }: Props) {
     }
   }, [])
 
+  // 依赖状态一变就同时通知两处：
+  //   ① 能力面板自身（ComfyUI 起来后 image 从缺失变可用）
+  //   ② 全局事件（App 重取 capabilities → 左栏标灰当场生效）
+  // 旧版只做 ①，于是「面板里启动成功、左栏节点还是灰的」，必须整页刷新。
+  const notifyChanged = useCallback(() => {
+    onChanged?.()
+    window.dispatchEvent(new CustomEvent('flowedge:env-changed'))
+  }, [onChanged])
+
   useEffect(() => {
     void load()
     return () => {
@@ -54,7 +63,7 @@ export default function DepsSection({ onChanged }: Props) {
         if (dep?.running) {
           setPending((p) => ({ ...p, [name]: false }))
           setMsg(`${dep.label} 已就绪`)
-          onChanged?.()
+          notifyChanged()
           return
         }
         if (dep?.last_error) {
@@ -66,7 +75,7 @@ export default function DepsSection({ onChanged }: Props) {
       setPending((p) => ({ ...p, [name]: false }))
       setMsg(`${name} 启动超时，请看后端控制台输出`)
     },
-    [load, onChanged],
+    [load, notifyChanged],
   )
 
   const start = async (name: string) => {
@@ -92,7 +101,7 @@ export default function DepsSection({ onChanged }: Props) {
     const d = await resp.json().catch(() => ({}))
     setMsg(resp.ok ? `${name} 已停止` : d.error || '停止失败')
     load()
-    onChanged?.()
+    notifyChanged()
   }
 
   if (items.length === 0) {
