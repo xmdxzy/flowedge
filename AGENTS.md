@@ -342,9 +342,21 @@ non_diegetic_music: N/A
   在 **7.875s** 检出切点（提示词写 `[Shot 2] At 00:07.500`）→ 「一条提示词多镜头」成立。
 - 已修的真 bug：纯音频时 `ensureRef2VAPrompt` 会写悬空的 `<Picture 1>`（图里没有 LoadImage），
   现在按实际引用描述，`ref2va_prompt_test.go` 锁住。
-- 待查（下一步）：dump ComfyUI `/history` 里实际提交的 graph，确认
-  `ref_audio_1` 是否真到节点 5、prompt 是否含 `retention_analysis … fully_copy`。
-  `ref_audios` 的类型是 `COMFY_AUTOGROW_V3`（prefix `ref_audio_`，max 3，每项 AUDIO link）。
+- **已查 /history（2026-10-19 22:40）**：接线是对的——`ref_audios: {"ref_audio_1": ["60",0]}`
+  已到节点 5，节点 60 是 `LoadAudio`，`D:\AI\ComfyUI\input\dub107.wav` 557KB / 4.458s 完好，
+  prompt 里 `retention_analysis: <Audio 1>: fully_copy` 也在。**接线、文件、提示词三样都对，音频仍未被复用。**
+- **再排除两个**：字段重复（源文本自带 `overall_soundscape` 会与追加值冲突，已修，
+  `/history` 里出现次数 2→1，仍 corr 0.166）；步数（12 步 turbo 0.166 vs 20 步非 turbo 0.092）。
+- **结论**：本实例上 `fully_copy` 不生效，不要再指望「模型自己把音轨照抄」。
+- **可行替代（已实测）**：视频侧照旧用 ref2va 出多镜头，音轨在后期 1:1 替换：
+  ```bash
+  # 关键：不要用 -shortest（音频比视频短 5ms 就会吃掉视频最后一帧，362 -> 361）
+  ffmpeg -y -i in.mp4 -i dub.wav -map 0:v -map 1:a -c:v copy -af apad -c:a aac -b:a 192k -t <视频时长> out.mp4
+  python scripts/audio-copy-check.py out.mp4 dub.wav   # 期望 peak_corr 1.0 / lag 0ms
+  ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames out.mp4
+  ```
+  实测：362 帧保住了、`peak_corr=1.0`、时长 15.084s。代价是**口型不由这段 wav 驱动**
+  （模型是照自己生成的音频动的嘴），台词与口型的一致性无保证——这条要如实写进交付说明。
 
 ### 节点用法
 `text2video` 节点填：
