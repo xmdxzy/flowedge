@@ -176,6 +176,48 @@ func ffprobeBin() string {
 }
 
 // inspectMedia 数帧 + 比对音画时长，抓「丢段」这类时长看不出来的缺陷。
+// replaceAudioTrack 用给定音轨 1:1 覆盖成片音轨，且**保证不丢帧**。
+//
+// 为什么需要它（AGENTS §5.8 ⚠）：本实例的 ref2va 不执行 fully_copy，模型会自己
+// 生成一段音频。要交付「台词跨镜连续、音景不重启」，只能后期把准备好的那条 wav
+// 铺上去——它必须整条覆盖，跨切点才不断。
+//
+// 两个必须遵守的细节：
+//  1. **不能用 -shortest**：音频比视频短几毫秒就会把视频尾帧砍掉（实测 362 → 361），
+//     而总时长只差 5ms，按「时长正常」验收永远发现不了。改用 apad 把音频补满，
+//     再按视频精确时长 -t 截断。
+//  2. 视频流用 -c:v copy：重编码既有代际损失又慢。
+//
+// 函数自己在返回前数一次帧：掉了就报错，而不是把一个少了帧的成片交出去。
+func replaceAudioTrack(video, audio string) (string, error) {
+	before, err := inspectMedia(video)
+	if err != nil {
+		return "", fmt.Errorf("替换音轨前读取视频信息失败：%w", err)
+	}
+	if before.VSeconds <= 0 {
+		return "", fmt.Errorf("替换音轨失败：读不到视频时长（%s）", video)
+	}
+	out := strings.TrimSuffix(video, filepath.Ext(video)) + "-dub.mp4"
+	cmd := exec.Command(ffmpegBin(), "-hide_banner", "-loglevel", "error", "-y",
+		"-i", video, "-i", audio,
+		"-map", "0:v", "-map", "1:a",
+		"-c:v", "copy",
+		"-af", "apad",
+		"-c:a", "aac", "-b:a", "192k",
+		"-t", fmt.Sprintf("%.3f", before.VSeconds),
+		out,
+	)
+	if b, cerr := cmd.CombinedOutput(); cerr != nil {
+		return "", fmt.Errorf("替换音轨失败：%w（%s）", cerr, strings.TrimSpace(string(b)))
+	}
+	after, aerr := inspectMedia(out)
+	if aerr == nil && before.Frames > 0 && after.Frames > 0 && after.Frames < before.Frames {
+		return "", fmt.Errorf("替换音轨后帧数从 %d 掉到 %d（音频短于视频时若用了 -shortest 就会砍尾帧）",
+			before.Frames, after.Frames)
+	}
+	return out, nil
+}
+
 func inspectMedia(path string) (mediaCheck, error) {
 	chk := mediaCheck{OK: true}
 	bin := ffprobeBin()

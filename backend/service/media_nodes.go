@@ -389,11 +389,13 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 				final = final2
 			}
 		}
-		return map[string]interface{}{
+		out := map[string]interface{}{
 			"video": final, "kind": "video", "text": prompt,
 			"segments": segs, "parts": parts, "beats": beats,
 			"duration_sec": float64(segs) * float64(req.Frames) / 24.0,
-		}, nil
+		}
+		out["video"] = muxPreparedAudio(node, final, out)
+		return out, nil
 	}
 
 	path, kindRet, err := e.t2i.GenerateMedia(req)
@@ -416,7 +418,34 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	if optimize {
 		out["original_prompt"] = original
 	}
+	out["video"] = muxPreparedAudio(node, path, out)
 	return out, nil
+}
+
+// muxPreparedAudio 节点给了 audio_track 就用它 1:1 覆盖成片音轨（见 AGENTS §5.8 ⚠）。
+//
+// 为什么不让模型自己做：实测本实例的 ref2va 不执行 fully_copy，音轨总是模型重新生成的。
+// 要保证「台词跨镜连续、音景不重启」，最可靠的是把准备好的一条 wav 整条铺上去。
+// 失败不阻断出片：把原因挂到 audio_muxed/audio_error 上，成片照旧返回。
+func muxPreparedAudio(node *model.NodeInstance, video string, out map[string]interface{}) string {
+	audio := ""
+	if node != nil {
+		if s, ok := node.Data["audio_track"].(string); ok {
+			audio = strings.TrimSpace(s)
+		}
+	}
+	if audio == "" {
+		return video
+	}
+	merged, err := replaceAudioTrack(video, audio)
+	if err != nil {
+		out["audio_muxed"] = false
+		out["audio_error"] = err.Error()
+		return video
+	}
+	out["audio_muxed"] = true
+	out["audio_track"] = audio
+	return merged
 }
 
 // stringList 读取"多值路径"字段：支持换行/分号分隔的字符串，也支持 JSON 数组。

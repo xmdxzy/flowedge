@@ -99,7 +99,7 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   image2image: ['image', 'kind', 'source', 'strength'],
   inpaint: ['image', 'kind', 'source', 'mask'],
   upscale: ['image', 'kind', 'source', 'width', 'height'],
-  text2video: ['video', 'kind', 'text', 'original_prompt', 'beats', 'parts', 'segments'],
+  text2video: ['video', 'kind', 'text', 'original_prompt', 'beats', 'parts', 'segments', 'audio_muxed', 'audio_track', 'audio_error'],
 }
 
 // 节点 → 依赖的环境能力（缺了就标灰；用户仍可先编排，环境补齐后直接跑）

@@ -2238,11 +2238,11 @@ function FlowEditor() {
                         checked={selectedNode.data.turbo !== false}
                         onChange={(e) => {
                           updateSelectedNodeData('turbo', e.target.checked)
-                          // turbo 蒸馏后 8 步就够；不带 turbo 才需要 20 步
-                          updateSelectedNodeData('steps', e.target.checked ? 8 : 20)
+                          // AGENTS §5.7：音频比画面晚收敛，8 步会乱语；turbo 12 步、非 turbo 20 步
+                          updateSelectedNodeData('steps', e.target.checked ? 12 : 20)
                         }}
                       />
-                      涡轮 LoRA（20 步 → 8 步，约 2.5 倍速；长片必开）
+                      涡轮 LoRA（20 步 → 12 步，约 1.6 倍速；步数低于 12 音频会乱语，长片必开）
                     </label>
                     <label className="flex items-center gap-2 text-[11px] text-gray-400">
                       <input
@@ -2262,6 +2262,48 @@ function FlowEditor() {
                         onChange={(e) => updateSelectedNodeData('segments', Number(e.target.value) || 1)}
                         className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
                       />
+                    </div>
+                  </div>
+                )}
+                {selectedNode.type === 'text2video' && selectedNode.data.backend === 'h3' && (
+                  <div className="flex flex-col gap-2 pt-2 border-t border-border">
+                    <div>
+                      <label className="text-[11px] text-gray-400 block mb-1">
+                        念稿音轨 ref_audio（给了就走 ref2va 台词模式）
+                      </label>
+                      <input
+                        value={(selectedNode.data.ref_audio as string) || ''}
+                        onChange={(e) => updateSelectedNodeData('ref_audio', e.target.value)}
+                        placeholder="dub.wav 绝对路径；留空 = 模型联合生成音频"
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-gray-400 block mb-1">
+                        参考图 ref_images（锁角色外貌，每行一条，≤9）
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={(selectedNode.data.ref_images as string) || ''}
+                        onChange={(e) => updateSelectedNodeData('ref_images', e.target.value)}
+                        placeholder="定妆图路径，换行分隔"
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs font-mono resize-y"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-gray-400 block mb-1">
+                        最终音轨 audio_track（出片后 1:1 覆盖，保证不丢帧）
+                      </label>
+                      <input
+                        value={(selectedNode.data.audio_track as string) || ''}
+                        onChange={(e) => updateSelectedNodeData('audio_track', e.target.value)}
+                        placeholder="留空 = 用模型生成的音轨"
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs font-mono"
+                      />
+                      <p className="text-[10px] text-gray-500 mt-1">
+                        实测本机 ref2va 不执行 fully_copy、音轨会被重新生成。要让台词跨镜连续、
+                        音景不重启，把同一段 wav 填这里；代价是口型不再与它同步。
+                      </p>
                     </div>
                   </div>
                 )}
@@ -2557,7 +2599,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'upscale':
       return { prompt: '', image_path: '', model: 'RealESRGAN_x4plus.pth' }
     case 'text2video':
-      return { prompt: '', backend: 'wan', width: 832, height: 480, frames: 33, fps: 16, steps: 20, negative: '', low_vram: false, segments: 1, interp: false, prompt_opt: true, turbo: true }
+      return { prompt: '', backend: 'wan', width: 832, height: 480, frames: 33, fps: 16, steps: 20, negative: '', low_vram: false, segments: 1, interp: false, prompt_opt: true, turbo: true, ref_audio: '', ref_images: '', audio_track: '' }
     case 'select':
       return { images: '', reference: '', criteria: '', threshold: 60, model: '' }
     case 'note':
