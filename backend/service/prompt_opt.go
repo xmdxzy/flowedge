@@ -77,8 +77,12 @@ func ensureRef2VAPrompt(prompt string, nImg, nAud int) string {
 	for j := 1; j <= nAud; j++ {
 		parts = append(parts, fmt.Sprintf("<Audio %d> is the spoken performance to be lip-synced.", j))
 	}
+	// 只有音频、没有参考图时，绝不能补一句 "<Picture 1> ..."：
+	// 图里根本没有 LoadImage 节点，模型会看到指向不存在输入的 <Picture 1>，
+	// 于是不认"照抄音频"，退化成自己造一段伪中文（实测 2026-10-19 22:11）。
+	// 参考图也没有时退回最保守的一句话，不再引用任何 <Picture N>。
 	if len(parts) == 0 {
-		parts = append(parts, "<Picture 1> defines the visual identity of the characters in the shot.")
+		parts = append(parts, "The target clip is generated from the text description alone.")
 	}
 	b.WriteString(strings.Join(parts, " "))
 	b.WriteString("\n")
