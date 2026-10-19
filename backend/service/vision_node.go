@@ -57,11 +57,44 @@ func (e *EngineV2) execVisionNode(ctx context.Context, node *model.NodeInstance,
 		return nil, fmt.Errorf("vision 节点没有图片输入：连一条来自文生图 / 聚合节点的线，或在配置里填图片路径")
 	}
 
-	modelName, _ := node.Data["model"].(string)
-	if e.llm == nil {
-		return nil, fmt.Errorf("视觉模型不可用：LLM 服务未初始化")
+	modelName, merr := e.resolveVisionModel(node)
+	if merr != nil {
+		return nil, merr
 	}
-	modelName = strings.TrimSpace(modelName)
+
+	// 参考主题：告诉模型「这张图本来该画什么」。
+	// 不给的话它只能按画面自评，结论与主题无关——AGENTS §6 记的老坑。
+	if reference := referenceFrom(node, upstream); reference != "" {
+		prompt = prompt + "\n\n参考主题（原本要求画的内容）：" + reference +
+			"\n请先判断图片是否与参考主题一致，不一致时明确指出差在哪里。"
+	}
+
+	text, usage, err := e.llm.VisionChat(prompt, images, modelName)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"text":      text,
+		"model":     modelName,
+		"images":    len(images),
+		"tokens":    usage.PromptTokens + usage.CompletionTokens,
+		"reference": referenceFrom(node, upstream),
+	}, nil
+}
+
+// resolveVisionModel 统一解析视觉模型：节点指定 > 启动探测 > 现探。
+// 抽出来给 vision 与 select 共用，避免两处各写一份「探测为空怎么办」。
+func (e *EngineV2) resolveVisionModel(node *model.NodeInstance) (string, error) {
+	if e == nil || e.llm == nil {
+		return "", fmt.Errorf("视觉模型不可用：LLM 服务未初始化")
+	}
+	modelName := ""
+	if node != nil {
+		if s, ok := node.Data["model"].(string); ok {
+			modelName = strings.TrimSpace(s)
+		}
+	}
 	if modelName == "" {
 		modelName = e.visionModel
 	}
@@ -73,20 +106,14 @@ func (e *EngineV2) execVisionNode(ctx context.Context, node *model.NodeInstance,
 		}
 	}
 	if modelName == "" {
-		return nil, fmt.Errorf("没有可用的视觉模型：先拉一个 VL 模型（如 ollama pull qwen2.5vl:7b）")
+		// 归类为 config_missing 而不是 execution_error：这是「依赖没装」，
+		// 界面据此给「打开环境面板」的修复动作，而不是让用户对着不知道什么意思的报错发呆。
+		return "", &nodeExecError{
+			Code: model.ErrorCodeConfigMissing,
+			Err:  fmt.Errorf("没有可用的视觉模型：先拉一个 VL 模型（ollama pull qwen2.5vl:7b，约 6GB）"),
+		}
 	}
-
-	text, usage, err := e.llm.VisionChat(prompt, images, modelName)
-	if err != nil {
-		return nil, err
-	}
-
-	return map[string]interface{}{
-		"text":   text,
-		"model":  modelName,
-		"images": len(images),
-		"tokens": usage.PromptTokens + usage.CompletionTokens,
-	}, nil
+	return modelName, nil
 }
 
 func looksLikeImagePath(s string) bool {

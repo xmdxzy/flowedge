@@ -322,7 +322,8 @@ ollama pull qwen2.5:7b
 | 分镜规划 | ai | 剧本 → 结构化分镜表（景别/角度/轴线/运镜/动作/声音/台词/衔接），时长按内容给 |
 | 分镜执行器 | ai | 逐镜生成 + ASR 音频抽检 + 按 cut/continue/dissolve 装配 + 响度归一 |
 | 视频插帧 | ai | 出片后帧率翻倍（Wan 16→32 / H3 24→48），ffmpeg minterpolate，**CPU 完成、不占显存** |
-| 视觉理解 | ai | 图片 + 提问 → 文字（本地 VLM，走 Ollama /api/chat） |
+| 视觉理解 | ai | 图片 + 提问 → 文字（本地 VLM，走 Ollama /api/chat）；支持「参考主题」入参，判断是否与要求一致 |
+| 择优挑选 | ai | K 个候选图 → VLM 逐个打分（0–100）→ 只输出最高分那张；单候选不打分（省一次换侧） |
 | 代码执行 | data | yaegi 跑 Go 子集，stdlib 白名单 |
 | 结束 | control | 输出最终结果 |
 

@@ -359,11 +359,15 @@ node <序策>/scripts/flow-cli.cjs run graph "content/01-H3音视频-台词氛�
   "frames":107,"work_dir":"...","expect_line":"这件事我其实早就知道了"}'
 ```
 
-### 四个必踩的坑（都已在图/脚本里规避）
+### 六个必踩的坑（都已在图/脚本里规避）
 1. **传参要平铺**：`'{"brief_file":...}'`，不要包一层 `{"input":{...}}`——否则 `run.input` 多一层，插值全空，路由静默走兜底。
 2. **下游节点不能用 `{{input.x}}`**：那只在触发节点有效，后续拿到的是上游输出。一律用 `{{vars.x}}`（吸收输入里的标量）。
 3. **shell 节点别传中文路径**：`cmd.exe` 转码会把 `运行\...` 弄坏。路径处理放进 Python 脚本内部（`--report-dir`），不要 shell 再转一手。
 4. **`write` 执行器有路径沙箱**（只能写序策项目内）：跨目录落盘用 shell + 脚本。
+5. **别在 cmd 里传可能为空的数值参数**：`--steps "{{vars.steps}}"` 在没传 steps 时渲染成 `--steps ""`，
+   argparse 直接 `invalid int value: ''`，整步失败。可选参数一律由 plan 声明，图里不传。
+6. **plan 里的相对路径按 plan 文件所在目录解析**：把 plan 复制到别的层级，`characters`
+   会指到不存在的目录。跨目录复用 plan 时改绝对路径。
 
 ### 验收门
 - 台词模式：`verify-media --asr --expect "<原话>" --gate` —— ASR 必须转出脚本原话
@@ -372,22 +376,38 @@ node <序策>/scripts/flow-cli.cjs run graph "content/01-H3音视频-台词氛�
 
 ## 5.10 多段成片与角色一致性（2026-10-19 实战：30 秒金丹斗法）
 
-### 分段：按内容给时长，不要均分
+### 先设计门，再开机（2026-10-19 定，覆盖一切"固定秒数"建议）
 
-**不要为了凑总时长把每段都设成同一个数**——这是我犯过的省事错误，代价是节奏被削平：
-对峙和收招用不了 10 秒，交锋却需要更长。
+**「每镜多少秒」没有恒定答案。** 我犯过两次同类错误（均分 5 秒、均分 10 秒），
+根因都是拿一个固定数字去凑总长。现在改成机制：**每条片子开工前必须先写 `plan.gates`，
+由 `scripts/film-gates.py` 机械校验，不自洽就不许出片。**
 
-做法：先按叙事功能定时长 → 吸附 `17k+5` 网格 → 核对 `sum(frames)/24 − 0.2×(段数−1)`。
+五层门：`timing`（总长/容差/单镜最短最长/各段权重）、`identity`（定妆图数/每段带参考图/<Picture N>）、
+`audio`（台词必须转出、氛围必须无人声、响度区间、静音缺口、段级重试）、
+`technical`（分辨率/帧率/音画漂移/接缝）、`budget`（总墙钟/单段墙钟/超限动作）。
 
-| 叙事功能 | 时长 | 帧数 |
-|---|---|---|
-| 建立/定场 | 6–8s | 158 / 175 / 192 |
-| 对话单回合 | 6–10s | 158 / 192 / 226 |
-| 交锋主体 | 11–15s | 277 / 294 / 328 / 362 |
-| 收招定格 | 9–11s | 226 / 243 / 260 |
+```bash
+# 1) 只给「总时长 + 各段叙事功能与权重」，脚本按比例分配并吸附 17k+5
+python scripts/film-gates.py plan --seconds 30 \
+    --beats setup=1.0,clash=1.35,finish=1.2 \
+    --modes dialogue,ambience,dialogue --lines-per-seg 1,0,2 --stills 2 --budget 1500
+# 2) 按本片内容改写草案（改门，不要直接改帧数）
+# 3) 验门（shot-film.py 会自动跑；不过则拒绝开机）
+python scripts/film-gates.py check --plan data/film/jindan/plan.json
+```
 
-30 秒三段的实际分配（优于均分）：192 + 277 + 260 = **29.98s**。
-`shot-film.py` 支持每段 `frames`，并会核对总长（差 >0.75s 告警）。
+门能抓的（实测反例）：段缩短但切点没前移 → `shot_too_short`（某镜 −0.2s）；
+台词表与 `<d>` 不一致 → `line_mismatch`；`<Picture 5>` 但只有 2 张 → `picture_overflow`。
+
+权重怎么定：问「这段承担多少叙事重量」，不问「该多少秒」。
+内容写不进去（镜头挤在一段）→ 加权重；观众会走神（一段只有环境声）→ 减权重。
+
+起点参考（默认值，**不是结论**）：建立 6–8s / 对话 6–10s / 交锋 11–15s / 收招 9–11s。
+30 秒实战取值：192 + 277 + 260 = **29.98s**（`min_shot=1.2`、`max_shot=4.5`、预算 1500s，
+实际墙钟 640s）。改任何一条都要能说出依据，写进 gates 的注释或 profile 名。
+
+**段级门**：`shot-film.py` 每段出片后立刻验（台词段 `--asr --expect`、氛围段 `--asr --no-speech`），
+不合门按 `audio.segment_retry` 重跑，仍不过才放弃——早失败只浪费一段，不是整片。
 
 ### 角色一致性：靠文生图定妆，不靠文字
 1. flux 出角色定妆图（正面、干净背景、露法器与服装特征）
@@ -419,11 +439,38 @@ node <序策>/scripts/flow-cli.cjs run graph "content/01-H3音视频-台词氛�
 | 3 | 260 | 台词（2 句） | 226s |
 合计 729 帧 ≈ **10.7 分钟** + 装配 1 分钟。单帧约 0.85–0.93s。
 同一批曾出现单段 556s（异常争用），**按 3–5 分钟/段估并留一次异常余量**。
+`budget.wall_seconds_max` 就是拿这组数当基准定的，超了按 `on_exceed` 处理。
+
+### 门必须有牙齿（2026-10-19 冒烟验证）
+
+只有"能拦住"的门才算门。实测三条：
+- 同一片段 `--max-silence 1.0` → WARN 通过；`--max-silence 0.8` → `FAIL silence_gap 0.92s（门上限 0.8s）`
+- 台词模式漏传 `--expect` → `--require-expect` 直接 FAIL（以前会静默通过）
+- plan 段缩到 141 帧但切点没前移 → `FAIL shot_too_short`（某镜 −0.2s）
+
+**门不要设成你以为的"高标准"**：3 秒测试片只有一句「站住」，剩余静音 0.92s，
+门设 0.8 会判它不合格——这是误判，正解是给 `dub-track.py` 混环境底噪，不是放宽门。
+已交付的 30 秒片在 0.8s 门下 OK（有音效填满），说明门值要按片子解释，不能跨片照搬。
 
 ### 一键复现
 ```bash
-python scripts/shot-film.py --plan data/film/jindan/plan.json
+python scripts/film-gates.py check --plan data/film/jindan/plan.json   # 先验门（不自洽就不必开机）
+python scripts/shot-film.py --plan data/film/jindan/plan.json          # 内部会再验一次
 ```
+
+### 预置门 profile（`film-gates.py plan --profile <name>`）
+
+| profile | min_shot | max_shot | 容差 | 重试 | 静音缺口 | 超预算 |
+|---|---|---|---|---|---|---|
+| `narrative` 默认 | 1.2 | 4.5 | 0.75 | 1 | 1.0 | warn |
+| `quick-cut` 快切 | 0.8 | 2.5 | 0.4 | 1 | 0.6 | warn |
+| `long-take` 长镜 | 2.0 | 不限 | 1.0 | 1 | 1.2 | warn |
+| `dialogue` 对话戏 | 1.5 | 6.0 | 0.75 | 2 | 0.8 | warn |
+| `batch-night` 夜间批跑 | 1.0 | 5.0 | 0.75 | 0 | 1.0 | **fail** |
+| `ambience-only` 纯氛围 | 1.5 | 6.0 | 0.75 | 1 | 0.7 | warn |
+
+叠加顺序 `DEFAULT < PROFILE < 本片 gates < 命令行显式参数`，所以 `--min-shot` 之类默认必须是
+`None`——给个 1.2 的默认值会把 profile 静默盖掉（当场踩过）。
 序策图：`content/02-H3多段成片-定妆图锁角色`（trigger → shot-film → 门 → 人工签收）
 
 ## 6. 已知不可用（别重复投入）
@@ -432,7 +479,7 @@ python scripts/shot-film.py --plan data/film/jindan/plan.json
 |---|---|---|
 | ~~minimax_h3~~ | **可用** | 必须走 `D://AI//ComfyUI-H3` 独立工作树 + 独立 venv（torch 2.14）；默认实例（torch 2.6）跑同图会 OOM |
 | qwen_image_2.1 出图 | 不可用 | VAE 被误判成 WanVAE（4 vs 12 通道），0.29/0.31 都没修 |
-| VLM 主题一致性质检 | 部分 | 视觉节点拿不到上游 start 的 prompt；需加「参考主题」入参 |
+| ~~VLM 主题一致性质检~~ | **已补齐** | vision 节点支持「参考主题」入参（节点填，或自动取上游 prompt/original_prompt），不再按画面自评；新增 `select` 择优节点：K 个候选 → VLM 逐个打分 → 取最高。缺 VL 模型时报 `config_missing`（界面给「打开环境面板」） |
 
 ## 7. 构建与验证
 

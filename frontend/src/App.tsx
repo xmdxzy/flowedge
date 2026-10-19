@@ -89,6 +89,7 @@ const nodeTypes: NodeTypes = {
   code: CodeNode,
   aggregate: AggregateNode,
   vision: VisionNode,
+  select: EditNode,
   storyboard: TransformNode,
   shotlist: EditNode,
   image2image: EditNode,
@@ -2289,6 +2290,68 @@ function FlowEditor() {
               </div>
             )}
 
+            {selectedNode.type === 'select' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">参考主题（这张图本来该画什么）</label>
+                  <textarea
+                    rows={2}
+                    value={(selectedNode.data.reference as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('reference', e.target.value)}
+                    placeholder="留空 = 自动取上游的 prompt / original_prompt"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                  />
+                  <p className="text-[10px] text-gray-500 mt-1">
+                    不给参考主题，模型只能按画面自评，结论会和你的要求无关。
+                  </p>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">额外要求（可选）</label>
+                  <input
+                    value={(selectedNode.data.criteria as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('criteria', e.target.value)}
+                    placeholder="例如：不要出现文字；人物必须朝左"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">采用阈值</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={(selectedNode.data.threshold as number) ?? 60}
+                      onChange={(e) => updateSelectedNodeData('threshold', Number(e.target.value) || 0)}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">视觉模型（留空自动挑）</label>
+                    <input
+                      value={(selectedNode.data.model as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('model', e.target.value)}
+                      placeholder="qwen2.5vl:7b"
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">候选图路径（可选，每行一条）</label>
+                  <textarea
+                    rows={3}
+                    value={(selectedNode.data.images as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('images', e.target.value)}
+                    placeholder="留空 = 收上游 image / images / values"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono resize-y"
+                  />
+                </div>
+                <p className="text-[10px] text-gray-500">
+                  用法：文生图 batch=3 → 择优挑选 → 下游只拿最高分那张。只有 1 张候选时不打分（省一次换侧）。
+                </p>
+              </div>
+            )}
+
             {selectedNode.type === 'vision' && (
               <div className="flex flex-col gap-3">
                 <div>
@@ -2495,6 +2558,8 @@ function getDefaultNodeData(type: string): Record<string, any> {
       return { prompt: '', image_path: '', model: 'RealESRGAN_x4plus.pth' }
     case 'text2video':
       return { prompt: '', backend: 'wan', width: 832, height: 480, frames: 33, fps: 16, steps: 20, negative: '', low_vram: false, segments: 1, interp: false, prompt_opt: true, turbo: true }
+    case 'select':
+      return { images: '', reference: '', criteria: '', threshold: 60, model: '' }
     case 'note':
       return { text: '' }
     case 'group':

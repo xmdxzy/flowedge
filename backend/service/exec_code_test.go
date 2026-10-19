@@ -14,9 +14,9 @@ func TestNodeRegistry_HasAllBuiltins(t *testing.T) {
 	types := eng.NodeTypes()
 	want := []string{
 		"aggregate", "asr", "code", "data_transform", "end", "http_request", "if_else",
-		"image2image", "inpaint", "llm", "loop", "prompt_opt", "rag_query", "shotlist",
-		"start", "storyboard", "sub_workflow", "text2image", "text2video", "tts", "upscale",
-		"video_compose", "vision",
+		"image2image", "inpaint", "llm", "loop", "prompt_opt", "rag_query", "select",
+		"shotlist", "start", "storyboard", "sub_workflow", "text2image", "text2video",
+		"tts", "upscale", "video_compose", "vision",
 	}
 	if len(types) != len(want) {
 		t.Fatalf("registered %d types, want %d: %v", len(types), len(want), types)

@@ -49,6 +49,7 @@ export const PALETTE: PaletteSection[] = [
       { type: 'asr', label: '语音转写', icon: '♪', tone: 'tone-multimodal' },
       { type: 'tts', label: '语音合成', icon: '◍', tone: 'tone-multimodal' },
       { type: 'vision', label: '视觉理解', icon: '◉', tone: 'tone-multimodal' },
+      { type: 'select', label: '择优挑选', icon: '⌁', tone: 'tone-ai' },
       { type: 'prompt_opt', label: '提示词优化', icon: '✧', tone: 'tone-ai' },
     ],
   },
@@ -90,7 +91,8 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   rag_query: ['text', 'context', 'sources', 'hits'],
   code: ['text', 'code_out'],
   aggregate: ['text', 'count', 'values', 'nodes', 'aggregate'],
-  vision: ['text', 'model', 'images', 'tokens'],
+  vision: ['text', 'model', 'images', 'tokens', 'reference'],
+  select: ['image', 'score', 'passed', 'threshold', 'picked', 'candidates', 'note'],
   prompt_opt: ['text', 'original', 'mode'],
   storyboard: ['text', 'plan', 'shots', 'title', 'style'],
   shotlist: ['video', 'kind', 'text', 'shots', 'seconds', 'detail'],
@@ -120,6 +122,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   tts: 'audio',
   video_compose: 'video',
   vision: 'vision',
+  select: 'vision', // 择优要靠 VLM 打分
   text2video: 'comfy',
   shotlist: 'comfy', // 分镜执行：H3 或 Wan 任一实例
 }

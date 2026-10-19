@@ -872,6 +872,7 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"loop":           e.execLoopNode,
 		"aggregate":      plain(e.execAggregateNode),
 		"vision":         e.execVisionNode,
+		"select":         e.execSelectNode,
 		"prompt_opt":     e.execPromptOptNode,
 		"storyboard":     e.execStoryboardNode,
 		"shotlist":       e.execShotListNode,
