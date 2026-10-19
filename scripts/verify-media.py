@@ -288,7 +288,8 @@ def verify(path: str, want_asr: bool, frames_dir: str | None, expect: str = "",
                     ))
                 else:
                     info["asr_text"] = text
-                    if len(text) >= 2:
+                    # --expect 是念稿核对模式：有人声是预期内的，不再报"乱语"
+                    if len(text) >= 2 and not expect:
                         issues.append((
                             FAIL if no_speech else WARN, "speech_detected",
                             f"检测到人声/疑似乱语：「{text[:60]}」——若本片无对白，需压音或重跑",

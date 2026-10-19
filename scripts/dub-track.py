@@ -195,7 +195,9 @@ def main() -> int:
     outdir = os.path.dirname(os.path.abspath(args.out))
     if outdir:
         os.makedirs(outdir, exist_ok=True)
+    # 限幅：TTS 原始峰值常顶到 0dB，fully_copy 会把这个削波原样带进成片
     code, out = run([FFMPEG, "-y", "-v", "error", "-i", final,
+                     "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
                      "-ar", str(OUT_RATE), "-ac", "2", "-c:a", "pcm_s16le", args.out])
     if code != 0:
         print(json.dumps({"ok": False, "error": "写出失败", "detail": out[:400]}, ensure_ascii=False))

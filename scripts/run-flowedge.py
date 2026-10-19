@@ -78,6 +78,42 @@ def ensure_h3(need_audio: bool) -> str:
     return ""
 
 
+
+def strip_dialogue_for_ambience(prompt: str) -> str:
+    """把带台词的剧本改成"无声版"，并补齐三段式声音字段。
+
+    两个坑（都踩过）：
+      1. 只删 <d> 块，会留下 "and says:" —— 模型照样开口；
+         要把「says + 说话人 + <d>」整段换成 stays silent。
+      2. 不补 overall_soundscape 字段，模型会自行脑补（含人声）。
+    """
+    import re as _re
+
+    # 1) "and says: (S1) ... <d>...</d>" → "stays silent"
+    prompt = _re.sub(r"(?:,?\s*and\s+)?says?:?\s*\(S\d+(?:,S\d+)*\)[^<]*<d>.*?</d>",
+                     ", and stays silent. ", prompt, flags=_re.S | _re.I)
+    # 2) 残余的说话人 + <d> 块（没有 says 连接词的情况）
+    prompt = _re.sub(r"\(S\d+(?:,S\d+)*\)[^<]*<d>.*?</d>", "", prompt, flags=_re.S)
+    # 3) 收尾动作里可能还留着"说完闭上嘴"，保留即可（正向描述）
+    prompt = _re.sub(r"\s{2,}", " ", prompt).strip()
+
+    # 4) 口型事实必须先写进画面描述，否则会拼到声音字段那一行（踩过）
+    if "lips stay closed" not in prompt.lower():
+        prompt = prompt.rstrip() + " Lips stay closed and still, jaw tight, breath audible through the nose."
+
+    # 5) 补齐官方三段式：空字段 = 模型自行脑补
+    low = prompt.lower()
+    if "overall_soundscape" not in low:
+        if "integrated_multimodal_description" not in low:
+            prompt = "integrated_multimodal_description: " + prompt
+        prompt += ("\noverall_soundscape: Continuous ambient sound of the setting, "
+                   "mixed with the physical sounds of the visible action; the only sound "
+                   "sources are the environment and what is visibly happening.")
+    if "non_diegetic_music" not in low:
+        prompt += "\nnon_diegetic_music: N/A"
+    return prompt
+
+
 def build_workflow(args, prompt: str) -> dict:
     dialogue = args.mode == "dialogue" or (args.mode == "auto" and args.audio)
     data = {
@@ -93,20 +129,15 @@ def build_workflow(args, prompt: str) -> dict:
         "segments": 1,
         "interp": False,
     }
+    # 参考图两模式都要：这是跨段角色一致性的唯一硬约束
+    if args.images:
+        data["ref_images"] = args.images.replace(";", "\n")
     if dialogue:
         if not args.audio or not os.path.isfile(args.audio):
             raise SystemExit("台词模式需要 --audio 指向念稿 wav（先跑 dub-track.py）")
         data["ref_audio"] = os.path.abspath(args.audio)
-        if args.images:
-            data["ref_images"] = args.images.replace(";", "\n")
     else:
-        # 氛围模式：同一份剧本也能切成"无台词版"——把 <d> 台词段剥掉，
-        # 换成口型可见事实（cfg=1 无负分支，否定词不管用）。
-        import re as _re
-        prompt = _re.sub(r"\(S\d+(?:,S\d+)*\)[^<]*<d>.*?</d>", "", prompt, flags=_re.S)
-        prompt = _re.sub(r"\s{2,}", " ", prompt).strip()
-        if "lips stay closed" not in prompt.lower():
-            prompt += " Lips stay closed and still, jaw tight, breath audible through the nose."
+        prompt = strip_dialogue_for_ambience(prompt)
     return {
         "name": f"run-flowedge-{int(time.time())}",
         "nodes": [
@@ -131,6 +162,9 @@ def main() -> int:
     ap.add_argument("--frames", type=int, default=107, help="必须落在 17k+5；107≈4.46s / 124≈5.17s")
     ap.add_argument("--fps", type=int, default=24)
     ap.add_argument("--steps", type=int, default=12)
+    ap.add_argument("--report-dir", default="",
+                    help="可选：把 report.json 写到该目录。由本脚本内部写盘——"
+                         "中文路径经 cmd.exe 传参会乱码，不能靠 shell 再转一手")
     ap.add_argument("--turbo", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -203,9 +237,24 @@ def main() -> int:
                           "video": video}, ensure_ascii=False))
         return 2
 
+    # 报告在本进程内写盘：避免把中文路径再传回 cmd.exe
+    if seconds is None:
+        seconds = round(args.frames / float(args.fps), 3)
+    report = {"mode": mode, "video": os.path.abspath(video), "seconds": seconds,
+              "check_ok": check_ok, "run_id": rid, "frames": args.frames,
+              "steps": args.steps}
+    if args.report_dir:
+        try:
+            os.makedirs(args.report_dir, exist_ok=True)
+            with open(os.path.join(args.report_dir, "report.json"), "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            report["report"] = os.path.join(os.path.abspath(args.report_dir), "report.json")
+        except Exception as e:  # 报告写失败不影响成片，但要说出来
+            report["report_error"] = str(e)
+
     print(json.dumps({"ok": True, "mode": mode, "video": os.path.abspath(video),
-                      "seconds": seconds, "check_ok": check_ok, "run_id": rid},
-                     ensure_ascii=False))
+                      "seconds": seconds, "check_ok": check_ok, "run_id": rid,
+                      "report": report.get("report", "")}, ensure_ascii=False))
     return 0
 
 

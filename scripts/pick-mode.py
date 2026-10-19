@@ -48,9 +48,6 @@ def main() -> int:
     if mode in ("dialogue", "ambience"):
         print(mode)
         return 0
-    if False:
-        print(args.mode)
-        return 0
     print("dialogue" if has_lines(args.lines_file) else "ambience")
     return 0
 
