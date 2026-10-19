@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { toast } from './Toast'
+import { hintFor } from '../lib/errorHints'
 
 interface RunRecord {
   id: number
@@ -133,7 +135,7 @@ export default function ExecutionPanel({ workflowId }: { workflowId?: number }) 
       const resp = await fetch(`/api/runs/${run.id}/cancel`, { method: 'POST' })
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({}))
-        alert(data.error || '取消失败')
+        toast(data.error || '取消失败', 'error')
       }
       loadRuns()
     } finally {
@@ -150,14 +152,14 @@ export default function ExecutionPanel({ workflowId }: { workflowId?: number }) 
       })
       if (!resp.ok) {
         const d = await resp.json().catch(() => ({}))
-        alert(d.error || '重跑失败')
+        toast(d.error || '重跑失败', 'error')
         return
       }
       loadRuns()
       const timer = setTimeout(() => openRun(run), 600)
       return () => clearTimeout(timer)
     } catch (err) {
-      alert('重跑失败：' + err)
+      toast('重跑失败：' + err, 'error')
     }
   }
 
@@ -250,7 +252,7 @@ export default function ExecutionPanel({ workflowId }: { workflowId?: number }) 
                     const style = STATUS_STYLE[n.status] || STATUS_STYLE.pending
                     const pct = totalMs > 0 ? Math.max(3, (ms / totalMs) * 100) : 3
                     return (
-                      <div key={n.id} title={n.error || n.error_code || ''}>
+                      <div key={n.id} title={n.error ? `${hintFor(n.error_code).title}：${hintFor(n.error_code).detail}\n\n${n.error}` : hintFor(n.error_code).title}>
                         <div className="flex items-center gap-1.5">
                           <span className="text-[9px] text-gray-400 truncate max-w-[86px]">{n.id}</span>
                           <span className="text-[9px] text-gray-600">{n.type}</span>

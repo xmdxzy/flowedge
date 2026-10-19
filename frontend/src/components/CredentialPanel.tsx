@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { confirmDialog } from './Toast'
 
 interface MaskedCredential {
   name: string
@@ -77,7 +78,11 @@ export default function CredentialPanel({ onClose }: Props) {
   }
 
   const remove = async (n: string) => {
-    if (!confirm(`删除凭据 ${n}？引用它的 HTTP 节点会开始报错。`)) return
+    const ok = await confirmDialog(`删除凭据 ${n}？引用它的 HTTP 节点会开始报错。`, {
+      title: '删除凭据',
+      okText: '删除',
+    })
+    if (!ok) return
     await fetch(`/api/credentials/${encodeURIComponent(n)}`, { method: 'DELETE' })
     load()
   }

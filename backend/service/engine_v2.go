@@ -108,8 +108,7 @@ func (e *nodeExecError) Error() string { return e.Err.Error() }
 func (e *nodeExecError) Unwrap() error { return e.Err }
 
 // classifyError 把执行错误归类为稳定错误码，供 UI 与告警消费
-func classifyError(err error) string {
-	if err == nil {
+func classifyError(err error) string {	if err == nil {
 		return ""
 	}
 	var ne *nodeExecError
@@ -121,6 +120,9 @@ func classifyError(err error) string {
 	}
 	return model.ErrorCodeExecution
 }
+
+// ErrorCodeOf 导出给 handler 层判断语义用（例如「主动中止 ≠ 失败」）。
+func ErrorCodeOf(err error) string { return classifyError(err) }
 
 // maxSubWorkflowDepth 子工作流/循环最大嵌套深度
 const maxSubWorkflowDepth = 4
@@ -571,7 +573,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					nodeMap[id].ErrorCode = model.ErrorCodeCancelled
 				}
 			}
-			return nodes, fmt.Errorf("运行已取消")
+			return nodes, &nodeExecError{Code: model.ErrorCodeCancelled, Err: fmt.Errorf("运行已取消")}
 		default:
 		}
 

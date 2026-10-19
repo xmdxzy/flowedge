@@ -36,6 +36,8 @@ import GroupNode from './nodes/GroupNode'
 import VisionNode from './nodes/VisionNode'
 import EditNode from './nodes/EditNode'
 import { type WorkflowTemplate } from './templates/workflowTemplates'
+import ToastHost, { toast } from './components/Toast'
+import ErrorNotice from './components/ErrorNotice'
 import {
   buildEntries,
   bumpUsage,
@@ -670,16 +672,23 @@ function FlowEditor() {
       const apiNodes = stripCanvasOnlyNodes(nodes)
       const apiEdges = stripCanvasOnlyEdges(nodes, edges)
 
-      const response = await fetch('/api/workflows', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: workflowName || '未命名工作流', nodes: apiNodes, edges: apiEdges }),
-      })
+      // 复用当前工作流：以前每次运行都 POST 新建一条，跑十次左栏「已保存」就多十条垃圾，
+      // 而且用户以为自己只是在跑，实际在偷偷建副本。只有真的没有 id（或被删）才新建。
+      const body = JSON.stringify({ name: workflowName || '未命名工作流', nodes: apiNodes, edges: apiEdges })
+      const headers = { 'Content-Type': 'application/json' }
+      let wfId: number | undefined = currentWorkflowId
+      if (wfId) {
+        const put = await fetch(`/api/workflows/${wfId}`, { method: 'PUT', headers, body })
+        if (!put.ok) wfId = undefined // 已被删掉 → 回退为新建
+      }
+      if (!wfId) {
+        const created = await fetch('/api/workflows', { method: 'POST', headers, body })
+        const wf = await created.json()
+        wfId = wf.id
+        setCurrentWorkflowId(wfId)
+      }
 
-      const wf = await response.json()
-      setCurrentWorkflowId(wf.id)
-
-      const runResp = await fetch(`/api/workflows/${wf.id}/run`, { method: 'POST' })
+      const runResp = await fetch(`/api/workflows/${wfId}/run`, { method: 'POST' })
       const runData = await runResp.json()
       setLastRunId(runData.run_id)
 
@@ -755,9 +764,12 @@ function FlowEditor() {
   const stopRun = async () => {
     if (!lastRunId) return
     await fetch(`/api/runs/${lastRunId}/cancel`, { method: 'POST' })
-    setRunStatus('failed')
-    setRunResult('已中止')
+    // 主动中止 ≠ 失败：后端写的是 error_code=cancelled。以前这里写 'failed'，
+    // 界面把「我自己按停的」显示成「执行失败」，是状态谎言（审计 C 类）。
+    setRunStatus('cancelled')
+    setRunResult('已中止（已完成节点的结果保留，可续跑）')
     setIsRunning(false)
+    toast('已中止本次运行，上游已完成的结果保留', 'info')
   }
 
   /** 从指定节点重跑：上游输出保持不变，只重算该节点及其下游 */
@@ -1033,6 +1045,8 @@ function FlowEditor() {
 
   return (
     <div className="flex flex-col h-screen w-screen">
+      {/* 全局轻提示 / 确认框（替代原生 alert、confirm） */}
+      <ToastHost />
       <div className="flex flex-1 min-h-0">
       {/* 左侧节点库 */}
       <div className="w-60 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
@@ -1466,9 +1480,13 @@ function FlowEditor() {
                 <p className="text-xs text-gray-500">暂无输出，运行工作流后显示</p>
               )}
               {selectedNode.data?.error != null && (
-                <div className="text-[11px] text-error border border-error/40 bg-error/10 rounded-lg p-2 whitespace-pre-wrap">
-                  {String(selectedNode.data.error)}
-                </div>
+                <ErrorNotice
+                  code={selectedNode.data?.error_code as string | undefined}
+                  message={String(selectedNode.data.error)}
+                  onAction={(a) => {
+                    if (a === 'open-env') setEnvOpen(true)
+                  }}
+                />
               )}
             </div>
           ) : (
@@ -2386,11 +2404,15 @@ function FlowEditor() {
               )
             })()}
 
-            {/* 错误信息 */}
+            {/* 错误信息：错误码翻成人话 + 可执行修复动作（不再裸抛 timeout/config_missing） */}
             {selectedNode.data?.error != null && (
-              <div className="p-2 rounded bg-error/10 border border-error/30">
-                <p className="text-xs text-error">{String(selectedNode.data.error)}</p>
-              </div>
+              <ErrorNotice
+                code={selectedNode.data?.error_code as string | undefined}
+                message={String(selectedNode.data.error)}
+                onAction={(a) => {
+                  if (a === 'open-env') setEnvOpen(true)
+                }}
+              />
             )}
           </div>
         ) : (

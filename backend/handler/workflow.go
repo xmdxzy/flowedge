@@ -216,6 +216,12 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 		run.EndedAt = &endNow
 		job.EndedAt = &endNow
 		switch {
+		case err != nil && service.ErrorCodeOf(err) == model.ErrorCodeCancelled:
+			// 主动中止 ≠ 失败：台账与界面都要能区分「我按停的」和「跑挂了」
+			run.Status = "cancelled"
+			run.Error = err.Error()
+			job.Status = "interrupted"
+			job.Error = err.Error()
 		case err != nil:
 			run.Status = "failed"
 			run.Error = err.Error()
@@ -373,7 +379,11 @@ func (h *WorkflowHandler) resumeFrom(c *gin.Context, fromNode string) {
 		run.EndedAt = &endNow
 
 		if err != nil {
-			run.Status = "failed"
+			if service.ErrorCodeOf(err) == model.ErrorCodeCancelled {
+				run.Status = "cancelled"
+			} else {
+				run.Status = "failed"
+			}
 			run.Error = err.Error()
 		} else {
 			run.Status = "success"
@@ -389,7 +399,11 @@ func (h *WorkflowHandler) resumeFrom(c *gin.Context, fromNode string) {
 			StartedAt: run.StartedAt, EndedAt: &endNow,
 		}
 		if err != nil {
-			job.Status = "failed"
+			if service.ErrorCodeOf(err) == model.ErrorCodeCancelled {
+				job.Status = "interrupted"
+			} else {
+				job.Status = "failed"
+			}
 			job.Error = err.Error()
 		}
 		h.db.Save(&job)

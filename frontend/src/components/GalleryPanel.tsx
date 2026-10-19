@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { toast, confirmDialog } from './Toast'
 
 interface Artifact {
   name: string
@@ -84,7 +85,8 @@ export default function GalleryPanel({ onClose }: Props) {
   }, [preview])
 
   const remove = async (name: string) => {
-    if (!confirm(`删除产物 ${name}？`)) return
+    const ok = await confirmDialog(`删除产物 ${name}？此操作不可撤销。`, { title: '删除产物', okText: '删除' })
+    if (!ok) return
     await fetch(`/api/artifacts/${encodeURIComponent(name)}`, { method: 'DELETE' })
     load()
   }
@@ -94,7 +96,7 @@ export default function GalleryPanel({ onClose }: Props) {
     try {
       await navigator.clipboard.writeText(path)
     } catch {
-      alert(path)
+      toast(`已复制：${path}`, 'success')
     }
   }
 
