@@ -53,7 +53,7 @@ func main() {
 	// 连接数据库（默认本地 SQLite，零外部依赖；DB_DRIVER=postgres 时使用 PostgreSQL）
 	db := initDB(cfg)
 	if db != nil {
-		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}, &service.ArtifactLineage{}); err != nil {
+		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}, &model.ShotJob{}, &service.ArtifactLineage{}); err != nil {
 			log.Printf("Warning: auto migrate failed: %v", err)
 		} else {
 			log.Println("Database migrated")
@@ -195,6 +195,8 @@ func main() {
 	// 事件日志：广播与落库并行（node_token 不入库，避免写放大）
 	if eventLogger != nil {
 		engine.SetEventLog(eventLogger)
+	// 镜头级作业：每镜落盘，失败重跑时复用已完成镜头（见 model.ShotJob）
+	engine.SetShotJobs(service.NewShotJobStore(db))
 	}
 
 	// GPU 真实遥测轮询（缓存 nvidia-smi 结果，避免每请求拉子进程）

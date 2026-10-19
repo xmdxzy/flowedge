@@ -20,6 +20,10 @@ import (
 const (
 	defaultNodeTimeout = 180 * time.Second
 	maxNodeTimeout     = 30 * time.Minute
+	// 分镜执行器（shotlist）例外：它的预算按「镜数 × 帧数」算，天然会超过 30 分钟。
+	// 旧实现用 maxNodeTimeout 封顶，导致 12 镜长片必然被杀（12 × 169s ≈ 34min > 30min；
+	// 按 AGENTS §5.10 实测 0.85–0.93 秒/帧，12 镜 300+ 帧更是要 40 分钟以上）。
+	maxShotlistTimeout = 8 * time.Hour
 )
 
 // nodeTimeoutFor 按节点类型与工作量估算超时。
@@ -55,22 +59,23 @@ func nodeTimeoutFor(n *model.NodeInstance) time.Duration {
 		// 首张含模型加载：给 4 分钟；此后每张按 75 秒累计
 		return time.Duration(240+n2*75) * time.Second
 	case "shotlist":
-		// 分镜执行器：按时长/镜头数给预算。默认 180s 会被合法长片直接砍断。
-		// 计划里能解析出镜头数就按「每镜 3 分钟 + 5 分钟后期」给，否则给满上限。
-		shots := 0
+		// 分镜执行器：预算必须按「镜数 × 帧数」给，不能按固定每镜 3 分钟。
+		// 基准是 AGENTS §5.10 实测 0.85–0.93 秒/帧（608×352 / 12 步 / 2 张参考图），
+		// 且出现过单段 556s 的异常争用，所以要留余量而不是卡着平均数走。
+		shots, totalFrames := 0, 0
 		if raw, ok := n.Data["plan"].(string); ok && raw != "" {
 			if p, err := ParseShotPlan(raw); err == nil {
 				shots = len(p.Shots)
+				for _, sh := range p.Shots {
+					totalFrames += sh.Frames
+				}
 			}
 		}
 		if shots == 0 {
-			return maxNodeTimeout
+			// 分镜表来自上游节点（storyboard），编译期读不到 → 给类型上限，运行期再细分
+			return maxShotlistTimeout
 		}
-		d := time.Duration(shots*3+5) * time.Minute
-		if d > maxNodeTimeout {
-			d = maxNodeTimeout
-		}
-		return d
+		return ShotListBudget(shots, totalFrames)
 	case "storyboard":
 		return 5 * time.Minute // LLM 规划 + JSON 校验
 	case "image2image", "inpaint", "upscale":
@@ -144,6 +149,7 @@ type EngineV2 struct {
 	tools           *ToolExecutor
 	cache           *NodeCache
 	eventLog        *EventLogger
+	shotJobs        *ShotJobStore    // 镜头级作业（可 nil：无库时降级为不落盘）
 	creds           *CredentialStore // 凭据仓库（HTTP 节点按名称取密钥）
 	visionModel     string           // 自动探测到的本地视觉模型（vision 节点留空时使用）
 	vram            *vramArbiter     // 显存仲裁：同一时刻只跑一个重任务
@@ -317,6 +323,8 @@ func (e *EngineV2) CancelRun(runID uint) bool {
 	defer e.runMu.Unlock()
 	if cancel, ok := e.activeRuns[runID]; ok {
 		cancel()
+		// 光取消 ctx 不够：长片一镜要跑 3–5 分钟，得让 ComfyUI 立刻停手。
+		e.interruptComfy()
 		return true
 	}
 	return false
@@ -666,12 +674,18 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					retryDelay = time.Duration(d) * time.Millisecond
 				}
 
-				// 节点级超时：data.timeout_ms 覆盖默认 180s（上限 30 分钟）
+				// 节点级超时：data.timeout_ms 覆盖默认 180s。
+				// 上限按节点类型给：shotlist 允许到 8h（长片本来就该跑几十分钟），
+				// 其余仍是 30 分钟。
 				timeout := nodeTimeoutFor(node)
+				limit := maxNodeTimeout
+				if node.Type == "shotlist" {
+					limit = maxShotlistTimeout
+				}
 				if ms, ok := node.Data["timeout_ms"].(float64); ok && ms > 0 {
 					timeout = time.Duration(ms) * time.Millisecond
-					if timeout > maxNodeTimeout {
-						timeout = maxNodeTimeout
+					if timeout > limit {
+						timeout = limit
 					}
 				}
 

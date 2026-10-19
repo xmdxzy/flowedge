@@ -113,6 +113,7 @@ type shotResult struct {
 	Ducked     bool    `json:"audio_ducked"`
 	Stripped   bool    `json:"center_stripped"`
 	Verified   bool    `json:"audio_verified"`
+	Reused     bool    `json:"reused,omitempty"` // 复用上次成功产物（提示词未变）
 	Note       string  `json:"note,omitempty"`
 }
 
@@ -185,11 +186,46 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	results := make([]shotResult, 0, len(plan.Shots))
 	var prevLastFrame string
 
+	// 镜头级作业：每镜成功即落盘，失败重跑时已完成的镜头直接复用（不重烧显存）。
+	// runID=0 表示独立执行（没有 run），此时 store 不落盘，行为与旧版一致。
+	runID := runIDFrom(ctx)
+	reroll := parseReroll(node)
+	reusedCount := 0
+
 	for i := range plan.Shots {
+		// 镜头之间响应取消。旧版循环体完全不看 ctx，点了停止也要等整片跑完。
+		if cerr := ctx.Err(); cerr != nil {
+			log.Printf("[shotlist] 第 %d/%d 镜前收到取消", i+1, len(plan.Shots))
+			return nil, fmt.Errorf("已取消（完成 %d/%d 镜，已完成部分已落盘，重跑会复用）：%w",
+				len(results), len(plan.Shots), cerr)
+		}
 		sh := plan.Shots[i]
 		// 只有上一镜声明 continue 时才用末帧引导；其余一律独立生成（多角度才成立）
 		continuity := i > 0 && plan.Shots[i-1].Transition == "continue" && prevLastFrame != ""
 		prompt := CompileShotPrompt(plan, sh, continuity)
+		hash := shotPromptHash(prompt, sh.Frames, width, height, steps, turbo)
+
+		// 复用：同 run + 同节点 + 同镜号 + 同提示词哈希，且产物文件仍在盘上。
+		if !reroll[i] {
+			if job, ok := e.shotJobs.Lookup(runID, node.ID, i, hash); ok {
+				clips = append(clips, job.File)
+				transitions = append(transitions, sh.Transition)
+				results = append(results, shotResult{
+					ID: sh.ID, File: job.File, Frames: job.Frames, Seconds: job.Seconds,
+					Transition: sh.Transition, Reused: true,
+					Note: "复用上次成功产物（提示词与参数未变）",
+				})
+				reusedCount++
+				e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "reused", 0)
+				if i < len(plan.Shots)-1 && sh.Transition == "continue" {
+					tmp := filepath.Join(os.TempDir(), fmt.Sprintf("flowedge-shot-%d-%d.png", time.Now().UnixNano(), sh.ID))
+					if err := extractLastFrame(job.File, tmp); err == nil {
+						prevLastFrame = tmp
+					}
+				}
+				continue
+			}
+		}
 
 		req := MediaRequest{
 			Kind: "h3", Prompt: prompt,
@@ -202,9 +238,21 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			req.Image = prevLastFrame
 		}
 
+		e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "generating", 0)
+		genStart := time.Now()
 		part, _, gerr := e.t2i.GenerateMedia(req)
+		genElapsed := time.Since(genStart)
 		if gerr != nil {
-			return nil, fmt.Errorf("第 %d 镜生成失败：%w", sh.ID, gerr)
+			e.shotJobs.Record(model.ShotJob{
+				RunID: runID, NodeID: node.ID, ShotIndex: i, PromptHash: hash,
+				ShotID: sh.ID, Prompt: prompt, Frames: sh.Frames, Transition: sh.Transition,
+				Status: "failed", Error: gerr.Error(), ElapsedMS: genElapsed.Milliseconds(),
+			})
+			e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "failed", genElapsed)
+			// 不再 return nil 把前几镜一起丢掉：它们已经落盘，重跑会复用。
+			// 报错里直接给出镜号与「只想重拍这一镜」的写法。
+			return nil, fmt.Errorf("第 %d 镜生成失败（已完成 %d/%d 镜并已落盘，重跑会复用；只重拍这一镜请设 reroll=%d）：%w",
+				sh.ID, len(results), len(plan.Shots), sh.ID, gerr)
 		}
 
 		res := shotResult{ID: sh.ID, File: part, Frames: sh.Frames, Seconds: float64(sh.Frames) / 24.0, Transition: sh.Transition}
@@ -242,6 +290,15 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		transitions = append(transitions, sh.Transition)
 		results = append(results, res)
 
+		// 立刻落盘：这是「第 5 镜失败不丢前 4 镜」的全部依据。
+		e.shotJobs.Record(model.ShotJob{
+			RunID: runID, NodeID: node.ID, ShotIndex: i, PromptHash: hash,
+			ShotID: sh.ID, Prompt: prompt, File: part, Frames: sh.Frames,
+			Seconds: res.Seconds, Transition: sh.Transition, Note: res.Note,
+			Status: "success", ElapsedMS: genElapsed.Milliseconds(),
+		})
+		e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "done", genElapsed)
+
 		// 取末帧供下一镜续接（仅当下一镜需要 continue 时才真的会用到）
 		if i < len(plan.Shots)-1 && sh.Transition == "continue" {
 			tmp := filepath.Join(os.TempDir(), fmt.Sprintf("flowedge-shot-%d-%d.png", time.Now().UnixNano(), sh.ID))
@@ -270,7 +327,6 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	if abs, aerr := filepath.Abs(final); aerr == nil {
 		final = abs
 	}
-
 	// 成片自检：数帧 + 音画时长比对。肉眼看时长看不出「中间整段画面丢失」，
 	// 但流水线必须自己知道。自检失败不影响产出，只把问题显式挂到输出上。
 	check, _ := inspectMedia(final)
@@ -285,15 +341,19 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		total += r.Seconds
 	}
 	planJSON := toJSON(results)
+	// 按镜明细：界面据此渲染「第 3/6 镜 · 复用 / 新生成 · 耗时」，也是 reroll 的依据
+	jobs := e.shotJobs.ListByNode(runID, node.ID)
 	return map[string]interface{}{
-		"video":    final,
-		"kind":     "video",
-		"text":     plan.Title,
-		"shots":    len(results),
-		"seconds":  total,
-		"detail":   planJSON,
-		"check":    toJSON(check),
-		"check_ok": check.OK,
+		"video":         final,
+		"kind":          "video",
+		"text":          plan.Title,
+		"shots":         len(results),
+		"seconds":       total,
+		"shots_reused":  reusedCount,
+		"shot_jobs":     toJSON(jobs),
+		"detail":        planJSON,
+		"check":         toJSON(check),
+		"check_ok":      check.OK,
 	}, nil
 }
 
