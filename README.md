@@ -9,7 +9,17 @@
 **编排引擎**
 - ✅ 可视化拖拽编排（React Flow v12，侧边栏拖拽 + 吸附网格 + 连线校验）
 - ✅ 分层并行 DAG 执行引擎（Go），含菱形汇合、条件分支、`join: any`、`continue_on_error`
-- ✅ **14 种节点**：开始 / 结束 / LLM / 文生图 / 语音转写 / 语音合成 / 视频合成 / 条件分支 / 循环 / 子工作流 / HTTP / 数据转换 / 知识库检索 / **代码执行**
+- ✅ **15 种节点**：开始 / 结束 / LLM / 文生图 / 语音转写 / 语音合成 / 视频合成 / 条件分支 / 循环 / 子工作流 / HTTP / 数据转换 / 知识库检索 / 代码执行 / **变量聚合**
+- ✅ **单步调试 + 断点**：节点上右键打断点，运行到断点停住，可「单步 / 继续 / 停止」，进度实时落库（`status=paused` + `paused_at`）
+- ✅ **凭据加密存储**：API Key 用 AES-256-GCM 加密落 `data/credentials.json`，HTTP 节点只写凭据名，导出工作流不再泄密
+- ✅ **产物血缘**：每张图 / 每段音 / 每个视频都可溯源到「哪个工作流、哪个运行、哪个节点、上游用了什么」
+- ✅ **依赖进程托管**：ComfyUI / ASR 在「环境」面板一键启停，无需另开终端
+- ✅ **知识库支持 PDF / DOCX / CSV**（PDF 优先走 poppler，找不到时内置流解析器，乱码会显式报错）
+- ✅ **TTS 零依赖**：Windows 内置 SAPI 直出 wav（无需 Python 服务）；配置 `TTS_BASE_URL` 时优先走服务
+- ✅ **画布体验**：分层自动布局、分组框、批注、深色 / 浅色主题
+- ✅ **视觉理解节点（VLM）**：图片 + 提问 → 中文描述，本地 qwen2.5vl:7b，图片不出本机
+- ✅ **模型资产统一管理**：全部权重落在 `D://AI//Models`，`/api/models` 可查家族/体积/具体文件
+- ✅ **显存单侧驻留**：扩散 / 语言 / 语音三类任务同一时刻只让一类驻留，换侧自动卸载并等显存真正归还
 - ✅ 代码执行节点：yaegi 解释 Go 子集，stdlib 白名单（strings/json/fmt/sort/regexp/time…），危险 import 静态拒绝
 - ✅ 图结构校验：环 / 自环 / 悬空边在**保存与执行前**拦截（Kahn 入度法，菱形 DAG 不误判）
 - ✅ 节点级超时（默认 180s，`timeout_ms` 覆盖，上限 30min）+ 结构化错误码（timeout / config_missing / cycle / retry_exhausted / cancelled）
@@ -127,6 +137,17 @@ ASR 首次会下载 whisper 模型约 500 MB）。
 | `COMFYUI_TEMPLATE` | 空 | 用 `data/comfy_workflows/<name>.json` 自定义工作流（占位符 `__PROMPT__` / `__WIDTH__` / `__HEIGHT__` / `__SEED__` / `__CHECKPOINT__`） |
 | `FFMPEG_PATH` | `ffmpeg` | ffmpeg 可执行文件路径 |
 | `ASR_BASE_URL` / `TTS_BASE_URL` | 空 | 指向本地语音服务（导出脚本后自行启动）。**未配置时 ASR/TTS 节点显式失败**，不会伪造结果 |
+| `COMFYUI_HOME` | 自动探测 | ComfyUI 安装目录（含 `main.py`）；用于「一键启动」 |
+| `COMFYUI_ARGS` | `--listen 127.0.0.1 --port 8188` | 自定义 ComfyUI 启动参数（低显存可加 `--lowvram`） |
+| `COMFYUI_AUTOSTART` | `0` | 设为 `1` 时引擎启动即拉起 ComfyUI |
+| `ASR_HOME` | `./local-services` | ASR 服务脚本目录（含 `asr_server.py`） |
+| `ASR_AUTOSTART` | `0` | 设为 `1` 时引擎启动即拉起 ASR |
+| `FLOWEDGE_MODELS_DIR` | `D:/AI/Models` | 统一模型根目录（`/api/models` 与面板都读它） |
+| `ASR_DEVICE` | `cpu` | whisper 设备；设为 `cuda` 更快但吃 3GB 显存 |
+| `TTS_DEVICE` | `cpu` | Kokoro 设备 |
+| `KOKORO_DIR` | `D:/AI/Models/tts` | Kokoro 权重与 HF 缓存 |
+| `FLOWEDGE_MASTER_KEY` | 空 | 凭据主密钥（hex/base64/任意口令），留空则自动生成 `data/.master_key` |
+| `FLOWEDGE_TTS_SAPI` | `1` | 设为 `0` 禁用 Windows 内置语音合成兜底 |
 | `FLOWEDGE_OPEN_BROWSER` | `0` | 设为 `1` 启动后自动打开浏览器 |
 | `STATIC_DIR` | 空 | 指定外部前端目录（想替换界面时用） |
 | `DB_DRIVER` | `sqlite` | 设为 `postgres` 且配置 `DB_*` 可切换 PostgreSQL |
@@ -233,6 +254,47 @@ ollama pull qwen2.5:7b
 - **红线（92%）**：强制卸载非活跃模型
 - **LRU 策略**：按最近最少使用淘汰，避免频繁换入换出
 
+## 本地模型栈（2026-10 实测）
+
+所有权重集中在 **`D://AI//Models`**（可用 `FLOWEDGE_MODELS_DIR` 改），项目目录只放代码与配置。
+
+| 家族 | 模型 | 体积 | 用途 | 默认设备 |
+|---|---|---|---|---|
+| 文生图 | `flux1-schnell-fp8` | 16.1 GB | 出图（英文提示词效果最好） | GPU 17GB |
+| 文生图（备用） | `qwen_image_2.1_turbo` + LoRA + VAE | 8.2 GB | 中文提示词友好（当前 ComfyUI 版本 VAE 识别不匹配，待升级） | GPU |
+| 视频+音频 | `minimax_h3_fl2va / ref2va` + 视频/音频 VAE | 47 GB | 联合音视频生成（需装 ComfyUI-MiniMax-H3-Turbo 节点） | GPU |
+| 文本编码 | `qwen3vl_8b_int8` / `qwen3vl_32b_nvfp4` | 23.3 GB | Qwen-Image / H3 的文本与视觉编码 | GPU |
+| 大语言模型 | `qwen2.5:14b`（Ollama） | 9.0 GB | 中文推理 / 改写 / 翻译 | GPU 9GB |
+| 视觉理解 | `qwen2.5vl:7b`（Ollama） | 6.0 GB | 看图回答（vision 节点） | GPU 6GB |
+| 插帧 | ffmpeg minterpolate | 0 | 视频帧率翻倍，CPU | CPU |
+| 语音识别 | `faster-whisper-large-v3` | 2.9 GB | 转写（默认 CPU int8，`ASR_DEVICE=cuda` 可上卡） | CPU |
+| 语音合成 | `Kokoro-82M` | 0.3 GB | 中英日神经 TTS（默认 CPU） | CPU |
+| 超分 | `RealESRGAN_x4plus` | 0.06 GB | 放大 | — |
+
+### 显存策略（24GB 卡 + UE5 同时开着的现实约束）
+
+```
+扩散侧 flux  ≈17GB   ←→   语言侧 14B ≈9GB / VLM ≈6GB   ←→   语音 whisper≈3GB
+```
+
+三类同时驻留必然爆显存，所以引擎内置了**显存仲裁**：
+
+1. 进入任一侧前先让其它侧卸载（Ollama `keep_alive=0` / ComfyUI `/free` + `free_memory`）
+2. 卸载后轮询 `vram_free`，等显存真正回到 16GB 以上才继续（CUDA 释放是异步的）
+3. 同类任务连续执行不重复卸载（避免每次 40 秒冷加载）
+4. ComfyUI **常驻权重**（`--reserve-vram 2`，不加 `--disable-smart-memory`）
+   同一批出图不重复装载；换到语言侧时由引擎调 `/free` 并等 `vram_free` 真回来
+5. 语音服务默认跑 CPU：Kokoro 82M / whisper int8 足够快，把显存全部留给图像与 LLM
+6. 视频平滑用 **ffmpeg minterpolate**（CPU），不用 RIFE：权重镜像 404 且要 cupy，
+   实测 10.4 秒视频插帧翻倍只要 36 秒 CPU、显存零占用
+
+> **实测对比（同一台 3090，5 条不同提示词 @768²）**：
+> 每张卸载重装 = **199 秒**；常驻权重 = **29 秒（6.9 倍）**。
+> 所以默认改成常驻；切到 LLM/VLM 时靠 `/free` 回收，最多等 12 秒，值得。
+
+实测（3090 24GB，同时开着 UE5 编辑器）：文生图 + 视觉理解串起来跑，**峰值 15.0GB**，
+任务结束后回落到 1.6GB；改造前同样流程峰值 24.0GB（贴着上限）。
+
 ## 节点类型
 
 | 节点 | 类型 | 能力 |
@@ -249,7 +311,20 @@ ollama pull qwen2.5:7b
 | HTTP 请求 | data | 调用外部接口 |
 | 数据转换 | data | 模板渲染（`{{input}}` / `{{a.b}}`） |
 | 知识库检索 | ai | 本地 RAG 语义检索 |
+| 变量聚合 | data | 把多路分支收拢成对象 / 数组 / 拼接文本（替代手写 code 节点） |
+| 图生图 | ai | 以输入图为底按强度重绘（flux，实测 0.85 明显改风格） |
+| 局部重绘 | ai | 蒙版区域按提示词重画（蒙版须与原图同尺寸，白色为重绘区） |
+| 超分放大 | ai | RealESRGAN 等放大模型（768→3072 实测） |
+| 文生视频 | ai | 双后端：Wan2.1-1.3B（64 秒/2 秒片，无声）/ **MiniMax-H3**（~2 分钟/5 秒片，**自带立体声**） |
+| 图生视频 | ai | H3 首帧引导（`MiniMaxH3AddGuide`）：给一张图 → 5 秒带声动态镜头 |
+| 分镜规划 | ai | 剧本 → 结构化分镜表（景别/角度/轴线/运镜/动作/声音/台词/衔接），时长按内容给 |
+| 分镜执行器 | ai | 逐镜生成 + ASR 音频抽检 + 按 cut/continue/dissolve 装配 + 响度归一 |
+| 视频插帧 | ai | 出片后帧率翻倍（Wan 16→32 / H3 24→48），ffmpeg minterpolate，**CPU 完成、不占显存** |
+| 视觉理解 | ai | 图片 + 提问 → 文字（本地 VLM，走 Ollama /api/chat） |
+| 代码执行 | data | yaegi 跑 Go 子集，stdlib 白名单 |
 | 结束 | control | 输出最终结果 |
+
+> 另有仅存在于画布的 **批注（note）** 与 **分组（group）**：保存与运行时会自动剔除，不会进工作流定义。
 
 ## API 接口
 
@@ -298,6 +373,13 @@ ollama pull qwen2.5:7b
 - `POST /api/workflows/:id/versions` - 创建新版本快照
 - `POST /api/workflows/:id/versions/:versionId/rollback` - 回滚到指定版本
 
+### 调试 / 凭据 / 依赖 / 血缘
+- `POST /api/runs/:runId/step` - 单步执行一个节点后暂停
+- `POST /api/runs/:runId/continue` - 跑到下一个断点或结束
+- `GET|POST /api/credentials` · `DELETE /api/credentials/:name` - 凭据（列表脱敏，值不可回读）
+- `GET /api/deps` · `POST /api/deps/:name/start|stop` · `GET /api/deps/:name/wait` - 依赖进程托管
+- `GET /api/artifacts/:name/lineage` · `GET /api/lineage` - 产物血缘
+
 ### 系统
 - `GET /api/gpu/status` - GPU 显存调度状态
 - `GET /api/ws` - WebSocket 实时事件推送
@@ -341,6 +423,25 @@ flowedge/
 └── README.md
 ```
 
+## 已知限制（诚实披露）
+
+- **图生图对强度敏感**：flux-schnell 是蒸馏 t2i 模型，0.55 只有轻微润色，0.8 以上才明显改风格。
+- **重绘质量有限**：flux 并非专门的重绘模型，蒙版内可能只做弱修补。要专业重绘需下 Flux-Fill（~11GB），
+  权衡后暂缓：功能可用，下载与图谱改动留待真有高频重绘需求再做。
+- **~~minimax_h3 不可用~~ → 已可用**：H3 必须跑在独立工作树 `D://AI//ComfyUI-H3`（自带 venv，torch 2.14 + 完整
+  int8/nvfp4 量化后端），启动参数 `--reserve-vram 4 --cache-none`，**不要叠加** `--disable-smart-memory`。
+  实测 608×352×124 帧 20 步：**约 2 分钟出片，峰值 21.8GB**，自带 32kHz 立体声。同机默认实例（torch 2.6）跑同一个图会 OOM，
+  这是两套环境差异，不是显存不够。
+- **qwen_image_2.1 暂不可用**：当前 ComfyUI 版本把它的 VAE 误判成 WanVAE（12 通道 vs 4 通道），
+  出图会报 size mismatch；权重已就位，等 ComfyUI 升级或补相应节点即可切换。
+- **flux 对中文提示词效果弱**：`flux1-schnell` 的文本编码器以英文为主，纯中文提示词经常只画出通用风景。
+  建议在工作流里先接一个 LLM 节点把中文改写/翻译成英文，再喂给文生图。
+- **ASR 精度取决于模型档位**：默认 `small`（CPU int8），中文专有名词可能听错（实测「闭环」被识别成「必还」）。
+  要更准可设 `WHISPER_MODEL=medium`，代价是更慢、更吃内存。
+- **重排 / VLM / 多租户** 仍按 SOTA 对照表放弃（原因见 `SOTA-达成度对照表.md`）。
+- **Electron 壳（`desktop/`）目前只是可选打包路径**，日常客户端走 Edge/Chrome 的 `--app` 模式，
+  两者不要同时维护界面逻辑。
+
 ## 路线图
 
 - [x] MVP：基础画布 + 串行执行 + 本地 LLM
@@ -354,8 +455,8 @@ flowedge/
 - [x] 执行历史面板
 - [x] 节点拖拽 + 右键菜单
 - [x] 工作流导出/导入
-- [ ] 单步调试 + 断点
+- [x] 单步调试 + 断点
 - [x] 单文件 Windows 部署（前端内嵌，无需 Docker/WSL/Node）
 - [ ] Docker 一键部署（服务器场景）
-- [ ] 节点插件系统
+- [x] 节点插件系统
 - [x] 子工作流嵌套

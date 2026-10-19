@@ -173,12 +173,20 @@ var defaultOutputFields = map[string][]string{
 	"http_request":   {"text", "status_code"},
 	"data_transform": {"text"},
 	"if_else":        {"text", "branch"},
-	"text2image":     {"image", "text"},
+	"text2image":     {"image", "images", "count", "prompts", "text"},
 	"asr":            {"text"},
 	"tts":            {"audio", "text"},
 	"video_compose":  {"video"},
 	"loop":           {"text", "all", "iterations", "stopped_by"},
 	"sub_workflow":   {"text"},
+	"vision":         {"text", "model", "images", "tokens"},
+	"prompt_opt":     {"text", "original", "mode"},
+	"storyboard":     {"text", "plan", "shots", "title", "style"},
+	"shotlist":       {"video", "kind", "text", "shots", "seconds", "detail"},
+	"text2video":     {"video", "kind", "text", "original_prompt", "beats", "parts", "segments"},
+	"image2image":    {"image", "kind", "source", "strength"},
+	"inpaint":        {"image", "kind", "source", "mask"},
+	"upscale":        {"image", "kind", "source", "width", "height"},
 }
 
 // DescribeOutputs 返回某节点类型可能的输出字段

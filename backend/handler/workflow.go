@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,13 +15,19 @@ import (
 )
 
 type WorkflowHandler struct {
-	db     *gorm.DB
-	engine *service.EngineV2
-	queue  *service.JobQueue // nil 时退化为直接 goroutine 起跑（保持向后兼容）
+	db      *gorm.DB
+	engine  *service.EngineV2
+	queue   *service.JobQueue      // nil 时退化为直接 goroutine 起跑（保持向后兼容）
+	lineage *service.LineageStore  // nil 时跳过血缘记录
 }
 
 func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue) *WorkflowHandler {
 	return &WorkflowHandler{db: db, engine: engine, queue: queue}
+}
+
+// SetLineage 注入血缘仓库（运行结束后记录产物来源）
+func (h *WorkflowHandler) SetLineage(l *service.LineageStore) {
+	h.lineage = l
 }
 
 // List 获取所有工作流
@@ -83,7 +90,11 @@ func (h *WorkflowHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, wf)
 }
 
-// Update 更新工作流
+// Update 更新工作流（局部更新）
+//
+// 之前是无条件写 name/nodes/edges 三个字段：调用方只想改名时，nodes/edges 为空
+// 就会把整张图覆盖成 null——一次「重命名」直接把工作流清空，属于静默数据丢失。
+// 现在只更新请求体里真正出现的字段。
 func (h *WorkflowHandler) Update(c *gin.Context) {
 	id := c.Param("id")
 	var wf model.Workflow
@@ -92,21 +103,39 @@ func (h *WorkflowHandler) Update(c *gin.Context) {
 		return
 	}
 
-	var updates model.Workflow
+	var updates struct {
+		Name  *string         `json:"name"`
+		Nodes json.RawMessage `json:"nodes"`
+		Edges json.RawMessage `json:"edges"`
+	}
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if code, body := validateGraph(updates.Nodes, updates.Edges); code != 0 {
-		c.JSON(code, body)
+
+	fields := map[string]interface{}{}
+	if updates.Name != nil && strings.TrimSpace(*updates.Name) != "" {
+		fields["name"] = strings.TrimSpace(*updates.Name)
+	}
+	if len(updates.Nodes) > 0 || len(updates.Edges) > 0 {
+		// 图结构必须成对提交：只改节点不改连线会得到一张自相矛盾的图
+		if len(updates.Nodes) == 0 || len(updates.Edges) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "nodes 与 edges 必须一起提交"})
+			return
+		}
+		if code, body := validateGraph(updates.Nodes, updates.Edges); code != 0 {
+			c.JSON(code, body)
+			return
+		}
+		fields["nodes"] = updates.Nodes
+		fields["edges"] = updates.Edges
+	}
+	if len(fields) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "没有可更新的字段"})
 		return
 	}
 
-	h.db.Model(&wf).Updates(map[string]interface{}{
-		"name":  updates.Name,
-		"nodes": updates.Nodes,
-		"edges": updates.Edges,
-	})
+	h.db.Model(&wf).Updates(fields)
 	h.db.First(&wf, id)
 	c.JSON(http.StatusOK, wf)
 }
@@ -158,19 +187,46 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 			Update("node_states", json.RawMessage(statesJSON))
 	}
 
+	// 断点：节点上勾了 breakpoint 就停，运行时不必再开调试模式
+	breakpoints := collectBreakpoints(nodesJSON)
+	var rc *service.RunControl
+	if len(breakpoints) > 0 {
+		rc = service.NewBreakpointControl(mapFromSlice(breakpoints))
+	}
+
 	exec := func() {
-		// 走可取消入口：前端可对进行中的运行发起中止
-		nodeStates, err := h.engine.ExecuteWithRunID(nodesJSON, edgesJSON, run.ID, persist)
+		var nodeStates []model.NodeInstance
+		var err error
+		if rc != nil {
+			// 走可取消 + 断点控制入口
+			nodeStates, err = h.engine.ExecuteWithControl(nodesJSON, edgesJSON, run.ID, rc, persist)
+		} else {
+			nodeStates, err = h.engine.ExecuteWithRunID(nodesJSON, edgesJSON, run.ID, persist)
+		}
+
+		paused, pauseAt, pauseReason := "", "", ""
+		if rc != nil {
+			p, at, reason := rc.State()
+			if p {
+				paused, pauseAt, pauseReason = "paused", at, reason
+			}
+		}
 
 		endNow := time.Now()
 		run.EndedAt = &endNow
 		job.EndedAt = &endNow
-		if err != nil {
+		switch {
+		case err != nil:
 			run.Status = "failed"
 			run.Error = err.Error()
 			job.Status = "failed"
 			job.Error = err.Error()
-		} else {
+		case paused != "":
+			run.Status = "paused"
+			run.PausedAt = pauseAt
+			run.PauseReason = pauseReason
+			job.Status = "paused"
+		default:
 			run.Status = "success"
 			job.Status = "done"
 		}
@@ -178,6 +234,13 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 		run.NodeStates = json.RawMessage(statesJSON)
 		h.db.Save(&run)
 		h.db.Save(&job)
+
+		// 产物血缘：运行结束（含暂停）都记一次，已产出的图/音/视频都能溯源
+		if h.lineage != nil {
+			var edges []model.EdgeInstance
+			_ = json.Unmarshal(edgesJSON, &edges)
+			h.lineage.RecordRun(wf.ID, run.ID, nodeStates, edges)
+		}
 	}
 
 	if h.queue != nil {

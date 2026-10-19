@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
@@ -52,7 +53,7 @@ func main() {
 	// 连接数据库（默认本地 SQLite，零外部依赖；DB_DRIVER=postgres 时使用 PostgreSQL）
 	db := initDB(cfg)
 	if db != nil {
-		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}); err != nil {
+		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}, &service.ArtifactLineage{}); err != nil {
 			log.Printf("Warning: auto migrate failed: %v", err)
 		} else {
 			log.Println("Database migrated")
@@ -91,6 +92,17 @@ func main() {
 	asrURL := getEnv("ASR_BASE_URL", "")
 	ttsURL := getEnv("TTS_BASE_URL", "")
 
+	// 本地 ASR 服务目录存在时，默认端点指向它（asr_server.py 固定监听 8101）。
+	// 否则会出现「引擎把服务拉起来了、能力面板却显示未启用、ASR 节点仍报 config_missing」
+	// 这种自相矛盾的状态——配置为空的语义应该是「用本地默认」，不是「不可用」。
+	if asrURL == "" && service.DetectASRHome() != "" {
+		asrURL = "http://127.0.0.1:8101"
+	}
+	// 同理：本地有 Kokoro 脚本就默认用神经 TTS；服务没起时引擎自动落回 Windows SAPI
+	if ttsURL == "" && service.DetectKokoroScript() != "" {
+		ttsURL = "http://127.0.0.1:8102"
+	}
+
 	t2iService := service.NewText2ImageService(comfyURL, getEnv("COMFYUI_CHECKPOINT", "flux1-schnell-fp8.safetensors"))
 	// 可选：指定 data/comfy_workflows/<name>.json 作为自定义工作流模板
 	t2iService.Template = getEnv("COMFYUI_TEMPLATE", "")
@@ -111,6 +123,31 @@ func main() {
 
 	// 引擎
 	engine := service.NewEngineV2(llmService, t2iService, asrService, ttsService, videoService, httpService, ragService, gpuSched, wsHub)
+
+	// 凭据仓库：AES-256-GCM 加密落 data/credentials.json，HTTP 节点按名称引用
+	credStore, credErr := service.NewCredentialStore("data")
+	if credErr != nil {
+		log.Printf("Warning: 凭据仓库初始化失败（HTTP 节点将无法使用 credential 字段）：%v", credErr)
+	} else {
+		engine.SetCredentials(credStore)
+	}
+
+	// 产物血缘
+	lineageStore := service.NewLineageStore(db)
+
+	// 视觉模型：本地装了 VL 模型就自动启用 vision 节点
+	visionModel := service.PickVisionModel(cfg.OllamaBaseURL)
+	if visionModel != "" {
+		engine.SetVisionModel(visionModel)
+		log.Printf("视觉理解已启用：%s", visionModel)
+	}
+	modelsRoot := service.ModelsRoot(baseDir)
+	log.Printf("模型根目录：%s", modelsRoot)
+
+	// 依赖进程管理器：ComfyUI / ASR 可一键托管（先探活，已在跑则复用）
+	depSupervisor := service.NewSupervisor(comfyURL, asrURL, ttsURL)
+	engine.SetSupervisor(depSupervisor)
+	depSupervisor.AutoStartAll()
 
 	// 子工作流解析器（从 DB 读取嵌套工作流定义）
 	engine.SetResolver(func(id uint) ([]byte, []byte, error) {
@@ -243,7 +280,9 @@ func main() {
 		log.Printf("上次异常退出的运行任务 %d 个，已标记为 interrupted（可在执行记录里续跑）", n)
 	}
 	wfHandler := handler.NewWorkflowHandler(db, engine, jobQueue)
+	wfHandler.SetLineage(lineageStore)
 	triggerHandler := handler.NewTriggerHandler(db, wfHandler)
+	debugHandler := handler.NewDebugHandler(db, engine, lineageStore)
 
 	// 定时触发器：每 20 秒扫描一次启用了 cron 的工作流（分钟级去重）
 	cronScheduler := service.NewCronScheduler(db, func(id uint) error {
@@ -273,6 +312,10 @@ func main() {
 		api.POST("/runs/:runId/resume", wfHandler.ResumeRun)
 		api.POST("/runs/:runId/rerun-from", wfHandler.ResumeFromRun)
 		api.POST("/runs/:runId/cancel", wfHandler.CancelRun)
+
+		// 单步调试与断点：step 执行一个节点后暂停，continue 跑到下一个断点/结束
+		api.POST("/runs/:runId/step", debugHandler.Step)
+		api.POST("/runs/:runId/continue", debugHandler.Continue)
 
 		// 运行维度：全局列表（分页/状态过滤）、事件回放、trace 与 token 统计
 		runHandler := handler.NewRunHandler(db, eventLogger)
@@ -310,9 +353,53 @@ func main() {
 
 		// 产物管理（生成的图片 / 视频 / 音频）
 		artifactHandler := handler.NewArtifactHandler(getEnv("GENERATED_DIR", "data/generated"))
+		artifactHandler.SetLineage(lineageStore)
 		api.GET("/artifacts", artifactHandler.List)
 		api.GET("/artifacts/:name", artifactHandler.Serve)
+		api.GET("/artifacts/:name/lineage", artifactHandler.Lineage)
 		api.DELETE("/artifacts/:name", artifactHandler.Delete)
+		// 血缘总表（画廊批量展示来源）
+		api.GET("/lineage", artifactHandler.LineageList)
+
+		// 凭据（值永不下发，只回名称与 header 名）
+		credHandler := handler.NewCredentialHandler(credStore)
+		api.GET("/credentials", credHandler.List)
+		api.POST("/credentials", credHandler.Set)
+		api.DELETE("/credentials/:name", credHandler.Delete)
+
+		// 模型资产清点（根目录 / 各家族体积 / 具体文件）
+		api.GET("/models", func(c *gin.Context) {
+			inv := service.ScanModels(service.ModelsRoot(baseDir))
+			ollamaModels := []string{}
+			if body, err := http.Get(cfg.OllamaBaseURL + "/api/tags"); err == nil {
+				var tags struct {
+					Models []struct {
+						Name string `json:"name"`
+						Size int64  `json:"size"`
+					} `json:"models"`
+				}
+				if json.NewDecoder(body.Body).Decode(&tags) == nil {
+					for _, m := range tags.Models {
+						ollamaModels = append(ollamaModels, m.Name)
+					}
+				}
+				body.Body.Close()
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"inventory":     inv,
+				"ollama_models": ollamaModels,
+				"vision_model":  service.PickVisionModel(cfg.OllamaBaseURL),
+				"models_dir":    modelsRoot,
+				"resident_side":  engine.ResidentSide(),
+			})
+		})
+
+		// 依赖进程托管（ComfyUI / ASR 一键启停）
+		depHandler := handler.NewDepHandler(depSupervisor)
+		api.GET("/deps", depHandler.List)
+		api.POST("/deps/:name/start", depHandler.Start)
+		api.POST("/deps/:name/stop", depHandler.Stop)
+		api.GET("/deps/:name/wait", depHandler.Wait)
 
 		// 触发器：Webhook（外部调用）+ Cron（定时）
 		api.GET("/workflows/:id/trigger", triggerHandler.Get)
@@ -508,18 +595,26 @@ func mark(ok bool) string {
 }
 
 // openBrowser 启动后自动打开默认浏览器（FLOWEDGE_OPEN_BROWSER=1 时）
+// openBrowser 用系统默认浏览器打开 URL。
+//
+// Windows 上用 rundll32 url.dll,FileProtocolHandler 而不是 explorer：
+// `explorer <url>` 在部分精简系统或默认浏览器为 Edge 的机器上会打开「资源管理器」
+// 窗口而不是浏览器（用户看到的就是「双击了但什么都没打开」）。
 func openBrowser(url string) {
 	var cmd string
 	var args []string
 	switch runtime.GOOS {
 	case "windows":
-		cmd, args = "explorer", []string{url}
+		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler", url}
 	case "darwin":
 		cmd, args = "open", []string{url}
 	default:
 		cmd, args = "xdg-open", []string{url}
 	}
-	_ = exec.Command(cmd, args...).Start()
+	c := exec.Command(cmd, args...)
+	// 显式丢弃输出：子进程若继承当前控制台句柄，关闭窗口时可能连带失败
+	c.Stdout, c.Stderr = nil, nil
+	_ = c.Start()
 }
 
 // exportServices 导出内嵌的语音服务脚本（供没有源码仓库的单文件用户使用）

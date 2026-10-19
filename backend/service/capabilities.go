@@ -27,6 +27,7 @@ type Capabilities struct {
 	GPU     Capability      `json:"gpu"`
 	Ollama  Capability      `json:"ollama"`
 	ComfyUI Capability      `json:"comfyui"`
+	Vision  Capability      `json:"vision"`
 	FFmpeg  Capability      `json:"ffmpeg"`
 	ASR     Capability      `json:"asr"`
 	TTS     Capability      `json:"tts"`
@@ -115,6 +116,25 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBas
 		setOK(&caps.ComfyUI, c)
 	}()
 
+	// 视觉理解（VLM）：从本地 Ollama 已装模型里找能看图的
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c := Capability{
+			Endpoint: ollamaBase,
+			Hint:     "未检测到视觉模型。拉一个即可：ollama pull qwen2.5vl:7b（约 6GB，3090 上可跑）",
+		}
+		if ollamaBase != "" {
+			if m := PickVisionModel(ollamaBase); m != "" {
+				c.OK = true
+				c.Hint = ""
+				c.Detail = m
+				c.Models = []string{m}
+			}
+		}
+		setOK(&caps.Vision, c)
+	}()
+
 	// ffmpeg（视频合成）
 	wg.Add(1)
 	go func() {
@@ -146,10 +166,32 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBas
 	// 绝不伪造转写文本或假音频——提示文案必须如实说明这一点
 	wg.Add(1)
 	go probeLocal(&caps.ASR, asrBase, "ASR",
-		"未配置：ASR 节点会直接失败（不会伪造转写结果）。启用方式：先运行 FlowEdge.exe --export-services 导出脚本到 local-services/，再装 Python 并执行 python asr_server.py（首次会自动下载 whisper 模型约 500MB）")
+		"未配置：ASR 节点会直接失败（不会伪造转写结果）。两种启用方式：① 界面「环境」面板点「启动 ASR」由引擎托管 faster-whisper；② 手动运行 FlowEdge.exe --export-services 导出脚本后 python asr_server.py（首次会从镜像下载 whisper 模型约 500MB）")
 	wg.Add(1)
-	go probeLocal(&caps.TTS, ttsBase, "TTS",
-		"未配置：TTS 节点会直接失败（不会写出假音频）。启用方式：先运行 FlowEdge.exe --export-services 导出脚本到 local-services/，再装 Python 并执行 python tts_server.py（用 Windows 自带语音引擎，无需下载模型）")
+	go func() {
+		defer wg.Done()
+		c := Capability{Endpoint: ttsBase, Hint: "未配置：TTS 节点会直接失败（不会写出假音频）。非 Windows 环境请设置 TTS_BASE_URL 指向本地 TTS 服务"}
+		if ttsBase != "" {
+			if _, err := httpGetBody(ttsBase + "/health"); err == nil {
+				c.OK = true
+				c.Hint = ""
+				c.Detail = "TTS 服务已就绪"
+				setOK(&caps.TTS, c)
+				return
+			}
+		}
+		// 零依赖兜底：Windows 自带 SAPI 语音引擎，不需要 Python 服务
+		if SAPIAvailable() {
+			c.OK = true
+			c.Hint = ""
+			c.Detail = "Windows 内置 SAPI（无需 Python 服务）"
+			if info := SAPIInfo(); info != "" {
+				c.Detail = "Windows 内置 SAPI：" + info
+			}
+			c.Path = "sapi"
+		}
+		setOK(&caps.TTS, c)
+	}()
 
 	wg.Wait()
 
@@ -157,7 +199,8 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, asrBas
 		"llm":   caps.Ollama.OK && len(caps.Ollama.Models) > 0,
 		"image": caps.ComfyUI.OK,
 		"audio": caps.ASR.OK && caps.TTS.OK,
-		"video": caps.FFmpeg.OK,
+		"video":  caps.FFmpeg.OK,
+		"vision": caps.Vision.OK,
 	}
 	for name, ok := range caps.Ready {
 		if !ok {

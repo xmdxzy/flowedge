@@ -31,6 +31,9 @@ backend/web/services/files/*
 data/
 backend/data/
 
+# 就地运行目录（exe + 本地数据库 + 启动脚本，不属于源码）
+/运行/
+
 # IDE
 .idea/
 .vscode/
@@ -45,6 +48,13 @@ Thumbs.db
 *.log
 logs/
 
+# 临时工作目录（verify-media 抽帧、审计中间产物）
+.tmp/
+
+# Python 字节码
+__pycache__/
+*.pyc
+
 # 本地服务虚拟环境
 backend/local-services/.venv/
 
@@ -52,3 +62,6 @@ backend/local-services/.venv/
 desktop/node_modules/
 desktop/window-screenshot.png
 *.exe~
+
+# 本地工作记录（助手记忆，不入库）
+.workbuddy/

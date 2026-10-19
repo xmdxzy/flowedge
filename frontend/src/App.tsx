@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -30,7 +30,24 @@ import HTTPNode from './nodes/HTTPNode'
 import TransformNode from './nodes/TransformNode'
 import RAGNode from './nodes/RAGNode'
 import CodeNode from './nodes/CodeNode'
-import { workflowTemplates, type WorkflowTemplate } from './templates/workflowTemplates'
+import AggregateNode from './nodes/AggregateNode'
+import NoteNode from './nodes/NoteNode'
+import GroupNode from './nodes/GroupNode'
+import VisionNode from './nodes/VisionNode'
+import EditNode from './nodes/EditNode'
+import { type WorkflowTemplate } from './templates/workflowTemplates'
+import {
+  buildEntries,
+  bumpUsage,
+  groupOf,
+  readUsage,
+  topEntries,
+  type UsageMap,
+} from './templates/templateCatalog'
+import TemplateLibrary from './components/TemplateLibrary'
+import StatusBar from './components/StatusBar'
+import NodePalette from './components/NodePalette'
+import { bumpNodeUsage, readNodeUsage, type NodeUsageMap } from './lib/nodeUsage'
 import { useHotkeys } from './hooks/useHotkeys'
 import { useWebSocket, type WSEvent } from './hooks/useWebSocket'
 import ExecutionPanel from './components/ExecutionPanel'
@@ -39,8 +56,19 @@ import DebugPanel from './components/DebugPanel'
 import CapabilityPanel from './components/CapabilityPanel'
 import TriggerPanel from './components/TriggerPanel'
 import GalleryPanel from './components/GalleryPanel'
+import CredentialPanel from './components/CredentialPanel'
 import CommandPalette, { type CommandItem } from './components/CommandPalette'
 import KBPanel from './components/KBPanel'
+import {
+  PALETTE,
+  NODE_OUTPUT_FIELDS,
+  LLM_TOOL_OPTIONS,
+  CANVAS_ONLY_TYPES,
+  initialNodes,
+  initialEdges,
+} from './config/graph'
+import { autoLayout, boundingBox, nextId, stripCanvasOnlyEdges, stripCanvasOnlyNodes } from './lib/graphUtils'
+import { applyTheme, CANVAS_THEME, getInitialTheme, type Theme } from './lib/theme'
 
 const nodeTypes: NodeTypes = {
   start: StartNode,
@@ -57,102 +85,17 @@ const nodeTypes: NodeTypes = {
   data_transform: TransformNode,
   rag_query: RAGNode,
   code: CodeNode,
+  aggregate: AggregateNode,
+  vision: VisionNode,
+  storyboard: TransformNode,
+  shotlist: EditNode,
+  image2image: EditNode,
+  inpaint: EditNode,
+  upscale: EditNode,
+  text2video: EditNode,
+  note: NoteNode,
+  group: GroupNode,
 }
-
-// 节点库（数据驱动：新增节点类型只需在这里加一行）
-const PALETTE: { label: string; items: { type: string; label: string; icon: string; tone: string }[] }[] = [
-  {
-    label: '控制',
-    items: [
-      { type: 'start', label: '开始', icon: '▶', tone: 'tone-control' },
-      { type: 'end', label: '结束', icon: '■', tone: 'tone-control' },
-      { type: 'if_else', label: '条件分支', icon: '⑂', tone: 'tone-warn' },
-      { type: 'loop', label: '循环', icon: '⟳', tone: 'tone-warn' },
-      { type: 'sub_workflow', label: '子工作流', icon: '⧉', tone: 'tone-purple' },
-    ],
-  },
-  {
-    label: 'AI 推理',
-    items: [
-      { type: 'llm', label: '大语言模型', icon: '✦', tone: 'tone-ai' },
-      { type: 'text2image', label: '文生图', icon: '◈', tone: 'tone-ai' },
-      { type: 'rag_query', label: '知识库检索', icon: '⌕', tone: 'tone-ai' },
-    ],
-  },
-  {
-    label: '多模态',
-    items: [
-      { type: 'asr', label: '语音转写', icon: '♪', tone: 'tone-multimodal' },
-      { type: 'tts', label: '语音合成', icon: '◍', tone: 'tone-multimodal' },
-      { type: 'video_compose', label: '视频合成', icon: '▤', tone: 'tone-purple' },
-    ],
-  },
-  {
-    label: '数据处理',
-    items: [
-      { type: 'http_request', label: 'HTTP 请求', icon: '⇄', tone: 'tone-data' },
-      { type: 'code', label: '代码执行', icon: '{ }', tone: 'tone-data' },
-      { type: 'data_transform', label: '数据转换', icon: '⇋', tone: 'tone-muted' },
-    ],
-  },
-]
-
-// 各节点类型的常用输出字段（用于变量提示；与后端 defaultOutputFields 对齐）
-const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
-  http_request: ['text', 'status_code'],
-  if_else: ['text', 'branch'],
-  loop: ['text', 'all', 'iterations', 'stopped_by'],
-  text2image: ['image'],
-  video_compose: ['video'],
-  tts: ['audio'],
-  asr: ['text'],
-  rag_query: ['text', 'context', 'sources', 'hits'],
-  code: ['text', 'code_out'],
-}
-
-// 节点 → 依赖的环境能力（缺了就标灰；用户仍可先编排，环境补齐后直接跑）
-const NODE_REQUIRES: Record<string, string> = {
-  llm: 'llm',
-  text2image: 'image',
-  asr: 'audio',
-  tts: 'audio',
-  video_compose: 'video',
-}
-
-// LLM 节点可用的内置工具（后端 service/tools.go 实现，全部本地执行）
-const LLM_TOOL_OPTIONS = [
-  { id: 'kb_search', label: '知识库检索' },
-  { id: 'http_get', label: 'HTTP 查询' },
-  { id: 'calc', label: '计算器' },
-  { id: 'now', label: '当前时间' },
-]
-
-// 初始示例工作流
-const initialNodes: Node[] = [
-  {
-    id: 'start-1',
-    type: 'start',
-    position: { x: 80, y: 200 },
-    data: { prompt: '用三句话介绍一下人工智能的发展历程' },
-  },
-  {
-    id: 'llm-1',
-    type: 'llm',
-    position: { x: 350, y: 200 },
-    data: { model: '', prompt: '' }, // 留空 = 用服务端自动探测到的本地模型
-  },
-  {
-    id: 'end-1',
-    type: 'end',
-    position: { x: 620, y: 200 },
-    data: {},
-  },
-]
-
-const initialEdges: Edge[] = [
-  { id: 'e1-2', source: 'start-1', target: 'llm-1' },
-  { id: 'e2-3', source: 'llm-1', target: 'end-1' },
-]
 
 // ReactFlowProvider 包裹：useReactFlow 需要 Provider 祖先
 export default function App() {
@@ -174,8 +117,14 @@ function FlowEditor() {
   const [workflowName, setWorkflowName] = useState('未命名工作流')
   const [savedWorkflows, setSavedWorkflows] = useState<any[]>([])
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId?: string } | null>(null)
-  const [isDebugMode, setIsDebugMode] = useState(false)
-  const [pausedNodeId, setPausedNodeId] = useState<string | null>(null)
+  // 调试：debugMode 只是「这次运行按断点执行」的开关，真正的暂停状态来自后端 run.status=paused
+  const [debugMode, setDebugMode] = useState(false)
+  const [runStatus, setRunStatus] = useState<string>('')
+  const [pausedAt, setPausedAt] = useState('')
+  const [pauseReason, setPauseReason] = useState('')
+  const [debugBusy, setDebugBusy] = useState(false)
+  const [theme, setTheme] = useState<Theme>(() => getInitialTheme())
+  const [credOpen, setCredOpen] = useState(false)
   const [lastRunId, setLastRunId] = useState<number | null>(null)
   const [canResume, setCanResume] = useState(false)
   const [kbOpen, setKbOpen] = useState(false)
@@ -183,6 +132,14 @@ function FlowEditor() {
   const [triggerOpen, setTriggerOpen] = useState(false)
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [cmdOpen, setCmdOpen] = useState(false)
+  const [tplLibOpen, setTplLibOpen] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
+  // 模板使用频次：驱动左栏「常用」排序，存在 localStorage
+  const [tplUsage, setTplUsage] = useState<UsageMap>(() => readUsage())
+  const tplEntries = useMemo(() => buildEntries(tplUsage), [tplUsage])
+  const tplTop = useMemo(() => topEntries(tplEntries, 4), [tplEntries])
+  // 节点使用频次：驱动「常用节点」
+  const [nodeUsage, setNodeUsage] = useState<NodeUsageMap>(() => readNodeUsage())
   const [propTab, setPropTab] = useState<'config' | 'output'>('config')
   // 环境就绪状态：用于把「当前跑不了」的节点标灰（仍可拖入画布，方便先编排）
   const [envReady, setEnvReady] = useState<Record<string, boolean> | null>(null)
@@ -195,6 +152,11 @@ function FlowEditor() {
       })
       .catch(() => {})
   }, [])
+
+  // 主题：切换写 data-theme，颜色由 CSS 变量接管
+  useEffect(() => {
+    applyTheme(theme)
+  }, [theme])
   const streamBufRef = useRef<Map<string, string>>(new Map())
   const streamFlushTimer = useRef<number | null>(null)
   const nodeIdRef = useRef(100)
@@ -257,8 +219,9 @@ function FlowEditor() {
   const saveWorkflow = async () => {
     const data = {
       name: workflowName,
-      nodes,
-      edges,
+      // 批注 / 分组是画布装饰，不进工作流定义（否则后端会当成未知节点执行失败）
+      nodes: stripCanvasOnlyNodes(nodes),
+      edges: stripCanvasOnlyEdges(nodes, edges),
     }
 
     try {
@@ -289,8 +252,8 @@ function FlowEditor() {
   const exportWorkflow = () => {
     const data = {
       name: workflowName,
-      nodes: nodes,
-      edges: edges,
+      nodes: stripCanvasOnlyNodes(nodes),
+      edges: stripCanvasOnlyEdges(nodes, edges),
       exported_at: new Date().toISOString(),
     }
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
@@ -530,6 +493,11 @@ function FlowEditor() {
 
   // 添加节点
   const addNode = (type: string) => {
+    if (type === 'group') {
+      groupSelection()
+      return
+    }
+    setNodeUsage(bumpNodeUsage(type))
     pushHistory()
     const id = `node-${nodeIdRef.current++}`
     const newNode: Node = {
@@ -539,7 +507,8 @@ function FlowEditor() {
       position: { x: 200 + (nodeIdRef.current % 5) * 60, y: 150 + (nodeIdRef.current % 5) * 60 },
       data: getDefaultNodeData(type),
     }
-    setNodes((nds) => [...nds, newNode])
+    // 分组框永远垫在最底层，避免盖住节点
+    setNodes((nds) => (type === 'group' ? [newNode, ...nds] : [...nds, newNode]))
   }
 
   // 拖拽放置节点
@@ -575,6 +544,7 @@ function FlowEditor() {
 
   // 开始拖拽
   const onDragStart = (event: React.DragEvent, nodeType: string) => {
+    setNodeUsage(bumpNodeUsage(nodeType))
     event.dataTransfer.setData('application/reactflow', nodeType)
     event.dataTransfer.effectAllowed = 'move'
   }
@@ -598,6 +568,8 @@ function FlowEditor() {
   // 加载模板：若模板内含「嵌套内层定义」（_inner），先自动创建内层工作流
   // 并把返回的 id 回填到 loop / sub_workflow 节点，模板开箱即用
   const loadTemplate = async (template: WorkflowTemplate) => {
+    // 记录使用频次：置顶之外，用得多也会自然浮到前面
+    setTplUsage(bumpUsage(template.id))
     const nodes = JSON.parse(JSON.stringify(template.nodes)) as any[]
 
     for (const n of nodes) {
@@ -625,67 +597,260 @@ function FlowEditor() {
   }
 
   // 执行工作流
+  // ===== 运行 / 调试 =====
+
+  /** 把后端 node_states 回写到画布（状态 + 输出 + 错误） */
+  const applyRunStates = useCallback(
+    (states: any[]) => {
+      if (!Array.isArray(states) || states.length === 0) return
+      const map = new Map(states.map((s) => [s.id, s]))
+      setNodes((nds) =>
+        nds.map((n) => {
+          const st = map.get(n.id)
+          if (!st) return n
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              status: st.status,
+              output: st.output,
+              error: st.error,
+              error_code: st.error_code,
+            },
+          }
+        }),
+      )
+    },
+    [setNodes],
+  )
+
+  /** 轮询到终态（success / failed / paused / interrupted） */
+  const pollRun = useCallback((runId: number, intervalMs = 800) => {
+    return new Promise<any>((resolve) => {
+      const timer = window.setInterval(async () => {
+        try {
+          const resp = await fetch(`/api/runs/${runId}`)
+          const data = await resp.json()
+          if (['success', 'failed', 'paused', 'interrupted'].includes(data.status)) {
+            window.clearInterval(timer)
+            resolve(data)
+          }
+        } catch {
+          /* 网络抖动继续等 */
+        }
+      }, intervalMs)
+    })
+  }, [])
+
   const runWorkflow = async () => {
     setIsRunning(true)
     setRunResult('')
+    setPausedAt('')
+    setPauseReason('')
+    setRunStatus('running')
 
-    setNodes((nds) =>
-      nds.map((n) => ({ ...n, data: { ...n.data, status: 'running' } })),
-    )
+    setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, status: 'running' } })))
 
     try {
+      // 批注 / 分组只存在于画布，绝不能提交给引擎
+      const apiNodes = stripCanvasOnlyNodes(nodes)
+      const apiEdges = stripCanvasOnlyEdges(nodes, edges)
+
       const response = await fetch('/api/workflows', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'MVP Demo',
-          nodes,
-          edges,
-        }),
+        body: JSON.stringify({ name: workflowName || '未命名工作流', nodes: apiNodes, edges: apiEdges }),
       })
 
       const wf = await response.json()
       setCurrentWorkflowId(wf.id)
 
-      const runResp = await fetch(`/api/workflows/${wf.id}/run`, {
-        method: 'POST',
-      })
+      const runResp = await fetch(`/api/workflows/${wf.id}/run`, { method: 'POST' })
       const runData = await runResp.json()
       setLastRunId(runData.run_id)
 
-      const pollInterval = setInterval(async () => {
-        const statusResp = await fetch(`/api/runs/${runData.run_id}`)
-        const statusData = await statusResp.json()
+      const data = await pollRun(runData.run_id)
+      applyRunStates(data.node_states)
 
-        if (statusData.status === 'success' || statusData.status === 'failed') {
-          clearInterval(pollInterval)
-          setIsRunning(false)
+      if (data.status === 'paused') {
+        setRunStatus('paused')
+        setPausedAt(data.paused_at || '')
+        setPauseReason(data.pause_reason || 'breakpoint')
+        setRunResult(`已暂停于 ${data.paused_at || '断点'}`)
+        setIsRunning(false)
+        return
+      }
 
-          if (statusData.status === 'success') {
-            setRunResult('执行成功')
-            setCanResume(false)
-            setNodes((nds) =>
-              nds.map((n) => ({
-                ...n,
-                data: { ...n.data, status: 'success' },
-              })),
-            )
-          } else {
-            setRunResult(`执行失败: ${statusData.error}`)
-            setCanResume(true)
-            setNodes((nds) =>
-              nds.map((n) => ({
-                ...n,
-                data: { ...n.data, status: n.data.status === 'failed' ? 'failed' : n.data.status },
-              })),
-            )
-          }
-        }
-      }, 1000)
+      setRunStatus(data.status)
+      setIsRunning(false)
+      if (data.status === 'success') {
+        setRunResult('执行成功')
+        setCanResume(false)
+      } else {
+        setRunResult(`执行失败: ${data.error}`)
+        setCanResume(true)
+      }
     } catch (err) {
       setIsRunning(false)
+      setRunStatus('failed')
       setRunResult(`错误: ${err}`)
     }
+  }
+
+  /** 调试推进（step / continue）：都是异步的，落库后靠轮询收结果 */
+  const advanceRun = async (mode: 'step' | 'continue') => {
+    if (!lastRunId) {
+      setRunResult('先运行一次工作流，再单步')
+      return
+    }
+    setDebugBusy(true)
+    setRunResult(mode === 'step' ? '单步执行中…' : '继续执行中…')
+    try {
+      const breakpoints = nodes.filter((n) => n.data?.breakpoint).map((n) => n.id)
+      const resp = await fetch(`/api/runs/${lastRunId}/${mode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ breakpoints }),
+      })
+      if (!resp.ok) {
+        const d = await resp.json().catch(() => ({}))
+        setRunResult(d.error || '推进失败')
+        setDebugBusy(false)
+        return
+      }
+      setRunStatus('running')
+      const data = await pollRun(lastRunId, 600)
+      applyRunStates(data.node_states)
+      if (data.status === 'paused') {
+        setRunStatus('paused')
+        setPausedAt(data.paused_at || '')
+        setPauseReason(data.pause_reason || 'step')
+        setRunResult(`已暂停于 ${data.paused_at || '断点'}`)
+      } else {
+        setRunStatus(data.status)
+        setRunResult(data.status === 'success' ? '执行成功' : `执行失败: ${data.error}`)
+      }
+    } catch (e) {
+      setRunResult(`错误: ${e}`)
+    } finally {
+      setDebugBusy(false)
+      setIsRunning(false)
+    }
+  }
+
+  const stopRun = async () => {
+    if (!lastRunId) return
+    await fetch(`/api/runs/${lastRunId}/cancel`, { method: 'POST' })
+    setRunStatus('failed')
+    setRunResult('已中止')
+    setIsRunning(false)
+  }
+
+  /** 从指定节点重跑：上游输出保持不变，只重算该节点及其下游 */
+  const rerunFrom = async (nodeId: string) => {
+    setContextMenu(null)
+    if (!lastRunId) {
+      setRunResult('先完整运行一次，再从节点重跑')
+      return
+    }
+    setRunStatus('running')
+    setRunResult(`从 ${nodeId} 重跑中…`)
+    try {
+      const resp = await fetch(`/api/runs/${lastRunId}/rerun-from`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: nodeId }),
+      })
+      if (!resp.ok) {
+        const d = await resp.json().catch(() => ({}))
+        setRunResult(d.error || '重跑失败')
+        setRunStatus('failed')
+        return
+      }
+      const data = await pollRun(lastRunId)
+      applyRunStates(data.node_states)
+      setRunStatus(data.status)
+      setRunResult(data.status === 'success' ? '重跑完成' : `重跑失败: ${data.error}`)
+    } catch (e) {
+      setRunResult(`错误: ${e}`)
+    }
+  }
+
+  /** 切换断点：红点由 CSS 画，状态存进节点 data（保存后依然生效） */
+  const toggleBreakpoint = (nodeId: string) => {
+    pushHistory()
+    setNodes((nds) =>
+      nds.map((n) =>
+        n.id === nodeId ? { ...n, data: { ...n.data, breakpoint: !n.data?.breakpoint } } : n,
+      ),
+    )
+    setContextMenu(null)
+  }
+
+  /** 自动布局：分层拓扑排版，反复执行结果稳定 */
+  const doAutoLayout = () => {
+    pushHistory()
+    setNodes((nds) => autoLayout(nds, edges))
+    setRunResult('已重新布局')
+  }
+
+  /** 把选中节点装进一个分组框 */
+  const groupSelection = () => {
+    const picked = nodes.filter((n) => n.selected && !CANVAS_ONLY_TYPES.has(n.type ?? '') && !n.parentId)
+    if (picked.length < 2) {
+      setRunResult('先框选至少两个节点再分组')
+      return
+    }
+    const box = boundingBox(nodes, picked.map((n) => n.id))
+    if (!box) return
+    pushHistory()
+    const groupId = nextId('group', new Set(nodes.map((n) => n.id)))
+    const ids = new Set(picked.map((n) => n.id))
+    // 父节点必须排在子节点前面，否则 React Flow 计算位置会错乱
+    const groupNode: Node = {
+      id: groupId,
+      type: 'group',
+      position: { x: box.x, y: box.y },
+      data: { label: '分组' },
+      style: { width: box.width, height: box.height },
+      zIndex: -1,
+    }
+    setNodes((nds) => [
+      groupNode,
+      ...nds.map((n) =>
+        ids.has(n.id)
+          ? {
+              ...n,
+              parentId: groupId,
+              extent: 'parent' as const,
+              position: { x: n.position.x - box.x, y: n.position.y - box.y },
+            }
+          : n,
+      ),
+    ])
+    setRunResult('已分组（拖动框可整体移动）')
+  }
+
+  /** 解散分组：把子节点坐标从相对转回全局 */
+  const ungroup = (groupId: string) => {
+    const group = nodes.find((n) => n.id === groupId)
+    if (!group) return
+    pushHistory()
+    setNodes((nds) =>
+      nds
+        .filter((n) => n.id !== groupId)
+        .map((n) =>
+          n.parentId === groupId
+            ? {
+                ...n,
+                parentId: undefined,
+                extent: undefined,
+                position: { x: n.position.x + group.position.x, y: n.position.y + group.position.y },
+              }
+            : n,
+        ),
+    )
+    setContextMenu(null)
   }
 
   // 断点续跑：复用已完成节点输出，只重跑失败部分
@@ -763,31 +928,100 @@ function FlowEditor() {
         }),
       ),
     )
-    workflowTemplates.forEach((t) =>
+    // 模板按「置顶 > 频次 > 成熟度」排，命令面板里也保持同一顺序
+    tplEntries.forEach((e) =>
       list.push({
-        id: `tpl-${t.id}`,
-        label: `套用模板：${t.name}`,
-        hint: t.description,
+        id: `tpl-${e.tpl.id}`,
+        label: `套用模板：${e.tpl.name}`,
+        hint: `${groupOf(e.meta.group).label} · ${e.meta.maturity === 'stable' ? '稳定' : '试用'} · ${
+          e.meta.useCase || e.tpl.description
+        }`,
         icon: '▦',
-        section: '模板',
-        run: () => loadTemplate(t),
+        section: (e.meta.pinned || 0) > 0 ? '模板 · 置顶' : '模板',
+        run: () => loadTemplate(e.tpl),
       }),
     )
+    list.push({
+      id: 'act-tpl-lib',
+      label: '打开模板库',
+      hint: '分组 / 搜索 / 置顶',
+      icon: '▦',
+      section: '面板',
+      run: () => setTplLibOpen(true),
+    })
     list.push(
       { id: 'panel-kb', label: '打开知识库', icon: '⌕', section: '面板', run: () => setKbOpen(true) },
       { id: 'panel-env', label: '查看运行环境', icon: '◍', section: '面板', run: () => setEnvOpen(true) },
       { id: 'panel-trigger', label: '配置触发器', icon: '⚡', section: '面板', run: () => setTriggerOpen(true) },
       { id: 'panel-gallery', label: '打开产物画廊', icon: '▣', section: '面板', run: () => setGalleryOpen(true) },
+      { id: 'panel-cred', label: '管理凭据', icon: '🔑', section: '面板', run: () => setCredOpen(true) },
       { id: 'act-run', label: '运行工作流', hint: 'Ctrl+Enter', icon: '▶', section: '动作', run: () => runWorkflow() },
       { id: 'act-save', label: '保存工作流', icon: '▤', section: '动作', run: () => saveWorkflow() },
+      { id: 'act-layout', label: '自动布局', icon: '⌗', section: '动作', run: () => doAutoLayout() },
+      { id: 'act-theme', label: '切换深色 / 浅色主题', icon: '☾', section: '动作', run: () => setTheme((t) => (t === 'dark' ? 'light' : 'dark')) },
     )
     return list
   }
 
+  // 断点 / 暂停态是纯视觉标记，挂在节点 wrapper 的 className 上
+  const displayNodes = useMemo(
+    () =>
+      nodes.map((n) => ({
+        ...n,
+        className: [
+          n.data?.breakpoint ? 'has-breakpoint' : '',
+          pausedAt && pausedAt === n.id ? 'is-paused' : '',
+        ]
+          .filter(Boolean)
+          .join(' '),
+      })),
+    [nodes, pausedAt],
+  )
+
+  // 右键菜单项：随目标节点类型变化（分组要能解散，批注没有断点）
+  const contextMenuItems = () => {
+    const cm = contextMenu
+    if (!cm) return []
+    if (cm.nodeId) {
+      const node = nodes.find((n) => n.id === cm.nodeId)
+      const isGroup = node?.type === 'group'
+      const isNote = node?.type === 'note'
+      const items: { label: string; icon?: string; danger?: boolean; onClick: () => void }[] = []
+      if (!isGroup) {
+        items.push({ label: '复制节点', icon: '📋', onClick: () => duplicateNode(cm.nodeId!) })
+      }
+      if (!isGroup && !isNote) {
+        items.push({
+          label: node?.data?.breakpoint ? '取消断点' : '设置断点',
+          icon: '🔴',
+          onClick: () => toggleBreakpoint(cm.nodeId!),
+        })
+        items.push({
+          label: '从该节点重跑',
+          icon: '⟲',
+          onClick: () => rerunFrom(cm.nodeId!),
+        })
+      }
+      if (isGroup) {
+        items.push({ label: '解散分组', icon: '⧈', onClick: () => ungroup(cm.nodeId!) })
+      }
+      items.push({ label: '删除节点', icon: '🗑️', danger: true, onClick: () => deleteNode(cm.nodeId!) })
+      return items
+    }
+    return [
+      { label: '添加批注', icon: '✎', onClick: () => { addNode('note'); setContextMenu(null) } },
+      { label: '添加开始节点', icon: '▶️', onClick: () => { addNode('start'); setContextMenu(null) } },
+      { label: '添加 LLM 节点', icon: '🤖', onClick: () => { addNode('llm'); setContextMenu(null) } },
+      { label: '自动布局', icon: '⌗', onClick: () => { doAutoLayout(); setContextMenu(null) } },
+      { label: '清空画布', icon: '🗑️', danger: true, onClick: () => { setNodes([]); setEdges([]); setContextMenu(null) } },
+    ]
+  }
+
   return (
-    <div className="flex h-screen w-screen">
+    <div className="flex flex-col h-screen w-screen">
+      <div className="flex flex-1 min-h-0">
       {/* 左侧节点库 */}
-      <div className="w-56 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
+      <div className="w-60 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
         <div className="flex items-center justify-between mb-2">
           <h3 className="text-sm font-semibold text-gray-300">节点库</h3>
           <button
@@ -799,45 +1033,42 @@ function FlowEditor() {
           </button>
         </div>
 
-        {PALETTE.map((section) => (
-          <div key={section.label}>
-            <div className="fe-section-label mt-1 mb-1">{section.label}</div>
-            <div className="flex flex-col gap-1">
-              {section.items.map((item) => (
-                <div
-                  key={item.type}
-                  draggable
-                  onDragStart={(e) => onDragStart(e, item.type)}
-                  onClick={() => addNode(item.type)}
-                  title={
-                    NODE_REQUIRES[item.type] && envReady && !envReady[NODE_REQUIRES[item.type]]
-                      ? `当前环境未就绪（缺 ${NODE_REQUIRES[item.type]}），可以先把节点摆好，补齐环境后再运行`
-                      : undefined
-                  }
-                  className={`fe-palette-item flex items-center gap-2 px-2.5 py-1.5 text-left cursor-grab active:cursor-grabbing ${
-                    NODE_REQUIRES[item.type] && envReady && !envReady[NODE_REQUIRES[item.type]]
-                      ? 'opacity-45'
-                      : ''
-                  }`}
-                >
-                  <span className={`fe-palette-icon ${item.tone}`}>{item.icon}</span>
-                  <span className="text-xs">{item.label}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
+        <NodePalette
+          envReady={envReady}
+          usage={nodeUsage}
+          onAdd={addNode}
+          onDragStart={onDragStart}
+        />
 
-        {/* 模板库 */}
-        <div className="fe-section-label mt-3 mb-1">模板</div>
-        {workflowTemplates.map((tpl) => (
+        {/* 模板：左栏只放置顶的几条，全量在模板库面板里 */}
+        <div className="flex items-center justify-between mt-3 mb-1">
+          <div className="fe-section-label">模板</div>
           <button
-            key={tpl.id}
-            onClick={() => loadTemplate(tpl)}
-            className="w-full text-left px-3 py-2 rounded-lg fe-palette-item border border-border hover:border-primary transition-all mb-1"
+            onClick={() => setTplLibOpen(true)}
+            className="text-[10px] text-gray-500 hover:text-white transition-colors"
+            title="打开模板库：分组、搜索、置顶"
           >
-            <p className="text-xs font-medium text-white">{tpl.name}</p>
-            <p className="text-[10px] text-gray-500 truncate">{tpl.description}</p>
+            全部 {tplEntries.length} →
+          </button>
+        </div>
+        {tplTop.map((e) => (
+          <button
+            key={e.tpl.id}
+            onClick={() => loadTemplate(e.tpl)}
+            title={e.meta.pinNote || e.meta.useCase || e.tpl.description}
+            className="w-full text-left px-2.5 py-1.5 fe-palette-item mb-1"
+          >
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11.5px] font-medium text-white truncate flex-1">
+                {e.tpl.name}
+              </span>
+              <span className={`fe-tag ${e.meta.maturity === 'stable' ? 'fe-tag-ok' : 'fe-tag-beta'}`}>
+                {e.meta.maturity === 'stable' ? '稳定' : '试用'}
+              </span>
+            </div>
+            <div className="text-[10px] fe-dim truncate mt-0.5">
+              {e.meta.useCase || e.tpl.description}
+            </div>
           </button>
         ))}
 
@@ -878,97 +1109,196 @@ function FlowEditor() {
       {/* 中间画布区域 */}
       <div className="flex-1 flex flex-col">
         {/* 顶部工具栏 */}
-        <div className="fe-topbar h-14 flex items-center px-4 gap-4">
-          <div className="flex items-center gap-2.5">
+        <div className="fe-topbar flex items-center px-3.5 gap-2">
+          {/* 品牌 + 当前图名 */}
+          <div className="flex items-center gap-2.5 mr-1 shrink-0">
             <div className="fe-logo-mark">
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
                 <path d="M9 1L3 9h4l-1 6 6-8H8l1-6z" fill="white" />
               </svg>
             </div>
-            <h1 className="fe-title text-lg font-bold">FlowEdge</h1>
+            <div className="leading-tight">
+              <h1 className="fe-title text-[14px] font-bold">FlowEdge</h1>
+              <div className="text-[9.5px] fe-dim3 -mt-px">多模态工作流</div>
+            </div>
           </div>
+
+          <div className="fe-vsep" />
 
           <input
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
-            className="px-3 py-1.5 rounded-lg bg-[#0D111B] border border-border text-sm w-48 focus:border-primary outline-none"
+            className="px-2.5 py-1.5 rounded-md bg-[#0A0E14] border border-border text-[12.5px] w-44 focus:border-primary outline-none shrink-0"
             placeholder="工作流名称"
           />
 
-          <div className="flex items-center gap-1.5">
-            <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-success' : 'bg-gray-500'}`} />
-            <span className="text-[10px] text-gray-500">{wsConnected ? '实时' : '离线'}</span>
-          </div>
+          <span className={`fe-pill ${wsConnected ? 'is-online' : 'is-offline'}`}>
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-success' : 'bg-gray-500'}`}
+            />
+            {wsConnected ? '实时' : '离线'}
+          </span>
 
-          <div className="ml-auto flex items-center gap-2">
-            {runResult && (
-              <span className="text-xs text-gray-400">{runResult}</span>
-            )}
-            <button onClick={exportWorkflow} className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm">
-              导出
-            </button>
-            <label className="fe-btn-ghost px-2.5 py-1.5 rounded-lg text-sm cursor-pointer shrink-0 whitespace-nowrap">
-              导入
-              <input type="file" accept=".json" onChange={importWorkflow} className="hidden" />
-            </label>
-            <button onClick={saveWorkflow} className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm">
+          {runResult && (
+            <span className="text-[11px] fe-dim truncate max-w-[300px]" title={runResult}>
+              {runResult}
+            </span>
+          )}
+
+          <div className="ml-auto flex items-center gap-1.5">
+            {/* 一级：高频文件与内容操作 */}
+            <button onClick={saveWorkflow} className="fe-tb" title="保存到本地库">
               保存
             </button>
             <button
               onClick={() => setKbOpen(true)}
-              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+              className="fe-tb"
               title="项目专属语义知识库"
             >
               知识库
             </button>
             <button
               onClick={() => setGalleryOpen(true)}
-              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+              className="fe-tb"
               title="浏览生成的图片 / 视频 / 音频"
             >
               产物
             </button>
-            <button
-              onClick={() => setTriggerOpen(true)}
-              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
-              title="Webhook 调用与定时运行"
-            >
-              ⚡ 触发
-            </button>
-            <button
-              onClick={() => setEnvOpen(true)}
-              className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
-              title="查看 GPU / Ollama / ComfyUI / ffmpeg / 语音服务的可用状态"
-            >
-              环境
-            </button>
+
+            <div className="fe-vsep" />
+
+            {/* 二级：收进「更多」，需要时展开 */}
+            <div className="fe-menu-wrap">
+              <button
+                onClick={() => setMoreOpen((v) => !v)}
+                className={`fe-tb ${moreOpen ? 'is-on' : ''}`}
+                title="更多操作"
+              >
+                ⋯
+              </button>
+              {moreOpen && (
+                <>
+                  <div className="fixed inset-0 z-[55]" onClick={() => setMoreOpen(false)} />
+                  <div className="fe-menu">
+                    <button
+                      onClick={() => {
+                        setTplLibOpen(true)
+                        setMoreOpen(false)
+                      }}
+                    >
+                      <span>模板库</span>
+                      <span className="mi-k">{tplEntries.length}</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setTriggerOpen(true)
+                        setMoreOpen(false)
+                      }}
+                    >
+                      触发 · Webhook / 定时
+                    </button>
+                    <button
+                      onClick={() => {
+                        setEnvOpen(true)
+                        setMoreOpen(false)
+                      }}
+                    >
+                      环境自检
+                    </button>
+                    <button
+                      onClick={() => {
+                        setCredOpen(true)
+                        setMoreOpen(false)
+                      }}
+                    >
+                      凭据管理
+                    </button>
+                    <div className="mi-sep" />
+                    <button
+                      onClick={() => {
+                        exportWorkflow()
+                        setMoreOpen(false)
+                      }}
+                    >
+                      导出 JSON
+                    </button>
+                    <label className="fe-menu-item">
+                      导入 JSON
+                      <input
+                        type="file"
+                        accept=".json"
+                        onChange={(e) => {
+                          importWorkflow(e)
+                          setMoreOpen(false)
+                        }}
+                        className="hidden"
+                      />
+                    </label>
+                    <div className="mi-sep" />
+                    <button
+                      onClick={() => {
+                        doAutoLayout()
+                        setMoreOpen(false)
+                      }}
+                    >
+                      自动布局
+                    </button>
+                    <button
+                      onClick={() => {
+                        groupSelection()
+                        setMoreOpen(false)
+                      }}
+                    >
+                      分组选中节点
+                    </button>
+                    <button
+                      onClick={() => {
+                        setTheme((t) => (t === 'dark' ? 'light' : 'dark'))
+                        setMoreOpen(false)
+                      }}
+                    >
+                      {theme === 'dark' ? '切到浅色主题' : '切到深色主题'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="fe-vsep" />
 
             <DebugPanel
-              isDebugging={isDebugMode}
-              pausedNodeId={pausedNodeId}
-              onStartDebug={() => setIsDebugMode(true)}
-              onPause={() => setPausedNodeId('current')}
-              onResume={() => setPausedNodeId(null)}
-              onStep={() => setPausedNodeId(null)}
-              onStop={() => { setIsDebugMode(false); setPausedNodeId(null) }}
+              debugMode={debugMode}
+              runId={lastRunId}
+              runStatus={runStatus}
+              pausedAt={pausedAt}
+              pauseReason={pauseReason}
+              breakpointCount={nodes.filter((n) => n.data?.breakpoint).length}
+              busy={debugBusy}
+              onStartDebug={() => {
+                setDebugMode(true)
+                setRunResult('调试模式：在节点上右键可加断点，运行后停在你关心的地方')
+              }}
+              onStep={() => advanceRun('step')}
+              onContinue={() => advanceRun('continue')}
+              onStop={stopRun}
             />
 
             {canResume && !isRunning && (
               <button
                 onClick={resumeWorkflow}
-                className="fe-btn-ghost px-3 py-1.5 rounded-lg text-sm"
+                className="fe-tb"
                 title="复用已完成节点的输出，只重跑失败部分"
               >
-                ⟲ 断点续跑
+                ⟲ 续跑
               </button>
             )}
 
             <button
               onClick={runWorkflow}
               disabled={isRunning}
-              className="fe-btn-primary px-5 py-1.5 rounded-lg text-sm font-medium"
+              className={`fe-run-btn ${isRunning ? 'is-going' : ''}`}
             >
-              {isRunning ? '执行中...' : '▶ 运行工作流'}
+              {isRunning ? '执行中…' : '▶ 运行'}
             </button>
           </div>
         </div>
@@ -1006,7 +1336,7 @@ function FlowEditor() {
             )}
 
             <ReactFlow
-              nodes={nodes}
+              nodes={displayNodes}
               edges={edges}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
@@ -1031,14 +1361,14 @@ function FlowEditor() {
               fitView
               className="bg-canvas"
             >
-              <Background color="#1C2436" gap={22} size={1.2} />
+              <Background color={CANVAS_THEME[theme].dot} gap={22} size={1.2} />
               <Controls />
               <MiniMap
                 pannable
                 zoomable
-                bgColor="#0D111B"
-                nodeColor="#6366F1"
-                maskColor="rgba(10, 13, 20, 0.75)"
+                bgColor={CANVAS_THEME[theme].minimapBg}
+                nodeColor={CANVAS_THEME[theme].minimapNode}
+                maskColor={CANVAS_THEME[theme].minimapMask}
               />
             </ReactFlow>
           </div>
@@ -1054,23 +1384,19 @@ function FlowEditor() {
           x={contextMenu.x}
           y={contextMenu.y}
           onClose={() => setContextMenu(null)}
-          items={
-            contextMenu.nodeId
-              ? [
-                  { label: '复制节点', icon: '📋', onClick: () => duplicateNode(contextMenu.nodeId!) },
-                  { label: '删除节点', icon: '🗑️', danger: true, onClick: () => deleteNode(contextMenu.nodeId!) },
-                ]
-              : [
-                  { label: '添加开始节点', icon: '▶️', onClick: () => { addNode('start'); setContextMenu(null) } },
-                  { label: '添加 LLM 节点', icon: '🤖', onClick: () => { addNode('llm'); setContextMenu(null) } },
-                  { label: '清空画布', icon: '🗑️', danger: true, onClick: () => { setNodes([]); setEdges([]); setContextMenu(null) } },
-                ]
-          }
+          items={contextMenuItems()}
         />
       )}
 
       {/* 项目知识库面板 */}
       <KBPanel open={kbOpen} onClose={() => setKbOpen(false)} />
+
+      {/* 模板库：分组 / 搜索 / 置顶 */}
+      <TemplateLibrary
+        open={tplLibOpen}
+        onClose={() => setTplLibOpen(false)}
+        onApply={loadTemplate}
+      />
 
       {/* 运行环境自检面板 */}
       {envOpen && <CapabilityPanel onClose={() => setEnvOpen(false)} />}
@@ -1080,6 +1406,9 @@ function FlowEditor() {
 
       {/* 产物画廊 */}
       {galleryOpen && <GalleryPanel onClose={() => setGalleryOpen(false)} />}
+
+      {/* 凭据管理 */}
+      {credOpen && <CredentialPanel onClose={() => setCredOpen(false)} />}
 
       {/* 命令面板 */}
       {cmdOpen && <CommandPalette items={buildCommands()} onClose={() => setCmdOpen(false)} />}
@@ -1311,7 +1640,39 @@ function FlowEditor() {
             )}
 
             {selectedNode.type === 'text2image' && (
+              <div className="flex flex-col gap-2">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">
+                    批量提示词（一行一条，留空用上游/单条）
+                  </label>
+                  <textarea
+                    rows={4}
+                    value={(selectedNode.data.prompts as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('prompts', e.target.value)}
+                    placeholder={'分镜1：雪山顶的白鹿，远景\n分镜2：鹿的特写，逆光\n分镜3：空镜，只留雪与天'}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y font-mono"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selectedNode.data.split_lines)}
+                    onChange={(e) => updateSelectedNodeData('split_lines', e.target.checked)}
+                  />
+                  把上游文本按行拆成多条（接 LLM 拆分镜时用）
+                </label>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  多条提示词会在**同一次模型加载**里跑完，比逐条省掉每条的冷启动。
+                </p>
+              </div>
+            )}
+
+            {selectedNode.type === 'text2image' && (
               <>
+                <p className="text-[10px] text-warning leading-relaxed mb-2">
+                  flux 的文本编码器以英文为主：纯中文提示词经常只画出「通用风景」。
+                  建议先用 LLM 节点把中文改写/翻译成英文，再喂给文生图。
+                </p>
                 <div>
                   <label className="text-xs text-gray-400 block mb-1">提示词</label>
                   <textarea
@@ -1482,6 +1843,514 @@ function FlowEditor() {
               </>
             )}
 
+            {selectedNode.type === 'aggregate' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">聚合模式</label>
+                  <select
+                    value={(selectedNode.data.mode as string) || 'object'}
+                    onChange={(e) => updateSelectedNodeData('mode', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                  >
+                    <option value="object">按节点汇聚（产出 nodes 映射）</option>
+                    <option value="list">列表（产出 values 数组）</option>
+                    <option value="text">文本拼接（产出 text）</option>
+                    <option value="first">取第一个上游</option>
+                    <option value="last">取最后一个上游</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">取值字段</label>
+                  <input
+                    value={(selectedNode.data.field as string) || 'text'}
+                    onChange={(e) => updateSelectedNodeData('field', e.target.value)}
+                    placeholder="text / image / audio / *（整个输出）"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">参与聚合的节点（可选）</label>
+                  <input
+                    value={(selectedNode.data.inputs as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('inputs', e.target.value)}
+                    placeholder="留空=全部上游；填 node-a,node-b 可指定顺序"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">文本连接符</label>
+                  <input
+                    value={(selectedNode.data.separator as string) ?? '\n\n'}
+                    onChange={(e) => updateSelectedNodeData('separator', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <label className="flex items-center gap-2 text-xs text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={!!selectedNode.data.include_empty}
+                    onChange={(e) => updateSelectedNodeData('include_empty', e.target.checked)}
+                  />
+                  保留空值（默认丢弃空上游）
+                </label>
+              </div>
+            )}
+
+            {selectedNode.type === 'note' && (
+              <div className="flex flex-col gap-2">
+                <label className="text-xs text-gray-400">批注内容</label>
+                <textarea
+                  rows={6}
+                  value={(selectedNode.data.text as string) || ''}
+                  onChange={(e) => updateSelectedNodeData('text', e.target.value)}
+                  placeholder="写给未来的自己：这里为什么这么连？"
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                />
+                <p className="text-[10px] text-gray-500">批注不参与执行，保存时也不会写进工作流定义。</p>
+              </div>
+            )}
+
+            {selectedNode.type === 'tts' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">文本（留空取上游）</label>
+                  <textarea
+                    rows={3}
+                    value={(selectedNode.data.text as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('text', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">语音名片段（可选）</label>
+                  <input
+                    value={(selectedNode.data.voice as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('voice', e.target.value)}
+                    placeholder="如 Huihui；留空用系统默认"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">语速（-10 ~ 10）</label>
+                  <input
+                    type="number"
+                    min={-10}
+                    max={10}
+                    value={Number(selectedNode.data.rate ?? 0)}
+                    onChange={(e) => updateSelectedNodeData('rate', Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <p className="text-[10px] text-gray-500">
+                  Windows 下走系统内置 SAPI（无需 Python 服务）；配置了 TTS_BASE_URL 时优先走服务。
+                </p>
+              </div>
+            )}
+
+            {selectedNode.type === 'storyboard' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">内容需求（留空取上游 text）</label>
+                  <textarea
+                    rows={4}
+                    value={(selectedNode.data.brief as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('brief', e.target.value)}
+                    placeholder="例：师徒二人在雨夜客栈对峙，师傅要废掉徒弟的修为"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">目标总时长（秒）</label>
+                    <input
+                      type="number" min={5} max={180}
+                      value={Number(selectedNode.data.seconds ?? 30)}
+                      onChange={(e) => updateSelectedNodeData('seconds', Number(e.target.value) || 30)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">镜头数上限</label>
+                    <input
+                      type="number" min={1} max={12}
+                      value={Number(selectedNode.data.max_shots ?? 6)}
+                      onChange={(e) => updateSelectedNodeData('max_shots', Number(e.target.value) || 6)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    />
+                  </div>
+                </div>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  输出结构化分镜表：景别 / 角度 / 轴线 / 运镜 / 动作 / 声音 / 台词 / 衔接方式。
+                  时长按内容给（3–8 秒，自动吸附 H3 的 17k+5 帧网格），不强制均分。
+                </p>
+              </div>
+            )}
+
+            {selectedNode.type === 'shotlist' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">分镜表 JSON（留空取上游 plan）</label>
+                  <textarea
+                    rows={5}
+                    value={(selectedNode.data.plan as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('plan', e.target.value)}
+                    placeholder='{"title":"…","character":"…","shots":[…]}"'
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] font-mono resize-y"
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {([['width', '宽'], ['height', '高'], ['steps', '步数']] as const).map(([k, label]) => (
+                    <div key={k}>
+                      <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                      <input
+                        type="number"
+                        value={Number(selectedNode.data[k] ?? 0)}
+                        onChange={(e) => updateSelectedNodeData(k, Number(e.target.value) || 0)}
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.data.turbo !== false}
+                    onChange={(e) => updateSelectedNodeData('turbo', e.target.checked)}
+                  />
+                  涡轮 LoRA（8 步）
+                </label>
+                <label className="flex items-start gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={selectedNode.data.audio_check !== false}
+                    onChange={(e) => updateSelectedNodeData('audio_check', e.target.checked)}
+                  />
+                  <span>
+                    音频抽检（ASR 检测到人声 → 自动压低音量，消除乱语但保留环境声）
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selectedNode.data.interp)}
+                    onChange={(e) => updateSelectedNodeData('interp', e.target.checked)}
+                  />
+                  成片后插帧到 48fps（CPU）
+                </label>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  按每镜 transition 装配：cut=硬切（1 帧）、continue=末帧续接（融 1 帧）、dissolve=叠化 0.3s；
+                  最后统一响度归一。
+                </p>
+              </div>
+            )}
+
+            {selectedNode.type === 'prompt_opt' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">原始想法（留空取上游 text）</label>
+                  <textarea
+                    rows={4}
+                    value={(selectedNode.data.text as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('text', e.target.value)}
+                    placeholder="例：雪山上的白鹿，很美，有大片留白"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">目标时长（秒）</label>
+                    <input
+                      type="number" min={2} max={15}
+                      value={Number(selectedNode.data.seconds ?? 5)}
+                      onChange={(e) => updateSelectedNodeData('seconds', Number(e.target.value) || 5)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">优化目标</label>
+                    <select
+                      value={(selectedNode.data.mode as string) || 'h3'}
+                      onChange={(e) => updateSelectedNodeData('mode', e.target.value)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    >
+                      <option value="h3">MiniMax H3（音视频联合）</option>
+                    </select>
+                  </div>
+                </div>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  按官方指南改写：单一主导动作 + 可见收尾 + 一个主运镜 + ≤2 层声音（绑定可见事件）。
+                  优化失败时自动透传原文，不中断工作流。
+                </p>
+              </div>
+            )}
+
+            {(selectedNode.type === 'image2image' || selectedNode.type === 'inpaint' || selectedNode.type === 'upscale' || selectedNode.type === 'text2video') && (
+              <div className="flex flex-col gap-3">
+                {selectedNode.type !== 'upscale' && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">提示词</label>
+                    <textarea
+                      rows={3}
+                      value={(selectedNode.data.prompt as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('prompt', e.target.value)}
+                      placeholder={selectedNode.type === 'text2video' ? '描述镜头与动作，如 slow push in, wind in the grass' : '改写成什么'}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                    />
+                  </div>
+                )}
+                {(selectedNode.type !== 'text2video' || selectedNode.data.backend === 'h3') && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">
+                      {selectedNode.type === 'text2video' ? '首帧图片（留空=文生视频，连图=图生视频）' : '输入图片（留空取上游）'}
+                    </label>
+                    <input
+                      value={(selectedNode.data.image_path as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('image_path', e.target.value)}
+                      placeholder="留空 = 用上游 image 输出"
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                    />
+                  </div>
+                )}
+                {selectedNode.type === 'inpaint' && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">蒙版路径（白色=重绘区）</label>
+                    <input
+                      value={(selectedNode.data.mask_path as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('mask_path', e.target.value)}
+                      placeholder="与原图同尺寸的黑白图"
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                    />
+                  </div>
+                )}
+                {selectedNode.type === 'image2image' && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">重绘强度（0.1 微调 → 0.9 大改）</label>
+                    <input
+                      type="number" step={0.05} min={0.05} max={1}
+                      value={Number(selectedNode.data.strength ?? 0.6)}
+                      onChange={(e) => updateSelectedNodeData('strength', Number(e.target.value) || 0.6)}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                    />
+                  </div>
+                )}
+                {selectedNode.type === 'upscale' && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">放大模型</label>
+                    <input
+                      value={(selectedNode.data.model as string) || 'RealESRGAN_x4plus.pth'}
+                      onChange={(e) => updateSelectedNodeData('model', e.target.value)}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                    />
+                  </div>
+                )}
+                {selectedNode.type === 'text2video' && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">视频后端</label>
+                    <select
+                      value={(selectedNode.data.backend as string) || 'wan'}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        updateSelectedNodeData('backend', v)
+                        // 切后端时把默认尺寸/帧数一并换掉：H3 必须是 17k+5 帧
+                        if (v === 'h3') {
+                          updateSelectedNodeData('width', 608)
+                          updateSelectedNodeData('height', 352)
+                          updateSelectedNodeData('frames', 124)
+                          updateSelectedNodeData('fps', 24)
+                          updateSelectedNodeData('steps', 20)
+                        } else {
+                          updateSelectedNodeData('width', 832)
+                          updateSelectedNodeData('height', 480)
+                          updateSelectedNodeData('frames', 33)
+                          updateSelectedNodeData('fps', 16)
+                        }
+                      }}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                    >
+                      <option value="wan">Wan 1.3B（快，无声，2 秒）</option>
+                      <option value="h3">MiniMax H3（慢，自带立体声，5 秒）</option>
+                    </select>
+                  </div>
+                )}
+                {selectedNode.type === 'text2video' && (
+                  <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.data.interp)}
+                      onChange={(e) => updateSelectedNodeData('interp', e.target.checked)}
+                    />
+                    出片后插帧翻倍（Wan 16→32fps / H3 24→48fps，CPU 完成，不占显存）
+                  </label>
+                )}
+                {selectedNode.type === 'text2video' && selectedNode.data.backend === 'h3' && (
+                  <label className="flex items-start gap-2 text-[11px] text-gray-400">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={selectedNode.data.prompt_opt !== false}
+                      onChange={(e) => updateSelectedNodeData('prompt_opt', e.target.checked)}
+                    />
+                    <span>
+                      自动优化提示词（推荐）—— 按官方指南改写成「镜头 + 声音分镜」再进模型，
+                      走本地 LLM 约 10 秒；失败自动回退原文
+                    </span>
+                  </label>
+                )}
+                {selectedNode.type === 'text2video' && selectedNode.data.backend === 'h3' && (
+                  <div className="flex flex-col gap-2">
+                    <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                      <input
+                        type="checkbox"
+                        checked={selectedNode.data.turbo !== false}
+                        onChange={(e) => {
+                          updateSelectedNodeData('turbo', e.target.checked)
+                          // turbo 蒸馏后 8 步就够；不带 turbo 才需要 20 步
+                          updateSelectedNodeData('steps', e.target.checked ? 8 : 20)
+                        }}
+                      />
+                      涡轮 LoRA（20 步 → 8 步，约 2.5 倍速；长片必开）
+                    </label>
+                    <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.data.low_vram)}
+                        onChange={(e) => updateSelectedNodeData('low_vram', e.target.checked)}
+                      />
+                      低显存模式（注意力/FFN 分块，可上 736×416）
+                    </label>
+                    <div>
+                      <label className="text-[11px] text-gray-400 block mb-1">
+                        分段数（每段 5.17 秒，自动拆分镜 + 末帧续接 + 拼接，最多 8 段≈41 秒）
+                      </label>
+                      <input
+                        type="number" min={1} max={8}
+                        value={Number(selectedNode.data.segments ?? 1)}
+                        onChange={(e) => updateSelectedNodeData('segments', Number(e.target.value) || 1)}
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                      />
+                    </div>
+                  </div>
+                )}
+                {selectedNode.type === 'text2video' && (
+                  <div className="grid grid-cols-2 gap-2">
+                    {([['width', '宽'], ['height', '高'], ['frames', '帧数'], ['fps', '帧率'], ['steps', '步数']] as const).map(([k, label]) => (
+                      <div key={k}>
+                        <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                        <input
+                          type="number"
+                          value={Number(selectedNode.data[k] ?? 0)}
+                          onChange={(e) => updateSelectedNodeData(k, Number(e.target.value) || 0)}
+                          className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  {selectedNode.type === 'text2video'
+                    ? (selectedNode.data.backend === 'h3'
+                        ? 'MiniMax H3：一次推理同时出画面 + 立体声，608×352×124 帧≈5 秒（实测 172 秒）。会先停掉默认 ComfyUI 腾显存，用完可切回。'
+                        : 'Wan2.1-T2V-1.3B：832×480×33 帧≈2 秒，约 64 秒出片，无音轨。')
+                    : '走 ComfyUI 本地节点，图片不出本机。'}
+                </p>
+              </div>
+            )}
+
+            {selectedNode.type === 'vision' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">提问</label>
+                  <textarea
+                    rows={4}
+                    value={(selectedNode.data.prompt as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('prompt', e.target.value)}
+                    placeholder="想问什么？例如：这张图里的人物衣着是什么朝代？"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">视觉模型（留空自动挑）</label>
+                  <input
+                    value={(selectedNode.data.model as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('model', e.target.value)}
+                    placeholder="qwen2.5vl:7b"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">图片路径（可选，覆盖上游）</label>
+                  <input
+                    value={(selectedNode.data.image_path as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('image_path', e.target.value)}
+                    placeholder="留空 = 用上游 image 输出"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  走本地 Ollama（/api/chat + base64），图片不出本机。单图上限 8MB。
+                </p>
+              </div>
+            )}
+
+            {selectedNode.type === 'asr' && (
+              <div className="flex flex-col gap-2">
+                <label className="text-xs text-gray-400">音频路径（留空取上游 audio）</label>
+                <input
+                  value={(selectedNode.data.audio_path as string) || ''}
+                  onChange={(e) => updateSelectedNodeData('audio_path', e.target.value)}
+                  placeholder="data/generated/tts-xxx.wav"
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                />
+              </div>
+            )}
+
+            {selectedNode.type === 'http_request' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">方法</label>
+                  <select
+                    value={(selectedNode.data.method as string) || 'GET'}
+                    onChange={(e) => updateSelectedNodeData('method', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                  >
+                    {['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">URL</label>
+                  <input
+                    value={(selectedNode.data.url as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('url', e.target.value)}
+                    placeholder="https://api.example.com/v1/chat"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">凭据名（推荐，免明文 Key）</label>
+                  <input
+                    value={(selectedNode.data.credential as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('credential', e.target.value)}
+                    placeholder="如 openai —— 在「凭据」面板里维护"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">请求体（JSON）</label>
+                  <textarea
+                    rows={3}
+                    value={(selectedNode.data.body as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('body', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono resize-y"
+                  />
+                </div>
+              </div>
+            )}
+
             {selectedNode.type === 'end' && (
               <p className="text-xs text-gray-500">
                 结束节点，输出最终结果
@@ -1514,6 +2383,16 @@ function FlowEditor() {
           <p className="text-xs text-gray-500">点击画布中的节点进行配置</p>
         )}
       </div>
+      </div>
+
+      {/* 底部状态栏：计数 / 运行状态 / 显存 / 缩放 */}
+      <StatusBar
+        nodesCount={nodes.length}
+        edgesCount={edges.length}
+        isRunning={isRunning}
+        runStatus={runStatus}
+        gpu={gpuStatus?.gpu}
+      />
     </div>
   )
 }
@@ -1527,7 +2406,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'end':
       return {}
     case 'text2image':
-      return { prompt: '', width: 1024, height: 1024 }
+      return { prompt: '', width: 1024, height: 1024, batch: 1, prompts: '', split_lines: false }
     case 'asr':
       return { audio_path: '' }
     case 'tts':
@@ -1559,6 +2438,31 @@ function getDefaultNodeData(type: string): Record<string, any> {
         code: 'result = strings.ToUpper(inputText)',
         timeout_ms: 30000,
       }
+    case 'aggregate':
+      return { mode: 'object', field: 'text', inputs: '', separator: '\n\n', include_empty: false }
+    case 'vision':
+      return { prompt: '描述这张图片的主体、构图、风格；如果有文字请原样抄下来。', model: '', image_path: '' }
+    case 'prompt_opt':
+      return { mode: 'h3', text: '', seconds: 5 }
+    case 'storyboard':
+      return { brief: '', seconds: 30, max_shots: 6 }
+    case 'shotlist':
+      return {
+        plan: '', backend: 'h3', width: 608, height: 352, steps: 8,
+        turbo: true, audio_check: true, interp: false,
+      }
+    case 'image2image':
+      return { prompt: '', image_path: '', strength: 0.6, steps: 8 }
+    case 'inpaint':
+      return { prompt: '', image_path: '', mask_path: '', denoise: 1.0, steps: 10 }
+    case 'upscale':
+      return { prompt: '', image_path: '', model: 'RealESRGAN_x4plus.pth' }
+    case 'text2video':
+      return { prompt: '', backend: 'wan', width: 832, height: 480, frames: 33, fps: 16, steps: 20, negative: '', low_vram: false, segments: 1, interp: false, prompt_opt: true, turbo: true }
+    case 'note':
+      return { text: '' }
+    case 'group':
+      return { label: '分组' }
     default:
       return {}
   }

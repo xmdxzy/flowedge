@@ -2,9 +2,14 @@ package service
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -200,4 +205,156 @@ func (s *LLMService) ChatWithToolsUsage(messages []toolChatMessage, tools []Tool
 	}
 	msg := out.Choices[0].Message
 	return &msg, out.Usage, nil
+}
+
+// ===== 视觉理解（VLM）=====
+//
+// 走 Ollama 原生 /api/chat（只有它接受 images 数组），而不是 OpenAI 兼容端点。
+// 图片以 base64（不带 data: 前缀）随消息发送，单图上限 8MB——本地视觉模型
+// 对超大图只会更慢，不会更准，先挡在入口比让用户等十分钟更诚实。
+
+const maxVisionImageBytes = 8 << 20
+
+type ollamaChatMessage struct {
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	Images  []string `json:"images,omitempty"`
+}
+
+type ollamaChatRequest struct {
+	Model    string              `json:"model"`
+	Messages []ollamaChatMessage `json:"messages"`
+	Stream   bool                `json:"stream"`
+}
+
+type ollamaChatResponse struct {
+	Message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"message"`
+	PromptEvalCount int `json:"prompt_eval_count"`
+	EvalCount       int `json:"eval_count"`
+}
+
+// VisionChat 图文问答：prompt + 若干本地图片路径
+func (s *LLMService) VisionChat(prompt string, imagePaths []string, model string) (string, LLMUsage, error) {
+	if model == "" {
+		model = s.Model
+	}
+	if len(imagePaths) == 0 {
+		return "", LLMUsage{}, fmt.Errorf("vision node has no image input")
+	}
+
+	images := make([]string, 0, len(imagePaths))
+	for _, p := range imagePaths {
+		st, err := os.Stat(p)
+		if err != nil {
+			return "", LLMUsage{}, fmt.Errorf("图片不存在：%s", p)
+		}
+		if st.Size() > maxVisionImageBytes {
+			return "", LLMUsage{}, fmt.Errorf("图片过大（%.1fMB > 8MB）：%s", float64(st.Size())/(1<<20), filepath.Base(p))
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return "", LLMUsage{}, fmt.Errorf("读取图片失败：%w", err)
+		}
+		images = append(images, base64.StdEncoding.EncodeToString(raw))
+	}
+
+	reqBody := ollamaChatRequest{
+		Model: model,
+		Messages: []ollamaChatMessage{
+			{Role: "user", Content: prompt, Images: images},
+		},
+		Stream: false,
+	}
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", LLMUsage{}, err
+	}
+
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Post(s.BaseURL+"/api/chat", "application/json", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", LLMUsage{}, fmt.Errorf("ollama vision request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+		return "", LLMUsage{}, fmt.Errorf("ollama vision status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var out ollamaChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", LLMUsage{}, fmt.Errorf("decode vision response failed: %w", err)
+	}
+	if strings.TrimSpace(out.Message.Content) == "" {
+		return "", LLMUsage{}, fmt.Errorf("视觉模型返回空内容（模型 %s 可能不支持图片输入）", model)
+	}
+	return out.Message.Content, LLMUsage{PromptTokens: out.PromptEvalCount, CompletionTokens: out.EvalCount}, nil
+}
+
+// visionModelHints 常见视觉模型的命名特征（用于自动挑选）
+var visionModelHints = []string{"vl", "vision", "llava", "minicpm-v", "gemma3", "qwen2.5vl", "qwen3vl", "moondream", "internvl"}
+
+// PickVisionModel 从本地已装模型里挑一个能看图的
+func PickVisionModel(ollamaBase string) string {
+	body, err := httpGetBody(ollamaBase + "/api/tags")
+	if err != nil {
+		return ""
+	}
+	var tags struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(body, &tags) != nil {
+		return ""
+	}
+	for _, m := range tags.Models {
+		lower := strings.ToLower(m.Name)
+		for _, h := range visionModelHints {
+			if strings.Contains(lower, h) {
+				return m.Name
+			}
+		}
+	}
+	return ""
+}
+
+// LoadedModels 列出当前驻留在显存/内存里的模型（Ollama /api/ps）
+func (s *LLMService) LoadedModels() []string {
+	body, err := httpGetBody(s.BaseURL + "/api/ps")
+	if err != nil {
+		return nil
+	}
+	var ps struct {
+		Models []struct {
+			Name string `json:"name"`
+			Size int64  `json:"size_vram"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(body, &ps) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(ps.Models))
+	for _, m := range ps.Models {
+		out = append(out, m.Name)
+	}
+	return out
+}
+
+// UnloadAllLoaded 把 Ollama 里所有已驻留模型卸掉（keep_alive=0）。
+//
+// 为什么需要：3090 只有 24GB，flux 一类扩散模型就要 17GB，
+// 再叠一个 14B LLM 立刻 OOM。执行前按需卸载，比事后 OOM 重试省得多。
+func (s *LLMService) UnloadAllLoaded() int {
+	names := s.LoadedModels()
+	n := 0
+	for _, name := range names {
+		if err := s.UnloadModel(name); err == nil {
+			n++
+		}
+	}
+	return n
 }

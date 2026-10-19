@@ -7,6 +7,17 @@ interface Artifact {
   mod_time: number
 }
 
+interface LineageNode {
+  name: string
+  kind: string
+  node_id: string
+  node_type: string
+  run_id: number
+  workflow_id: number
+  parents: string
+  meta: string
+}
+
 interface Props {
   onClose: () => void
 }
@@ -25,6 +36,8 @@ export default function GalleryPanel({ onClose }: Props) {
   const [preview, setPreview] = useState<Artifact | null>(null)
   const [loading, setLoading] = useState(false)
   const [filter, setFilter] = useState<'all' | 'image' | 'video' | 'audio'>('all')
+  const [lineage, setLineage] = useState<{ self: LineageNode; ancestors: LineageNode[] } | null>(null)
+  const [lineageNote, setLineageNote] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -41,6 +54,34 @@ export default function GalleryPanel({ onClose }: Props) {
   useEffect(() => {
     load()
   }, [load])
+
+  // 产物血缘：点开预览时按名字查来源链（没有记录时给出明确说明，不假装有）
+  useEffect(() => {
+    if (!preview) {
+      setLineage(null)
+      setLineageNote('')
+      return
+    }
+    let alive = true
+    fetch(`/api/artifacts/${encodeURIComponent(preview.name)}/lineage`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (!alive) return
+        if (d?.available && d.self) {
+          setLineage({ self: d.self, ancestors: Array.isArray(d.ancestors) ? d.ancestors : [] })
+          setLineageNote('')
+        } else {
+          setLineage(null)
+          setLineageNote(d?.reason || '没有血缘记录')
+        }
+      })
+      .catch(() => {
+        if (alive) setLineageNote('血缘查询失败')
+      })
+    return () => {
+      alive = false
+    }
+  }, [preview])
 
   const remove = async (name: string) => {
     if (!confirm(`删除产物 ${name}？`)) return
@@ -190,6 +231,48 @@ export default function GalleryPanel({ onClose }: Props) {
             >
               复制路径（可在节点里复用）
             </button>
+          </div>
+
+          {/* 来源链：由哪个节点产出、上游用了哪些图/音 */}
+          <div
+            className="mt-3 w-[min(720px,80vw)] max-h-[22vh] overflow-y-auto rounded-lg bg-surface/90 border border-border px-3 py-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="text-[10px] text-gray-500 mb-1">来源（产物血缘）</p>
+            {lineage ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-[11px] text-white">
+                  <span className="text-primary font-mono">{lineage.self.node_id}</span>
+                  <span className="text-gray-500">（{lineage.self.node_type}）</span>
+                  <span className="text-gray-500">
+                    {' '}
+                    · 工作流 #{lineage.self.workflow_id} · 运行 #{lineage.self.run_id}
+                  </span>
+                </p>
+                {(() => {
+                  try {
+                    const meta = JSON.parse(lineage.self.meta || '{}')
+                    return meta.prompt ? (
+                      <p className="text-[10px] text-gray-400 line-clamp-2">提示词：{String(meta.prompt)}</p>
+                    ) : null
+                  } catch {
+                    return null
+                  }
+                })()}
+                {lineage.ancestors.length > 0 && (
+                  <p className="text-[10px] text-gray-400">
+                    上游：
+                    {lineage.ancestors.map((a) => (
+                      <span key={a.name} className="font-mono text-gray-300 mr-2">
+                        {a.name}
+                      </span>
+                    ))}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-[10px] text-gray-600">{lineageNote || '查询中…'}</p>
+            )}
           </div>
         </div>
       )}

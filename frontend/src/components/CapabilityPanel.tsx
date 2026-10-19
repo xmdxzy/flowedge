@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
+import DepsSection from './DepsSection'
+import ModelsSection from './ModelsSection'
 
 interface Capability {
   ok: boolean
@@ -15,6 +17,7 @@ interface Capabilities {
   gpu: Capability
   ollama: Capability
   comfyui: Capability
+  vision: Capability
   ffmpeg: Capability
   asr: Capability
   tts: Capability
@@ -56,6 +59,7 @@ const ITEMS: { key: keyof Capabilities; label: string; need: string; effect: str
   { key: 'gpu', label: 'NVIDIA GPU', need: '显卡驱动', effect: 'CUDA 推理' },
   { key: 'ollama', label: 'Ollama', need: 'ollama.com 安装包', effect: 'LLM 推理 / 知识库向量化' },
   { key: 'comfyui', label: 'ComfyUI', need: '本地 ComfyUI', effect: '文生图' },
+  { key: 'vision', label: '视觉理解 (VLM)', need: 'Ollama + VL 模型', effect: '看图回答 / 素材审核' },
   { key: 'ffmpeg', label: 'ffmpeg', need: 'gyan.dev 静态包', effect: '视频合成' },
   { key: 'asr', label: '语音转写服务', need: 'Python + faster-whisper', effect: '语音转文字' },
   { key: 'tts', label: '语音合成服务', need: 'Python（Windows 自带 SAPI）', effect: '文字转语音' },
@@ -201,6 +205,24 @@ export default function CapabilityPanel({ onClose }: Props) {
                 </div>
               )
             })}
+          </div>
+
+          {/* 模型资产：统一放在 D 盘模型根，这里列出家族与体积 */}
+          <div className="mt-4 pt-3 border-t border-border">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-gray-300">模型资产</span>
+              <span className="text-[10px] text-gray-500">点开看具体文件</span>
+            </div>
+            <ModelsSection />
+          </div>
+
+          {/* 依赖进程托管：ComfyUI / ASR 一键启动（起完自动重测能力） */}
+          <div className="mt-4 pt-3 border-t border-border">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-gray-300">依赖进程</span>
+              <span className="text-[10px] text-gray-500">由引擎托管，无需另开终端</span>
+            </div>
+            <DepsSection onChanged={refresh} />
           </div>
 
           {/* 显存调度：谁占着显存、有没有被驱逐 */}

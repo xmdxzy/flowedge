@@ -36,12 +36,15 @@ type Workflow struct {
 type WorkflowRun struct {
 	ID         uint            `gorm:"primaryKey" json:"id"`
 	WorkflowID uint            `gorm:"index" json:"workflow_id"`
-	Status     string          `gorm:"size:20;default:pending" json:"status"` // pending, running, success, failed
+	Status     string          `gorm:"size:20;default:pending" json:"status"` // pending, running, paused, success, failed
 	NodeStates json.RawMessage `gorm:"type:text" json:"node_states"`
 	Error      string          `gorm:"type:text" json:"error,omitempty"`
-	StartedAt  *time.Time      `json:"started_at,omitempty"`
-	EndedAt    *time.Time      `json:"ended_at,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
+	// 断点调试：停在哪个节点 / 为什么停（step=单步耗尽，breakpoint=断点）
+	PausedAt    string     `gorm:"size:64" json:"paused_at,omitempty"`
+	PauseReason string     `gorm:"size:32" json:"pause_reason,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	EndedAt     *time.Time `json:"ended_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 // NodeInstance 节点运行时状态

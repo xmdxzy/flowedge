@@ -19,6 +19,7 @@ import (
 // Text2ImageService 文生图服务（ComfyUI 兼容）
 type Text2ImageService struct {
 	BaseURL    string
+	H3BaseURL  string // H3 专用实例（ComfyUI-H3 工作树，独立 venv/torch）
 	Checkpoint string
 	OutputDir  string // 生成图片落盘目录（默认 data/generated）
 	Template   string // ComfyUI 工作流模板名（data/comfy_workflows/<name>.json）
@@ -29,8 +30,13 @@ func NewText2ImageService(baseURL, checkpoint string) *Text2ImageService {
 	if checkpoint == "" {
 		checkpoint = "flux1-schnell-fp8.safetensors"
 	}
+	h3Base := os.Getenv("H3_BASE_URL")
+	if h3Base == "" {
+		h3Base = "http://127.0.0.1:8189"
+	}
 	return &Text2ImageService{
 		BaseURL:    baseURL,
+		H3BaseURL:  h3Base,
 		Checkpoint: checkpoint,
 		client: &http.Client{
 			Timeout: 300 * time.Second,
@@ -39,13 +45,17 @@ func NewText2ImageService(baseURL, checkpoint string) *Text2ImageService {
 }
 
 // UnloadModels 让 ComfyUI 释放已加载模型（POST /free）。
-// 没有这个，LLM 与 flux 抢显存时调度器只能记账，显存实际一点没让出来。
+//
+// 注意：必须带 {"unload_models":true,"free_memory":true} 的请求体。
+// 空 body 的 /free 只做了一部分清理，实测显存不归还（flux 17GB 仍占着），
+// 结果就是「换侧」后 VLM 再进来直接顶到 23.9GB/24GB。
 func (s *Text2ImageService) UnloadModels() error {
 	if s.BaseURL == "" {
 		return fmt.Errorf("%w: ComfyUI 未配置", ErrServiceNotConfigured)
 	}
 	cl := &http.Client{Timeout: 10 * time.Second}
-	resp, err := cl.Post(s.BaseURL+"/free", "application/json", nil)
+	payload, _ := json.Marshal(map[string]bool{"unload_models": true, "free_memory": true})
+	resp, err := cl.Post(s.BaseURL+"/free", "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -54,6 +64,32 @@ func (s *Text2ImageService) UnloadModels() error {
 		return fmt.Errorf("comfyui free status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// FreeVRAMMB 查询 ComfyUI 侧当前可用显存（MB）。
+// 卸载是异步的：/free 返回后显存要几秒才真正归还，换侧前必须等这一刻。
+func (s *Text2ImageService) FreeVRAMMB() (int, error) {
+	if s.BaseURL == "" {
+		return 0, fmt.Errorf("comfyui not configured")
+	}
+	cl := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cl.Get(s.BaseURL + "/system_stats")
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Devices []struct {
+			VRAMFree int64 `json:"vram_free"`
+		} `json:"devices"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&st); err != nil {
+		return 0, err
+	}
+	if len(st.Devices) == 0 {
+		return 0, fmt.Errorf("comfyui reported no devices")
+	}
+	return int(st.Devices[0].VRAMFree / (1 << 20)), nil
 }
 
 // ComfyTemplateDir ComfyUI 工作流模板目录（用户把自己的 workflow JSON 放这里即可接入）
@@ -299,12 +335,17 @@ type comfyHistoryEntry struct {
 		StatusStr string `json:"status_str"`
 	} `json:"status"`
 	Outputs map[string]struct {
-		Images []struct {
-			Filename  string `json:"filename"`
-			Subfolder string `json:"subfolder"`
-			Type      string `json:"type"`
-		} `json:"images"`
+		Images []comfyFileRef `json:"images"`
+		Gifs   []comfyFileRef `json:"gifs"`
+		Videos []comfyFileRef `json:"videos"`
 	} `json:"outputs"`
+}
+
+// comfyFileRef ComfyUI 产物引用（图片 / gif / 视频共用）
+type comfyFileRef struct {
+	Filename  string `json:"filename"`
+	Subfolder string `json:"subfolder"`
+	Type      string `json:"type"`
 }
 
 // ASRService 语音转写服务
@@ -379,15 +420,48 @@ func NewTTSService(baseURL string) *TTSService {
 	}
 }
 
-// Synthesize 文字转语音
-func (s *TTSService) Synthesize(text string, outputPath string) error {
-	if s.BaseURL == "" {
-		// 未配置必须显式失败：写一个假音频文件会让下游节点「成功」产出垃圾
-		return fmt.Errorf("%w: TTS 服务未配置（设置 TTS_BASE_URL，或由桌面客户端自动拉起语音服务）", ErrServiceNotConfigured)
-	}
+// TTSOptions 语音合成参数（当前仅内置 SAPI 后端使用；HTTP 服务端可选支持）
+type TTSOptions struct {
+	Voice string // 语音名片段，如 "Huihui"；空则用系统默认
+	Rate  int    // 语速 -10..10
+}
 
+// Synthesize 文字转语音（兼容旧调用）
+func (s *TTSService) Synthesize(text string, outputPath string) error {
+	_, err := s.SynthesizeWith(text, outputPath, TTSOptions{})
+	return err
+}
+
+// SynthesizeWith 文字转语音，返回实际使用的后端（service / sapi）
+//
+// 降级顺序：显式配置的 TTS_BASE_URL 服务 → Windows 内置 SAPI。
+// 两条路都不通时显式失败——绝不写出假音频让下游「成功」产出垃圾。
+func (s *TTSService) SynthesizeWith(text string, outputPath string, opt TTSOptions) (string, error) {
+	if s.BaseURL != "" {
+		if err := s.synthesizeHTTP(text, outputPath, opt); err != nil {
+			return "", err
+		}
+		return "service", nil
+	}
+	if SAPIAvailable() {
+		if err := synthesizeSAPI(text, outputPath, opt.Voice, opt.Rate); err != nil {
+			return "", err
+		}
+		return "sapi", nil
+	}
+	return "", fmt.Errorf("%w: TTS 不可用：未配置 TTS_BASE_URL，且当前系统不支持 Windows 内置语音（非 Windows，或已设置 FLOWEDGE_TTS_SAPI=0）", ErrServiceNotConfigured)
+}
+
+// synthesizeHTTP 走本地 / 远程 TTS 服务
+func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptions) error {
 	reqBody := map[string]interface{}{
 		"text": text,
+	}
+	if opt.Voice != "" {
+		reqBody["voice"] = opt.Voice
+	}
+	if opt.Rate != 0 {
+		reqBody["rate"] = opt.Rate
 	}
 	jsonBody, _ := json.Marshal(reqBody)
 
@@ -403,6 +477,9 @@ func (s *TTSService) Synthesize(text string, outputPath string) error {
 	}
 
 	// 保存音频文件
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return err
+	}
 	out, err := os.Create(outputPath)
 	if err != nil {
 		return err
@@ -471,7 +548,11 @@ func (s *VideoService) ComposeVideoMulti(imagePaths []string, audioPath string, 
 		args = append(args, "-i", audioPath)
 	}
 
-	// 视频流拼接
+	// 视频流拼接。
+	//
+	// 单图场景曾经有个隐蔽 bug：只有多图才加 -map [v]，单图时又用 -map 1:a 指了音轨，
+	// ffmpeg 在有显式 -map 时只输出被映射的流 → 产出一个「只有声音没有画面」的 mp4。
+	// 这里统一显式映射视频流，单图也必须走 -map 0:v。
 	if len(imagePaths) > 1 {
 		var filter string
 		for i := range imagePaths {
@@ -479,6 +560,8 @@ func (s *VideoService) ComposeVideoMulti(imagePaths []string, audioPath string, 
 		}
 		filter += fmt.Sprintf("concat=n=%d:v=1:a=0[v]", len(imagePaths))
 		args = append(args, "-filter_complex", filter, "-map", "[v]")
+	} else {
+		args = append(args, "-map", "0:v")
 	}
 
 	args = append(args, "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p")

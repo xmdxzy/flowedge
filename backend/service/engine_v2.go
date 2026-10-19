@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +21,73 @@ const (
 	defaultNodeTimeout = 180 * time.Second
 	maxNodeTimeout     = 30 * time.Minute
 )
+
+// nodeTimeoutFor 按节点类型与工作量估算超时。
+//
+// 固定 180s 在「批量出图」和「分段视频」上会误杀合法任务（实测 5 条提示词
+// 需要 ~3 分钟、2 段 H3 视频需要 ~5 分钟）。这里按实际提交量给预算，
+// 仍然保留 data.timeout_ms 覆盖，且有 maxNodeTimeout 兜底。
+func nodeTimeoutFor(n *model.NodeInstance) time.Duration {
+	switch n.Type {
+	case "text2video":
+		backend, _ := n.Data["backend"].(string)
+		if backend == "h3" {
+			segs := int(fieldFloat(n, "segments", 1))
+			if segs < 1 {
+				segs = 1
+			}
+			return time.Duration(segs) * 12 * time.Minute // 每段约 2–3 分钟，留余量
+		}
+		return 25 * time.Minute
+	case "text2image":
+		prompts := len(splitPromptLines(n.Data["prompts"]))
+		batch := int(fieldFloat(n, "batch", 1))
+		if batch < 1 {
+			batch = 1
+		}
+		n2 := prompts
+		if n2 < batch {
+			n2 = batch
+		}
+		if n2 < 1 {
+			n2 = 1
+		}
+		// 首张含模型加载：给 4 分钟；此后每张按 75 秒累计
+		return time.Duration(240+n2*75) * time.Second
+	case "shotlist":
+		// 分镜执行器：按时长/镜头数给预算。默认 180s 会被合法长片直接砍断。
+		// 计划里能解析出镜头数就按「每镜 3 分钟 + 5 分钟后期」给，否则给满上限。
+		shots := 0
+		if raw, ok := n.Data["plan"].(string); ok && raw != "" {
+			if p, err := ParseShotPlan(raw); err == nil {
+				shots = len(p.Shots)
+			}
+		}
+		if shots == 0 {
+			return maxNodeTimeout
+		}
+		d := time.Duration(shots*3+5) * time.Minute
+		if d > maxNodeTimeout {
+			d = maxNodeTimeout
+		}
+		return d
+	case "storyboard":
+		return 5 * time.Minute // LLM 规划 + JSON 校验
+	case "image2image", "inpaint", "upscale":
+		return 10 * time.Minute
+	case "asr":
+		return 15 * time.Minute // 长音频分段转写
+	}
+	return defaultNodeTimeout
+}
+
+// fieldFloat 读节点数值字段（JSON 反序列化后统一是 float64）
+func fieldFloat(n *model.NodeInstance, key string, def float64) float64 {
+	if v, ok := n.Data[key].(float64); ok && v != 0 {
+		return v
+	}
+	return def
+}
 
 // ErrServiceNotConfigured 依赖的外部服务未配置（ASR / TTS 等）。
 // 铁律：未配置必须显式失败，绝不能伪造成功结果——那会让用户以为真的跑通了。
@@ -76,7 +144,11 @@ type EngineV2 struct {
 	tools           *ToolExecutor
 	cache           *NodeCache
 	eventLog        *EventLogger
-	nodes           nodeRegistry // 节点类型注册表（内置 14 种 + 可注册自定义）
+	creds           *CredentialStore // 凭据仓库（HTTP 节点按名称取密钥）
+	visionModel     string           // 自动探测到的本地视觉模型（vision 节点留空时使用）
+	vram            *vramArbiter     // 显存仲裁：同一时刻只跑一个重任务
+	deps            *Supervisor      // 依赖进程托管（H3 需要按需切换实例）
+	nodes           nodeRegistry     // 节点类型注册表（内置 15 种 + 可注册自定义）
 	runMu           sync.Mutex
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
@@ -98,6 +170,15 @@ func (e *EngineV2) SetCache(c *NodeCache) { e.cache = c }
 
 // SetEventLog 注入事件日志（nil 表示只广播不落库）
 func (e *EngineV2) SetEventLog(l *EventLogger) { e.eventLog = l }
+
+// SetCredentials 注入凭据仓库（HTTP 节点 credential 字段生效的前提）
+func (e *EngineV2) SetCredentials(c *CredentialStore) { e.creds = c }
+
+// SetVisionModel 注入自动探测到的视觉模型名（vision 节点未显式指定模型时使用）
+func (e *EngineV2) SetVisionModel(name string) { e.visionModel = name }
+
+// SetSupervisor 注入依赖管理器（H3 需要它来切换 ComfyUI 实例）
+func (e *EngineV2) SetSupervisor(s *Supervisor) { e.deps = s }
 
 // ctxKeyRunID runID 在 context 里的键类型（避免与其他包的 context 键冲突）
 type ctxKeyRunID struct{}
@@ -180,6 +261,54 @@ func (e *EngineV2) ExecuteWithRunID(nodesJSON, edgesJSON []byte, runID uint, per
 	}()
 
 	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, "", persist)
+}
+
+// ExecuteWithControl 带单步/断点控制的可取消执行入口。
+// rc 为 nil 时与 ExecuteWithRunID 完全等价。
+func (e *EngineV2) ExecuteWithControl(nodesJSON, edgesJSON []byte, runID uint, rc *RunControl, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = withRunID(ctx, runID)
+	ctx = withRunControl(ctx, rc)
+
+	e.runMu.Lock()
+	if e.activeRuns == nil {
+		e.activeRuns = make(map[uint]context.CancelFunc)
+	}
+	e.activeRuns[runID] = cancel
+	e.runMu.Unlock()
+
+	defer func() {
+		cancel()
+		e.runMu.Lock()
+		delete(e.activeRuns, runID)
+		e.runMu.Unlock()
+	}()
+
+	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, "", persist)
+}
+
+// ResumeWithControl 断点续跑 + 单步/断点控制。
+// 单步调试的每一次「继续」都是走这里：已成功节点复用输出，只有 pending 节点会真正执行。
+func (e *EngineV2) ResumeWithControl(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, runID uint, rc *RunControl, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = withRunID(ctx, runID)
+	ctx = withRunControl(ctx, rc)
+
+	e.runMu.Lock()
+	if e.activeRuns == nil {
+		e.activeRuns = make(map[uint]context.CancelFunc)
+	}
+	e.activeRuns[runID] = cancel
+	e.runMu.Unlock()
+
+	defer func() {
+		cancel()
+		e.runMu.Lock()
+		delete(e.activeRuns, runID)
+		e.runMu.Unlock()
+	}()
+
+	return e.runWithContext(ctx, nodesJSON, edgesJSON, prev, "", persist)
 }
 
 // CancelRun 中止一个正在运行的工作流，返回是否找到该运行
@@ -483,6 +612,20 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 			go func(nid string) {
 				defer wg.Done()
 
+				// 单步 / 断点：先向控制对象申请执行许可。
+				// 命中断点或预算用尽时节点保持 pending（不置 running、不写 started_at），
+				// 这样 Resume 时它会被当作「未执行」重新排队，语义与用户预期一致。
+				if rc := runControlFrom(ctx); rc != nil {
+					if rc.ShouldPauseBefore(nid) {
+						rc.MarkPaused(nid, "breakpoint")
+						return
+					}
+					if !rc.Take() {
+						rc.MarkPaused(nid, "step")
+						return
+					}
+				}
+
 				mu.Lock()
 				node := nodeMap[nid]
 				node.Status = "running"
@@ -524,7 +667,7 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				}
 
 				// 节点级超时：data.timeout_ms 覆盖默认 180s（上限 30 分钟）
-				timeout := defaultNodeTimeout
+				timeout := nodeTimeoutFor(node)
 				if ms, ok := node.Data["timeout_ms"].(float64); ok && ms > 0 {
 					timeout = time.Duration(ms) * time.Millisecond
 					if timeout > maxNodeTimeout {
@@ -641,6 +784,17 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 
 		wg.Wait()
 
+		// 单步 / 断点命中：把当前进度落库后正常返回（不是失败）。
+		// 调用方从 RunControl.State() 读出停在哪个节点，再决定继续还是中止。
+		if rc := runControlFrom(ctx); rc != nil {
+			if paused, _, _ := rc.State(); paused {
+				if persist != nil {
+					persist(nodes)
+				}
+				return nodes, nil
+			}
+		}
+
 		if layerFailed {
 			for _, id := range order {
 				if nodeMap[id].Status == "pending" {
@@ -700,6 +854,15 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"rag_query":      plain(e.execRAGNode),
 		"sub_workflow":   e.execSubWorkflowNode,
 		"loop":           e.execLoopNode,
+		"aggregate":      plain(e.execAggregateNode),
+		"vision":         e.execVisionNode,
+		"prompt_opt":     e.execPromptOptNode,
+		"storyboard":     e.execStoryboardNode,
+		"shotlist":       e.execShotListNode,
+		"image2image":    e.execImage2ImageNode,
+		"inpaint":        e.execInpaintNode,
+		"upscale":        e.execUpscaleNode,
+		"text2video":     e.execText2VideoNode,
 		"end":            plain(e.execEndNode),
 		"code":           e.execCodeNode,
 	}
@@ -759,6 +922,10 @@ func (e *EngineV2) execStartNode(node *model.NodeInstance, upstream map[string]i
 }
 
 func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	// LLM 与扩散模型共用 24GB：换侧时让扩散侧先释放
+	release := e.enterSide(sideLanguage)
+	defer release()
+
 	// 节点级提示词 = 指令前缀；上游文本 = 输入主体。两者拼接，缺一不可丢
 	runID := runIDFrom(ctx)
 	instruction := ""
@@ -994,7 +1161,31 @@ func (e *EngineV2) streamFinalAnswer(ctx context.Context, node *model.NodeInstan
 	return sb.String(), usage, nil
 }
 
+// splitPromptLines 把「一行一条」的批量提示词拆成切片
+func splitPromptLines(v interface{}) []string {
+	raw, ok := v.(string)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+	// 24GB 上不能同时养 flux 与 14B LLM：换侧（清语言侧）并独占执行
+	release := e.enterSide(sideDiffusion)
+	defer release()
+	// H3 实例在跑时默认实例是停的，出图前自动切回（已健康时是空操作）
+	if err := e.ensureComfy(""); err != nil {
+		return nil, err
+	}
+
 	// 显存调度：flux 与 LLM 抢同一块 24GB 显存，不纳入调度就会出现
 	// 「LLM 已加载 + 直接起 flux」→ OOM。此前只有 LLM 节点走调度。
 	if e.gpuSched != nil && e.t2i != nil && e.t2i.Checkpoint != "" {
@@ -1034,6 +1225,58 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		height = int(h)
 	}
 
+	// 多提示词批量（分镜 / 角色表 / 表情包）：
+	//   prompts 字段一行一条；或勾了 split_lines 时把上游整段文本按行拆。
+	// 关键收益不是并行，而是**只加载一次 17GB 模型**——逐条跑每条都要重载。
+	prompts := splitPromptLines(node.Data["prompts"])
+	if len(prompts) < 2 {
+		if v, ok := node.Data["split_lines"].(bool); ok && v {
+			prompts = splitPromptLines(prompt)
+		}
+	}
+	if len(prompts) > 1 {
+		if len(prompts) > 12 {
+			prompts = prompts[:12] // 单次图上限：再多只会把排队时间拉长，收益不再增长
+		}
+		paths, err := e.t2i.GenerateImagesFromPrompts(prompts, width, height)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"text":    prompts[0],
+			"image":   paths[0],
+			"images":  paths,
+			"count":   len(paths),
+			"prompts": prompts,
+		}, nil
+	}
+
+	// 批量：一次提交出 n 张，共用同一次模型加载（省掉 n 次冷启动）。
+	// 输出同时给 image（第一张）与 images（全部），旧工作流不用改。
+	batch := 1
+	if v, ok := node.Data["batch"].(float64); ok && int(v) > 1 {
+		batch = int(v)
+		if batch > 8 {
+			batch = 8 // 24GB 上一次 8 张已经够用，再多只会把显存与时间拉满
+		}
+	}
+
+	if batch > 1 {
+		paths, err := e.t2i.GenerateImages(prompt, width, height, batch)
+		if err != nil {
+			return nil, err
+		}
+		if len(paths) == 0 {
+			return nil, fmt.Errorf("批量出图没有产出")
+		}
+		return map[string]interface{}{
+			"text":   prompt,
+			"image":  paths[0],
+			"images": paths,
+			"count":  len(paths),
+		}, nil
+	}
+
 	imagePath, err := e.t2i.GenerateImage(prompt, width, height)
 	if err != nil {
 		return nil, err
@@ -1065,6 +1308,9 @@ func (e *EngineV2) execASRNode(node *model.NodeInstance, upstream map[string]int
 		return nil, fmt.Errorf("asr node has no audio input")
 	}
 
+	release := e.enterSide(sideAudio)
+	defer release()
+
 	text, err := e.asr.Transcribe(audioPath)
 	if err != nil {
 		return nil, err
@@ -1094,18 +1340,33 @@ func (e *EngineV2) execTTSNode(node *model.NodeInstance, upstream map[string]int
 	}
 
 	outputPath := fmt.Sprintf("data/generated/tts-%d.wav", time.Now().UnixNano())
-	if p, ok := node.Data["output_path"].(string); ok {
+	if p, ok := node.Data["output_path"].(string); ok && p != "" {
 		outputPath = p
 	}
 
-	err := e.tts.Synthesize(text, outputPath)
+	// 语音名 / 语速：Windows 内置 SAPI 直接支持；HTTP 服务端可选支持
+	voice, _ := node.Data["voice"].(string)
+	rate := 0
+	if v, ok := node.Data["rate"].(float64); ok {
+		rate = int(v)
+	}
+
+	release := e.enterSide(sideAudio)
+	defer release()
+
+	backend, err := e.tts.SynthesizeWith(text, outputPath, TTSOptions{Voice: voice, Rate: rate})
 	if err != nil {
 		return nil, err
 	}
+	// 统一输出绝对路径：下游节点与画廊复制粘贴都能直接用，不依赖进程 CWD
+	if abs, absErr := filepath.Abs(outputPath); absErr == nil {
+		outputPath = abs
+	}
 
 	return map[string]interface{}{
-		"text":  text,
-		"audio": outputPath,
+		"text":    text,
+		"audio":   outputPath,
+		"backend": backend,
 	}, nil
 }
 
@@ -1142,6 +1403,9 @@ func (e *EngineV2) execVideoNode(node *model.NodeInstance, upstream map[string]i
 	err := e.video.ComposeVideoMulti(images, audioPath, outputPath, perImage)
 	if err != nil {
 		return nil, err
+	}
+	if abs, absErr := filepath.Abs(outputPath); absErr == nil {
+		outputPath = abs
 	}
 
 	return map[string]interface{}{
@@ -1215,6 +1479,27 @@ func (e *EngineV2) execHTTPNode(node *model.NodeInstance, upstream map[string]in
 	if h, ok := node.Data["headers"].(map[string]interface{}); ok {
 		for k, v := range h {
 			headers[k] = fmt.Sprintf("%v", v)
+		}
+	}
+
+	// 凭据注入：节点只写凭据名，明文 header 不落在工作流 JSON 里
+	credName, _ := node.Data["credential"].(string)
+	if credName != "" {
+		if e.creds == nil {
+			return nil, fmt.Errorf("http node 引用了凭据 %q，但凭据仓库未初始化", credName)
+		}
+		credHeaders, credQuery, err := e.creds.Resolve(credName)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range credHeaders {
+			// 节点显式写的 header 优先，便于临时覆盖
+			if _, exists := headers[k]; !exists {
+				headers[k] = v
+			}
+		}
+		if len(credQuery) > 0 {
+			url = appendQuery(url, credQuery)
 		}
 	}
 

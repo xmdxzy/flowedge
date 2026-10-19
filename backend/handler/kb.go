@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -108,20 +109,27 @@ func (h *KBHandler) Query(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"query": req.Query, "results": out})
 }
 
-// ImportFile 上传 .md/.txt 文件导入知识库
+// ImportFile 上传 .md/.txt/.csv/.docx/.pdf 文件导入知识库
 func (h *KBHandler) ImportFile(c *gin.Context) {
 	file, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing file field"})
 		return
 	}
-	if file.Size > 2<<20 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "file too large (max 2MB)"})
+	// 文本类限 2MB；PDF/DOCX 是二进制容器，放宽到 20MB
+	maxSize := int64(2 << 20)
+	if !strings.HasSuffix(strings.ToLower(file.Filename), ".md") && !strings.HasSuffix(strings.ToLower(file.Filename), ".txt") {
+		maxSize = 20 << 20
+	}
+	if file.Size > maxSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("file too large (max %dMB)", maxSize>>20)})
 		return
 	}
-	name := strings.ToLower(file.Filename)
-	if !strings.HasSuffix(name, ".md") && !strings.HasSuffix(name, ".txt") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "only .md/.txt supported"})
+	if !service.IsSupportedDoc(file.Filename) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "unsupported file type",
+			"support": service.SupportedDocExts,
+		})
 		return
 	}
 
@@ -136,12 +144,18 @@ func (h *KBHandler) ImportFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if strings.TrimSpace(string(data)) == "" {
+
+	text, err := service.ExtractDocumentText(file.Filename, data)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error(), "file": file.Filename})
+		return
+	}
+	if strings.TrimSpace(text) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "file is empty"})
 		return
 	}
 
-	ids, err := h.rag.AddDocument(string(data), file.Filename)
+	ids, err := h.rag.AddDocument(text, file.Filename)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -150,6 +164,7 @@ func (h *KBHandler) ImportFile(c *gin.Context) {
 		"file":     file.Filename,
 		"chunks":   len(ids),
 		"ids":      ids,
+		"chars":    len([]rune(text)),
 		"total":    h.rag.Count(),
 		"embedder": h.rag.Backend(),
 	})
@@ -211,13 +226,16 @@ func (h *KBHandler) ImportDir(c *gin.Context) {
 			return nil
 		}
 		scanned++
-		lower := strings.ToLower(d.Name())
-		if !strings.HasSuffix(lower, ".md") && !strings.HasSuffix(lower, ".txt") {
+		if !service.IsSupportedDoc(d.Name()) {
 			skipped = append(skipped, path)
 			return nil
 		}
 		st, statErr := d.Info()
-		if statErr != nil || st.Size() > 2<<20 {
+		limit := int64(2 << 20)
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
+			limit = 20 << 20
+		}
+		if statErr != nil || st.Size() > limit {
 			skipped = append(skipped, path)
 			return nil
 		}
@@ -226,7 +244,12 @@ func (h *KBHandler) ImportDir(c *gin.Context) {
 			readErrs = append(readErrs, path+": "+readErr.Error())
 			return nil
 		}
-		content := strings.TrimSpace(string(raw))
+		content, convErr := service.ExtractDocumentText(d.Name(), raw)
+		if convErr != nil {
+			readErrs = append(readErrs, path+": "+convErr.Error())
+			return nil
+		}
+		content = strings.TrimSpace(content)
 		if content == "" {
 			skipped = append(skipped, path)
 			return nil

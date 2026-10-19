@@ -32,15 +32,32 @@ func TestASR_NotConfiguredFails(t *testing.T) {
 	}
 }
 
-func TestTTS_NotConfiguredFails(t *testing.T) {
+// TestTTS_FallbackNeverFakesAudio 未配置服务时：能用 SAPI 就产出真音频，不能就显式失败。
+// 两种结果都不允许出现「假音频」——这是这条测试守的不变量。
+func TestTTS_FallbackNeverFakesAudio(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.wav")
 
 	s := NewTTSService("")
-	err := s.Synthesize("hello", out)
+	backend, err := s.SynthesizeWith("hello", out, TTSOptions{})
+	t.Logf("SAPI 可用=%v backend=%q err=%v", SAPIAvailable(), backend, err)
+
+	if SAPIAvailable() {
+		if err != nil {
+			t.Fatalf("SAPI 可用时应成功合成，got %v", err)
+		}
+		if backend != "sapi" {
+			t.Fatalf("后端应为 sapi，got %s", backend)
+		}
+		st, statErr := os.Stat(out)
+		if statErr != nil || st.Size() < 1000 {
+			t.Fatalf("SAPI 应产出真实音频文件（>1KB），statErr=%v", statErr)
+		}
+		return
+	}
 
 	if err == nil {
-		t.Fatal("TTS 未配置时必须返回错误，不能写假音频文件")
+		t.Fatal("TTS 完全不可用时必须返回错误，不能写假音频文件")
 	}
 	if !errors.Is(err, ErrServiceNotConfigured) {
 		t.Fatalf("错误必须可被 ErrServiceNotConfigured 判定，got %v", err)
@@ -50,7 +67,7 @@ func TestTTS_NotConfiguredFails(t *testing.T) {
 		if strings.Contains(string(data), "fake audio") {
 			t.Fatal("不得写出 fake audio data")
 		}
-		t.Fatal("未配置时不得创建输出文件")
+		t.Fatal("不可用时不得创建输出文件")
 	}
 	if classifyError(err) != "config_missing" {
 		t.Fatalf("错误码应为 config_missing，got %s", classifyError(err))
