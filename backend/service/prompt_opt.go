@@ -65,6 +65,12 @@ func ensureRef2VAPrompt(prompt string, nImg, nAud int) string {
 	if desc == "" {
 		desc = strings.TrimSpace(prompt)
 	}
+	// 源提示词自带 overall_soundscape / non_diegetic_music 时必须先剥掉：
+	// 否则它们会被原样嵌进 detailed_description，而下面又追加一份权威值，
+	// 同一份提示词里出现两个互相矛盾的 overall_soundscape —— 模型就不知道该不该
+	// 照抄参考音频（实测 2026-10-19 22:30：ref_audio 接线正确、fully_copy 也在，
+	// 但成片音轨仍被重生成，corr 0.22）。
+	desc = stripFieldLines(desc)
 	sound := h3FieldValue(prompt, "overall_soundscape")
 	music := h3FieldValue(prompt, "non_diegetic_music")
 
@@ -125,6 +131,39 @@ func ensureRef2VAPrompt(prompt string, nImg, nAud int) string {
 		b.WriteString("non_diegetic_music: N/A")
 	}
 	return b.String()
+}
+
+// stripFieldLines 去掉源提示词里自带的三段式字段行，只留画面描述正文。
+//
+// 背景：h3FieldValue 找不到 integrated_multimodal_description / detailed_description 时
+// 会把整段原文当 desc。用户常常自带 overall_soundscape / non_diegetic_music，
+// 于是这些行被嵌进 detailed_description，函数末尾又追加一份权威值 —— 字段重复且互相
+// 矛盾，模型无所适从（实测：ref2va 的 fully_copy 因此不生效，音频被重生成）。
+func stripFieldLines(s string) string {
+	labels := []string{
+		"overall_soundscape:", "non_diegetic_music:",
+		"integrated_multimodal_description:", "detailed_description:",
+		"subject_definitions:", "summary:", "retention_analysis:",
+	}
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		low := strings.ToLower(trimmed)
+		skip := false
+		for _, l := range labels {
+			if strings.HasPrefix(low, l) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, trimmed)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 // h3FieldValue 取出三段式里某个字段的值（到行尾）；没有就返回空。
