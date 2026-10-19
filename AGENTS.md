@@ -321,6 +321,31 @@ non_diegetic_music: N/A
 
 耗时：ref2va 107 帧 ≈ 110s（权重热态）。口型帧人工抽查：说话时刻嘴部张开，与音轨对得上。
 
+### ⚠ 复验：`fully_copy` 未复现（2026-10-19 22:30，独立实例 8092）
+
+上表那条「音频 1:1 透传」在**独立构建 + 严格核验**下没有复现，先别当既定事实用。
+
+核验方法：`scripts/audio-copy-check.py <成片> <参考.wav>` —— 比 10ms 包络互相关，
+抗 AAC 编码噪声与毫秒级偏移（直接相减会把「同一段声音错了几十毫秒」误判成不同）。
+
+| 实验 | 帧 | 参考图 | peak_corr | 判定 |
+|---|---|---|---|---|
+| 362 帧 + 音频 | 362 | 无 | 0.22 | DIFFERENT |
+| 362 帧（修悬空 `<Picture 1>` 前） | 362 | 无 | 0.05 | DIFFERENT |
+| 107 帧 + 音频 | 107 | 无 | 0.09 | DIFFERENT |
+| 107 帧 + 音频 + 定妆图 | 107 | 1 张 | 0.18 | DIFFERENT |
+
+- 判据 0.8；四组全部不达标 → **成片音轨是模型自己生成的，不是那段 wav**。
+  旁证：run1 的 ASR 转出「湘田英臣想话…」这类乱语。
+- 已排除：帧长（107 也失败）、缺参考图（加了也失败）。
+- **视频侧是达标的**：362 帧 / 15.083s / 608×352 / 24fps，`ffmpeg select='gt(scene,0.30)'`
+  在 **7.875s** 检出切点（提示词写 `[Shot 2] At 00:07.500`）→ 「一条提示词多镜头」成立。
+- 已修的真 bug：纯音频时 `ensureRef2VAPrompt` 会写悬空的 `<Picture 1>`（图里没有 LoadImage），
+  现在按实际引用描述，`ref2va_prompt_test.go` 锁住。
+- 待查（下一步）：dump ComfyUI `/history` 里实际提交的 graph，确认
+  `ref_audio_1` 是否真到节点 5、prompt 是否含 `retention_analysis … fully_copy`。
+  `ref_audios` 的类型是 `COMFY_AUTOGROW_V3`（prefix `ref_audio_`，max 3，每项 AUDIO link）。
+
 ### 节点用法
 `text2video` 节点填：
 - `ref_audio`：一段 wav 路径（念稿音频）
