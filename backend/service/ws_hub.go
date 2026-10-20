@@ -7,7 +7,7 @@ import (
 
 // Event 执行事件
 type Event struct {
-	Type    string                 `json:"type"` // node_started, node_finished, node_failed, workflow_finished
+	Type    string                 `json:"type"` // node_started, node_progress, node_retry, node_finished, node_failed, workflow_finished
 	NodeID  string                 `json:"node_id,omitempty"`
 	RunID   uint                   `json:"run_id,omitempty"`
 	Data    map[string]interface{} `json:"data,omitempty"`

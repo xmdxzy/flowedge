@@ -102,6 +102,12 @@ const nodeTypes: NodeTypes = {
 }
 
 // ReactFlowProvider 包裹：useReactFlow 需要 Provider 祖先
+// 毫秒转人类可读时长：短任务用秒，长任务用分钟（多模态单节点常跑一两分钟）
+function fmtDuration(ms: number): string {
+  if (ms >= 60000) return `${(ms / 60000).toFixed(1)}min`
+  return `${Math.max(1, Math.round(ms / 1000))}s`
+}
+
 export default function App() {
   return (
     <ReactFlowProvider>
@@ -124,6 +130,8 @@ function FlowEditor() {
   // 调试：debugMode 只是「这次运行按断点执行」的开关，真正的暂停状态来自后端 run.status=paused
   const [debugMode, setDebugMode] = useState(false)
   const [runStatus, setRunStatus] = useState<string>('')
+  // P0 可观测性：运行中节点的实时进度（已用 / 预计），来自后端 WS node_progress 心跳
+  const [liveProgress, setLiveProgress] = useState<{ nodeId: string; elapsedMs: number; etaMs: number } | null>(null)
   const [pausedAt, setPausedAt] = useState('')
   const [pauseReason, setPauseReason] = useState('')
   const [debugBusy, setDebugBusy] = useState(false)
@@ -351,6 +359,18 @@ function FlowEditor() {
           e.source === event.node_id
             ? { ...e, animated: true }
             : e,
+        ),
+      )
+    } else if (event.type === 'node_progress' && event.node_id) {
+      // P0 可观测性：长任务实时进度。此前界面只有一个转圈，看不到跑到哪了。
+      const elapsedMs = Number(event.data?.elapsed_ms ?? 0)
+      const etaMs = Number(event.data?.eta_ms ?? 0)
+      setLiveProgress({ nodeId: event.node_id, elapsedMs, etaMs })
+      setNodes((nds) =>
+        nds.map((n) =>
+          n.id === event.node_id
+            ? { ...n, data: { ...n.data, elapsed_ms: elapsedMs, eta_ms: etaMs } }
+            : n,
         ),
       )
     } else if (event.type === 'node_finished' && event.node_id) {
@@ -1321,6 +1341,16 @@ function FlowEditor() {
               >
                 ⟲ 续跑
               </button>
+            )}
+
+            {isRunning && liveProgress && liveProgress.elapsedMs > 0 && (
+              <span
+                className="px-2 py-1 rounded-lg text-xs font-mono bg-canvas border border-border text-gray-300"
+                title={`节点 ${liveProgress.nodeId} 实时进度`}
+              >
+                已用 {fmtDuration(liveProgress.elapsedMs)}
+                {liveProgress.etaMs > 0 ? ` · 预计 ${fmtDuration(liveProgress.etaMs)}` : ''}
+              </span>
             )}
 
             <button

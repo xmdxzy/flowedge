@@ -161,7 +161,14 @@ type EngineV2 struct {
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
 	depth           atomic.Int32                       // 当前嵌套深度
+
+	// P0 可观测性：按节点类型维护耗时 EWMA（毫秒），供长任务 ETA 与进度心跳下发
+	durMu   sync.Mutex
+	durEWMA map[string]float64
 }
+
+// nodeProgressTick 进度心跳间隔。做成包级变量是为了让测试能调快，不必真等 2 秒。
+var nodeProgressTick = 2 * time.Second
 
 // SetLLMStream 注入流式 LLM 服务（nil 则 LLM 节点走非流式）
 func (e *EngineV2) SetLLMStream(s *LLMStreamService) {
@@ -175,6 +182,35 @@ func (e *EngineV2) SetResolver(fn func(uint) ([]byte, []byte, error)) {
 
 // SetCache 注入节点缓存（nil 表示不启用）
 func (e *EngineV2) SetCache(c *NodeCache) { e.cache = c }
+
+// observeDuration 记录一次节点实际耗时，按 EWMA 更新（新样本权重 0.3）。
+// 只看同类型节点的耗时：多模态里 text2video 和 llm 差着两个数量级，混算没意义。
+func (e *EngineV2) observeDuration(typ string, ms int64) {
+	if typ == "" || ms <= 0 {
+		return
+	}
+	e.durMu.Lock()
+	defer e.durMu.Unlock()
+	if e.durEWMA == nil {
+		e.durEWMA = make(map[string]float64)
+	}
+	if prev, ok := e.durEWMA[typ]; ok {
+		e.durEWMA[typ] = prev*0.7 + float64(ms)*0.3
+	} else {
+		e.durEWMA[typ] = float64(ms)
+	}
+}
+
+// ETAFor 返回该类型节点的预计耗时（毫秒）。无历史样本返回 0（前端据此隐藏 ETA）。
+func (e *EngineV2) ETAFor(typ string) int64 {
+	e.durMu.Lock()
+	defer e.durMu.Unlock()
+	v, ok := e.durEWMA[typ]
+	if !ok || v <= 0 {
+		return 0
+	}
+	return int64(v)
+}
 
 // SetEventLog 注入事件日志（nil 表示只广播不落库）
 func (e *EngineV2) SetEventLog(l *EventLogger) { e.eventLog = l }
@@ -659,6 +695,32 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 
 				e.emit(runID, Event{Type: "node_started", NodeID: nid, Data: map[string]interface{}{"type": node.Type}})
 
+				// P0 可观测性：执行期间定期推进度心跳（已用 / 预计）。
+				// 多模态一个节点常跑一两分钟，此前界面只有一个转圈、看不到进度。
+				hbStop := make(chan struct{})
+				hbStart := time.Now()
+				if node.StartedAt != nil {
+					hbStart = *node.StartedAt
+				}
+				go func() {
+					ticker := time.NewTicker(nodeProgressTick)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-hbStop:
+							return
+						case <-ticker.C:
+							e.emit(runID, Event{Type: "node_progress", NodeID: nid,
+								Data: map[string]interface{}{
+									"type":       node.Type,
+									"elapsed_ms": time.Since(hbStart).Milliseconds(),
+									"eta_ms":     e.ETAFor(node.Type),
+								}})
+						}
+					}
+				}()
+				defer close(hbStop)
+
 				// 带超时 + 重试执行节点（retry / retry_delay_ms 数据驱动，重试上限 5）
 				type execResult struct {
 					out interface{}
@@ -711,7 +773,8 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 						propagate(nid, cached, branchCached)
 						mu.Unlock()
 						e.emit(runID, Event{Type: "node_finished", NodeID: nid,
-							Data: map[string]interface{}{"output": cached, "cache_hit": true}})
+							Data: map[string]interface{}{"output": cached, "cache_hit": true,
+								"duration_ms": endCached.Sub(hbStart).Milliseconds()}})
 						return
 					}
 				}
@@ -745,6 +808,9 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				mu.Lock()
 				endNow := time.Now()
 				node.EndedAt = &endNow
+				// P0 可观测性：本次实际耗时入 EWMA，供后续同类型节点算 ETA
+				durMs := endNow.Sub(hbStart).Milliseconds()
+				e.observeDuration(node.Type, durMs)
 
 				if execErr != nil {
 					node.Status = "failed"
@@ -764,7 +830,8 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 						node.Output = failOut
 						propagate(nid, failOut, "")
 						mu.Unlock()
-						e.emit(runID, Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
+						e.emit(runID, Event{Type: "node_failed", NodeID: nid, Message: execErr.Error(),
+							Data: map[string]interface{}{"duration_ms": durMs}})
 						return
 					}
 
@@ -773,7 +840,8 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					layerMu.Unlock()
 					markFailed(nid, execErr.Error())
 					mu.Unlock()
-					e.emit(runID, Event{Type: "node_failed", NodeID: nid, Message: execErr.Error()})
+					e.emit(runID, Event{Type: "node_failed", NodeID: nid, Message: execErr.Error(),
+						Data: map[string]interface{}{"duration_ms": durMs}})
 					return
 				}
 
@@ -784,7 +852,8 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					e.cache.Put(cacheKeyStr, out)
 				}
 				mu.Unlock()
-				e.emit(runID, Event{Type: "node_finished", NodeID: nid, Data: map[string]interface{}{"output": out}})
+				e.emit(runID, Event{Type: "node_finished", NodeID: nid,
+					Data: map[string]interface{}{"output": out, "duration_ms": durMs}})
 
 				// 处理出边（if_else 需按命中分支裁剪未激活侧）
 				branchPath := ""
