@@ -1703,10 +1703,6 @@ function FlowEditor() {
 
             {selectedNode.type === 'text2image' && (
               <>
-                <p className="text-[10px] text-warning leading-relaxed mb-2">
-                  flux 的文本编码器以英文为主：纯中文提示词经常只画出「通用风景」。
-                  建议先用 LLM 节点把中文改写/翻译成英文，再喂给文生图。
-                </p>
                 <div>
                   <label className="text-xs text-gray-400 block mb-1">提示词</label>
                   <textarea
@@ -1716,6 +1712,19 @@ function FlowEditor() {
                     placeholder="描述要生成的图片..."
                   />
                 </div>
+                <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.data.auto_translate === true}
+                    onChange={(e) => updateSelectedNodeData('auto_translate', e.target.checked)}
+                  />
+                  检测到中文时自动过本地 LLM 译成英文（flux 对中文弱）
+                </label>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  flux 的文本编码器以英文为主：纯中文提示词经常只画出「通用风景」。
+                  勾选后由本地 LLM 在进模型前翻译，翻译失败会自动降级用原文并在输出里留痕
+                  （<code>translated</code> / <code>translate_error</code>）。
+                </p>
                 <div className="flex gap-2">
                   <div>
                     <label className="text-xs text-gray-400 block mb-1">宽度</label>
@@ -2300,6 +2309,17 @@ function FlowEditor() {
                     />
                   </div>
                 )}
+                {selectedNode.type === 'inpaint' && (
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">重绘模型（留空=默认弱修补）</label>
+                    <input
+                      value={(selectedNode.data.model as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('model', e.target.value)}
+                      placeholder="如 Flux-Fill，先落位 D:/AI/Models 再用"
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
+                    />
+                  </div>
+                )}
                 {selectedNode.type === 'image2image' && (
                   <div>
                     <label className="text-xs text-gray-400 block mb-1">重绘强度（0.1 微调 → 0.9 大改）</label>
@@ -2600,6 +2620,40 @@ function FlowEditor() {
                   placeholder="data/generated/tts-xxx.wav"
                   className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
                 />
+                <div className="flex gap-2">
+                  <div className="flex-1">
+                    <label className="text-[10px] text-gray-500 block mb-1">模型档位（留空=服务默认）</label>
+                    <select
+                      value={(selectedNode.data.model as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('model', e.target.value)}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                    >
+                      <option value="">默认（small）</option>
+                      <option value="tiny">tiny（最快，试听用）</option>
+                      <option value="base">base</option>
+                      <option value="small">small（默认）</option>
+                      <option value="medium">medium（更准，更慢）</option>
+                      <option value="large-v3">large-v3（台词镜头用）</option>
+                    </select>
+                  </div>
+                  <div className="w-24">
+                    <label className="text-[10px] text-gray-500 block mb-1">设备</label>
+                    <select
+                      value={(selectedNode.data.device as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('device', e.target.value)}
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+                    >
+                      <option value="">默认（CPU）</option>
+                      <option value="cpu">CPU（不占显存）</option>
+                      <option value="cuda">CUDA（快，吃 3GB）</option>
+                      <option value="auto">auto</option>
+                    </select>
+                  </div>
+                </div>
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  档位按镜头挑：台词镜头 large-v3 保准确，氛围镜头 small 省时间。
+                  cuda 会占用约 3GB 显存——出片工作流里建议留 CPU。
+                </p>
               </div>
             )}
 
@@ -2710,7 +2764,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'text2image':
       return { prompt: '', width: 1024, height: 1024, batch: 1, prompts: '', split_lines: false }
     case 'asr':
-      return { audio_path: '' }
+      return { audio_path: '', model: '', device: '' }
     case 'tts':
       return { text: '' }
     case 'video_compose':
@@ -2758,7 +2812,7 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'image2image':
       return { prompt: '', image_path: '', strength: 0.6, steps: 8 }
     case 'inpaint':
-      return { prompt: '', image_path: '', mask_path: '', denoise: 1.0, steps: 10 }
+      return { prompt: '', image_path: '', mask_path: '', model: '', denoise: 1.0, steps: 10 }
     case 'upscale':
       return { prompt: '', image_path: '', model: 'RealESRGAN_x4plus.pth' }
     case 'text2video':

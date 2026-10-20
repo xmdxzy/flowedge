@@ -37,7 +37,7 @@ type MediaRequest struct {
 	FPS      int     // 视频帧率
 	Strength float64 // img2img 去噪强度 / inpaint denoise
 	Seed     int64
-	Model    string // 超分模型名
+	Model    string // 模型名覆盖：超分模型（upscale）/ checkpoint（inpaint，如 Flux-Fill）；空 = 服务默认
 	LowVRAM  bool   // H3：用分块注意力/分块 FFN 换显存，换更高分辨率
 	Segments int    // H3：分几段生成再拼接（每段 124 帧 ≈ 5 秒）
 	Interp   bool   // 出片后帧率翻倍（ffmpeg minterpolate，CPU，不占显存）
@@ -301,8 +301,10 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 			steps = 10
 		}
 		// 蒙版按原图尺寸缩放，避免尺寸不一致导致 latent 对不上
+		// checkpoint 可被节点覆盖：填 Flux-Fill 得专业重绘（~11GB，先落位
+		// D:/AI/Models 再用），留空走服务默认（flux-schnell，弱修补）
 		return map[string]interface{}{
-			"4":  ckptNode(s.Checkpoint),
+			"4":  ckptNode(firstNonEmpty(req.Model, s.Checkpoint)),
 			"10": map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": name}},
 			"20": map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": maskName}},
 			"11": map[string]interface{}{"class_type": "VAEEncode", "inputs": map[string]interface{}{"pixels": link("10", 0), "vae": link("4", 2)}},

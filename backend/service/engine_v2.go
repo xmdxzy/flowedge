@@ -1197,25 +1197,6 @@ func splitPromptLines(v interface{}) []string {
 }
 
 func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	// 24GB 上不能同时养 flux 与 14B LLM：换侧（清语言侧）并独占执行
-	release := e.enterSide(sideDiffusion)
-	defer release()
-	// H3 实例在跑时默认实例是停的，出图前自动切回（已健康时是空操作）
-	if err := e.ensureComfy(""); err != nil {
-		return nil, err
-	}
-
-	// 显存调度：flux 与 LLM 抢同一块 24GB 显存，不纳入调度就会出现
-	// 「LLM 已加载 + 直接起 flux」→ OOM。此前只有 LLM 节点走调度。
-	if e.gpuSched != nil && e.t2i != nil && e.t2i.Checkpoint != "" {
-		// 串行门：同层多个文生图节点不会同时进 ComfyUI（并行只会互相 OOM）
-		e.gpuSched.LockText2Image()
-		defer e.gpuSched.UnlockText2Image()
-
-		_ = e.gpuSched.AcquireModel(e.t2i.Checkpoint)
-		defer e.gpuSched.ReleaseModel(e.t2i.Checkpoint)
-	}
-
 	prompt := ""
 	if p, ok := node.Data["prompt"].(string); ok {
 		prompt = p
@@ -1233,6 +1214,45 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 
 	if prompt == "" {
 		return nil, fmt.Errorf("text2image node has no prompt")
+	}
+
+	// 中文提示词自动翻译（flux 文本编码器以英文为主，纯中文提示词经常只画出
+	// 通用风景——README「已知限制」第一条）。默认关；开了才会走 LLM。
+	// 必须在进扩散侧之前做：LLM 是语言侧，顺序反了会和 flux 互相卸载权重
+	// （同 H3 prompt_opt 的顺序纪律）。
+	translated := false
+	translateNote := ""
+	if v, ok := node.Data["auto_translate"].(bool); ok && v && e.llm != nil {
+		if hasCJK(prompt) {
+			en, terr := translatePromptToEnglish(e.llm, prompt)
+			if terr != nil {
+				// 翻译失败降级为原文，不阻断执行（flux 中文弱是降级不是错误），
+				// 但必须在输出里留痕，不许假装翻过了
+				translateNote = terr.Error()
+			} else {
+				prompt = en
+				translated = true
+			}
+		}
+	}
+
+	// 24GB 上不能同时养 flux 与 14B LLM：换侧（清语言侧）并独占执行
+	release := e.enterSide(sideDiffusion)
+	defer release()
+	// H3 实例在跑时默认实例是停的，出图前自动切回（已健康时是空操作）
+	if err := e.ensureComfy(""); err != nil {
+		return nil, err
+	}
+
+	// 显存调度：flux 与 LLM 抢同一块 24GB 显存，不纳入调度就会出现
+	// 「LLM 已加载 + 直接起 flux」→ OOM。此前只有 LLM 节点走调度。
+	if e.gpuSched != nil && e.t2i != nil && e.t2i.Checkpoint != "" {
+		// 串行门：同层多个文生图节点不会同时进 ComfyUI（并行只会互相 OOM）
+		e.gpuSched.LockText2Image()
+		defer e.gpuSched.UnlockText2Image()
+
+		_ = e.gpuSched.AcquireModel(e.t2i.Checkpoint)
+		defer e.gpuSched.ReleaseModel(e.t2i.Checkpoint)
 	}
 
 	width := 1024
@@ -1267,6 +1287,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			"images":  paths,
 			"count":   len(paths),
 			"prompts": prompts,
+			"translated":      translated,
+			"translate_error": translateNote,
 		}, nil
 	}
 
@@ -1293,6 +1315,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			"image":  paths[0],
 			"images": paths,
 			"count":  len(paths),
+			"translated":      translated,
+			"translate_error": translateNote,
 		}, nil
 	}
 
@@ -1304,7 +1328,42 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 	return map[string]interface{}{
 		"text":  prompt,
 		"image": imagePath,
+		"translated":      translated,
+		"translate_error": translateNote,
 	}, nil
+}
+
+// hasCJK 是否含中日韩文字（flux 文本编码器对 CJK 弱，英文才吃得动）。
+// 日文假名一并算入：混在中文里说明是日系题材提示词，同样该翻。
+func hasCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x4E00 && r <= 0x9FFF) || // CJK 统一表意
+			(r >= 0x3400 && r <= 0x4DBF) || // 扩展 A
+			(r >= 0x3040 && r <= 0x30FF) || // 平假名 / 片假名
+			(r >= 0xAC00 && r <= 0xD7AF) { // 韩文音节
+			return true
+		}
+	}
+	return false
+}
+
+// translatePromptToEnglish 用本地 LLM 把图像提示词译成英文。
+// 指令要求「只输出英文提示词」：加解释会把解释也拼进 prompt，
+// flux 会把"Translation:"这类词真的画进去。
+func translatePromptToEnglish(llm *LLMService, prompt string) (string, error) {
+	instr := "Translate the following image-generation prompt into English. " +
+		"Output ONLY the English prompt itself — no explanations, no quotes, " +
+		"no prefixes like 'Translation:'. Keep proper nouns, style keywords " +
+		"and composition terms intact.\n\n" + prompt
+	out, err := llm.Chat(instr)
+	if err != nil {
+		return "", fmt.Errorf("提示词自动翻译失败（已用原文继续）：%w", err)
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", fmt.Errorf("提示词自动翻译返回空（已用原文继续）")
+	}
+	return out, nil
 }
 
 func (e *EngineV2) execASRNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
@@ -1330,12 +1389,22 @@ func (e *EngineV2) execASRNode(node *model.NodeInstance, upstream map[string]int
 	release := e.enterSide(sideAudio)
 	defer release()
 
-	text, err := e.asr.Transcribe(audioPath)
+	// 节点级模型档位：台词镜头用 large-v3、氛围镜头用 small，按镜头挑精度
+	// （服务端多档缓存，切档不重启）。默认留空 = 服务端配置（small / cpu）。
+	opt := ASROptions{}
+	if m, ok := node.Data["model"].(string); ok && strings.TrimSpace(m) != "" {
+		opt.Model = strings.TrimSpace(m)
+	}
+	if d, ok := node.Data["device"].(string); ok && strings.TrimSpace(d) != "" {
+		opt.Device = strings.TrimSpace(d)
+	}
+
+	text, err := e.asr.TranscribeWith(audioPath, opt)
 	if err != nil {
 		return nil, err
 	}
 
-	return map[string]interface{}{"text": text}, nil
+	return map[string]interface{}{"text": text, "model": opt.Model}, nil
 }
 
 func (e *EngineV2) execTTSNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {

@@ -36,6 +36,11 @@ SERVICES_EMBED = os.path.join(ROOT, "backend", "web", "services", "files")
 BACKEND = os.path.join(ROOT, "backend")
 OUT_DIR = os.path.join(ROOT, "dist")
 
+# 目标平台（可被命令行覆盖，用于交叉构建 Linux / macOS 二进制）
+GOOS = "windows"
+GOARCH = "amd64"
+OUTPUT_NAME = ""
+
 
 def log(msg):
     print("[build] %s" % msg, flush=True)
@@ -118,27 +123,45 @@ def embed_services():
 def build_backend(version):
     go = which("go")
     if not go:
-        fail("未找到 go 工具链。请安装 Go 1.25+ 或把 go.exe 所在目录加入 PATH")
+        fail("未找到 go 工具链。请安装 Go 1.25+ 或把 go 所在目录加入 PATH")
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    out = os.path.join(OUT_DIR, "FlowEdge.exe")
+    # 跨平台：Windows 默认 FlowEdge.exe，其它平台默认小写 flowedge
+    if OUTPUT_NAME:
+        out_name = OUTPUT_NAME
+    elif GOOS == "windows":
+        out_name = "FlowEdge.exe"
+    else:
+        out_name = "flowedge"
+    out = os.path.join(OUT_DIR, out_name)
     ldflags = "-s -w -X main.version=%s" % version
     env = dict(os.environ)
     env.setdefault("CGO_ENABLED", "0")
+    env["GOOS"] = GOOS
+    env["GOARCH"] = GOARCH
     run([go, "build", "-trimpath", "-ldflags", ldflags, "-o", out, "."], cwd=BACKEND, env=env)
 
     size = os.path.getsize(out) / (1024 * 1024)
-    log("已生成 %s（%.1f MB）" % (out, size))
+    log("已生成 %s（%.1f MB，GOOS=%s GOARCH=%s）" % (out, size, GOOS, GOARCH))
     return out
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-ui", action="store_true", help="跳过前端构建，直接内嵌已有产物")
-    ap.add_argument("--version", default=time.strftime("%Y.%m.%d"), help="版本号（写入 exe）")
+    ap.add_argument("--version", default=time.strftime("%Y.%m.%d"), help="版本号（写入二进制）")
+    ap.add_argument("--goos", default="windows", help="交叉构建目标系统（windows/linux/darwin），默认 windows")
+    ap.add_argument("--goarch", default="amd64", help="交叉构建目标架构（amd64/arm64），默认 amd64")
+    ap.add_argument("--output", default="", help="输出二进制名（默认 windows=FlowEdge.exe，其它=flowedge）")
     args = ap.parse_args()
 
-    log("目标平台：Windows 原生单文件（无 Docker / 无 WSL / 无 Node 运行时依赖）")
+    global GOOS, GOARCH, OUTPUT_NAME
+    GOOS, GOARCH, OUTPUT_NAME = args.goos, args.goarch, args.output
+
+    if GOOS == "windows":
+        log("目标平台：Windows 原生单文件（无 Docker / 无 WSL / 无 Node 运行时依赖）")
+    else:
+        log("目标平台：%s/%s 原生单文件（CGO_ENABLED=0，无运行时依赖）" % (GOOS, GOARCH))
 
     if args.skip_ui:
         if not os.path.exists(os.path.join(STATIC_DIR, "index.html")):

@@ -359,17 +359,28 @@ type ASRService struct {
 	client  *http.Client
 }
 
+// ASROptions 转写档位（节点级覆盖服务默认；空 = 用服务端配置）
+type ASROptions struct {
+	Model  string // faster-whisper 模型名：tiny / base / small / medium / large-v3
+	Device string // cpu / cuda / auto（默认 cpu：把显存留给图像与 LLM）
+}
+
 func NewASRService(baseURL string) *ASRService {
 	return &ASRService{
 		BaseURL: baseURL,
 		client: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 300 * time.Second, // large-v3 首次加载 + 长音频，small 的 120s 会误杀
 		},
 	}
 }
 
-// Transcribe 语音转文字
+// Transcribe 语音转文字（服务端默认档位）
 func (s *ASRService) Transcribe(audioPath string) (string, error) {
+	return s.TranscribeWith(audioPath, ASROptions{})
+}
+
+// TranscribeWith 语音转文字（可指定模型档位与设备）
+func (s *ASRService) TranscribeWith(audioPath string, opt ASROptions) (string, error) {
 	if s.BaseURL == "" {
 		// 未配置必须显式失败：伪造转写文本会让用户以为真的转写成功了
 		return "", fmt.Errorf("%w: ASR 服务未配置（设置 ASR_BASE_URL，或由桌面客户端自动拉起语音服务）", ErrServiceNotConfigured)
@@ -381,12 +392,18 @@ func (s *ASRService) Transcribe(audioPath string) (string, error) {
 	}
 	defer file.Close()
 
-	// 简单 multipart 上传
+	// 简单 multipart 上传（file + 可选 model/device 文本字段）
 	var buf bytes.Buffer
 	buf.WriteString("--boundary\r\n")
 	buf.WriteString("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
 	buf.WriteString("Content-Type: audio/wav\r\n\r\n")
 	io.Copy(&buf, file)
+	buf.WriteString("\r\n--boundary\r\n")
+	buf.WriteString("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
+	buf.WriteString(opt.Model)
+	buf.WriteString("\r\n--boundary\r\n")
+	buf.WriteString("Content-Disposition: form-data; name=\"device\"\r\n\r\n")
+	buf.WriteString(opt.Device)
 	buf.WriteString("\r\n--boundary--\r\n")
 
 	resp, err := s.client.Post(s.BaseURL+"/asr", "multipart/form-data; boundary=boundary", &buf)

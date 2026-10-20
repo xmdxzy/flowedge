@@ -93,6 +93,24 @@ cd frontend && npm install && npm run dev
 python scripts/build-windows.py   # → dist/FlowEdge.exe
 ```
 
+**Linux / macOS (one-command local run)**
+
+`scripts/run-local.sh` builds the binary if needed (cross-compile-free, `CGO_ENABLED=0`),
+starts it in the background, polls `/api/health`, and prints the client URL.
+
+```bash
+./scripts/run-local.sh            # build-if-needed + start + health-check → http://127.0.0.1:8080
+./scripts/run-local.sh --build    # force a rebuild
+./scripts/run-local.sh --stop     # stop the background engine
+./scripts/run-local.sh --logs     # follow the engine log
+```
+
+Build a Linux/amd64 binary directly (for container or remote deploy):
+
+```bash
+python scripts/build-windows.py --goos linux --goarch amd64 --output flowedge   # → dist/flowedge
+```
+
 ## Documentation
 
 | Document | Contents |

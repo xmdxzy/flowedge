@@ -154,10 +154,17 @@ func (e *EngineV2) execInpaintNode(ctx context.Context, node *model.NodeInstance
 	if v, ok := node.Data["steps"].(float64); ok && v > 0 {
 		steps = int(v)
 	}
+	// checkpoint 覆盖：填 Flux-Fill 得专业重绘（先落位 D:/AI/Models 再用），
+	// 留空走服务默认（flux-schnell，蒙版内只做弱修补）
+	inpaintModel := ""
+	if m, ok := node.Data["model"].(string); ok {
+		inpaintModel = strings.TrimSpace(m)
+	}
 
 	path, kind, err := e.t2i.GenerateMedia(MediaRequest{
 		Kind: "inpaint", Prompt: prompt, Image: src, Mask: mask,
 		Width: w, Height: h, Strength: denoise, Steps: steps,
+		Model: inpaintModel,
 	})
 	if err != nil {
 		return nil, err
