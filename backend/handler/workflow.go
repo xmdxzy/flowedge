@@ -65,12 +65,56 @@ func (h *WorkflowHandler) preflight(nodesJSON, edgesJSON []byte) []service.DepRe
 }
 
 // preflightErrorText 把缺失清单压成一行错误文本（run 记录的 error 字段用）
+//
+// 每项后面带上修复动作：只说「缺 TTS」等于让用户自己去猜去哪儿点，
+// 而依赖面板/一键修复路径是现成的，把那句话直接递过去。
 func preflightErrorText(missing []service.DepRequirement) string {
 	parts := make([]string, 0, len(missing))
 	for _, m := range missing {
-		parts = append(parts, fmt.Sprintf("%s（节点 %s）", m.Label, m.NodeID))
+		item := fmt.Sprintf("%s（节点 %s）", m.Label, m.NodeID)
+		if m.Fix != "" {
+			item += " → " + m.Fix
+		}
+		parts = append(parts, item)
 	}
 	return "依赖服务未就绪，工作流未开始执行：" + strings.Join(parts, "、")
+}
+
+// PreflightCheck 只体检不运行：把当前画布上的节点清单送进来，
+// 返回缺失依赖 + 每项的可执行修复动作（含能否一键拉起）。
+//
+// 与运行时预检用同一套判定（同一份 PreflightDeps），所以「体检说 OK」和
+// 「运行不报错」不会出现两套结论。
+func (h *WorkflowHandler) PreflightCheck(c *gin.Context) {
+	var body struct {
+		Nodes json.RawMessage `json:"nodes"`
+		Edges json.RawMessage `json:"edges"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体需要 nodes / edges"})
+		return
+	}
+	if len(body.Nodes) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "nodes 为空"})
+		return
+	}
+	edges := body.Edges
+	if len(edges) == 0 {
+		edges = json.RawMessage("[]")
+	}
+	missing := h.preflight([]byte(body.Nodes), []byte(edges))
+	fixable := 0
+	for _, m := range missing {
+		if m.Fixable {
+			fixable++
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      len(missing) == 0,
+		"missing": missing,
+		"count":   len(missing),
+		"fixable": fixable,
+	})
 }
 
 // List 获取所有工作流

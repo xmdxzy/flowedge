@@ -95,6 +95,15 @@ func (e *EngineV2) execImage2ImageNode(ctx context.Context, node *model.NodeInst
 		return nil, fmt.Errorf("图生图缺少输入图：连一条来自文生图的线，或在配置里填图片路径")
 	}
 	prompt, _ := node.Data["prompt"].(string)
+	// 场景锁（P2）：图生图同样受跨镜头一致性约束，规则与文生图一致
+	sceneLock, lockErr := resolveSceneLock(node, upstream)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	lockInjected := false
+	if out, inj := applySceneLock(prompt, sceneLock); inj {
+		prompt, lockInjected = out, true
+	}
 	strength := 0.6
 	if v, ok := node.Data["strength"].(float64); ok && v > 0 {
 		strength = v
@@ -112,6 +121,7 @@ func (e *EngineV2) execImage2ImageNode(ctx context.Context, node *model.NodeInst
 	}
 	return map[string]interface{}{
 		"image": path, "kind": kind, "source": src, "strength": strength, "text": prompt,
+		"scene_lock": sceneLock, "scene_lock_injected": lockInjected,
 	}, nil
 }
 
@@ -398,6 +408,8 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	if (kind == "h3" || kind == "h3_i2v") && segs > 1 {
 		parts := make([]string, 0, segs)
 		guide := req.Image
+		var segNote string
+		segDegrade := 0
 		for i := 0; i < segs; i++ {
 			req.Image = guide
 			if guide == "" {
@@ -412,6 +424,20 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 				req.Prompt = prompt
 			}
 			part, _, perr := e.t2i.GenerateMedia(req)
+			// P3 显存降级：只在「一段都还没出来」时允许降档。
+			// 已经出了段再降，新段分辨率/帧数与旧段不一致，硬拼会跳变——
+			// 那时如实报错，让用户降参数重跑，比交一条半截变画质的片强。
+			// 降的是共享的 req，所以后续所有段都用同一档参数。
+			if perr != nil && IsOOMError(perr) && len(parts) == 0 && segDegrade < maxOOMDegrade {
+				e.releaseDiffusionAndWait() // CUDA 异步释放，不等就白降
+				if next, changed := degradeMediaRequest(req); changed {
+					segNote = degradeNote(req, next)
+					req = next
+					segDegrade++
+					i--
+					continue
+				}
+			}
 			if perr != nil {
 				return nil, fmt.Errorf("第 %d/%d 段失败：%w", i+1, segs, perr)
 			}
@@ -447,6 +473,8 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 		"video": final, "kind": "video", "text": prompt,
 		"segments": segs, "parts": parts, "beats": beats,
 		"duration_sec": float64(segs) * float64(req.Frames) / 24.0,
+		// 降档留痕：用户有权知道这一版是靠降分辨率/帧数跑出来的
+		"degraded": segDegrade > 0, "degrade_level": segDegrade, "degrade_note": segNote,
 	}
 	if sceneLock != "" {
 		out["scene_lock"] = sceneLock
@@ -458,7 +486,9 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 		return out, nil
 	}
 
-	path, kindRet, err := e.t2i.GenerateMedia(req)
+	// P3 显存降级：OOM 时先还显存再降档重试（最多两档），
+	// 比「直接失败、用户改参数、重新加载 34GB 权重」便宜一个数量级
+	path, kindRet, degLevel, degNote, err := e.generateMediaWithDegrade(req)
 	if err != nil {
 		return nil, err
 	}
@@ -474,6 +504,7 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	}
 	out := map[string]interface{}{
 		"video": path, "kind": kindRet, "text": prompt,
+		"degraded": degLevel > 0, "degrade_level": degLevel, "degrade_note": degNote,
 	}
 	if sceneLock != "" {
 		out["scene_lock"] = sceneLock

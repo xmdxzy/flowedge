@@ -308,6 +308,7 @@ func main() {
 		versionHandler := handler.NewVersionHandler(db)
 		wsHandler := handler.NewWSHandler(wsHub)
 
+		api.POST("/preflight", wfHandler.PreflightCheck) // 只体检不运行：返回缺失依赖与可执行修复动作
 		api.GET("/workflows", wfHandler.List)
 		api.GET("/workflows/:id", wfHandler.Get)
 		api.POST("/workflows", wfHandler.Create)

@@ -30,11 +30,16 @@ import (
 //   - 声明式规则全部来自节点 data，没配的项不检
 
 // gateCheck 单项检查结果
+//
+// Fix 是「可执行修复建议」：门只报 FAIL 码时，用户还得自己去猜改哪个参数，
+// 等于把排查成本原样退回去。这里把每项失败落成一句能直接照做的动作
+// （改哪个节点字段、改成多少、用哪条命令），随失败一起抛出。
 type gateCheck struct {
 	Name   string `json:"name"`
 	OK     bool   `json:"ok"`
 	Level  string `json:"level"` // fail（阻断）/ warn（备忘）
 	Detail string `json:"detail"`
+	Fix    string `json:"fix"`
 }
 
 // execQualityGateNode 质检门执行器
@@ -53,11 +58,18 @@ func (e *EngineV2) execQualityGateNode(ctx context.Context, node *model.NodeInst
 
 	rules := parseGateRules(node)
 	checks := runGateChecks(ctx, path, info, rules)
+	annotateFixes(checks, info, rules)
 
 	fails := make([]string, 0, len(checks))
+	fixes := make([]string, 0, len(checks))
 	for _, c := range checks {
 		if !c.OK && c.Level == "fail" {
-			fails = append(fails, fmt.Sprintf("%s：%s", c.Name, c.Detail))
+			detail := fmt.Sprintf("%s：%s", c.Name, c.Detail)
+			if c.Fix != "" {
+				detail += " → 修复：" + c.Fix
+				fixes = append(fixes, fmt.Sprintf("%s → %s", c.Name, c.Fix))
+			}
+			fails = append(fails, detail)
 		}
 	}
 	if len(fails) > 0 {
@@ -68,6 +80,7 @@ func (e *EngineV2) execQualityGateNode(ctx context.Context, node *model.NodeInst
 	return map[string]interface{}{
 		"gate":    "pass",
 		"checks":  checks,
+		"fixes":   fixes,
 		"path":    path,
 		"kind":    info.kind,
 		"width":   info.width,
@@ -76,6 +89,50 @@ func (e *EngineV2) execQualityGateNode(ctx context.Context, node *model.NodeInst
 		"seconds": info.seconds,
 		"text":    gateSummary(checks),
 	}, nil
+}
+
+// annotateFixes 给每一项「未通过」填可执行修复建议（通过的项不填，避免噪音）。
+//
+// 建议必须落到具体动作：改哪个字段、改成多少、或给一条能复制的命令。
+// 「请检查参数」这类正确但无用的话一律不写——那只是把排查成本原样退回去。
+func annotateFixes(checks []gateCheck, info *gateMediaInfo, r gateRules) {
+	for i := range checks {
+		c := &checks[i]
+		if c.OK {
+			continue
+		}
+		switch c.Name {
+		case "has_video_stream":
+			c.Fix = "合成节点必须显式映射视频流：ffmpeg ... -map 0:v:0 -map 0:a:0；少了 -map 0:v:0 就会得到纯音频 mp4"
+		case "has_audio_stream":
+			c.Fix = "合成时加 -map 0:a:0，或先用 TTS 节点配音再合成；同时确认音源路径真实存在"
+		case "min_width":
+			c.Fix = fmt.Sprintf("把上游生成节点的 width 从 %d 提到 ≥%d（注意显存：宽度每 +25%% 显存约 +30%%）",
+				info.width, r.minWidth)
+		case "min_height":
+			c.Fix = fmt.Sprintf("把上游生成节点的 height 从 %d 提到 ≥%d", info.height, r.minHeight)
+		case "min_frames":
+			need := int(math.Ceil(float64(r.minFrames)))
+			c.Fix = fmt.Sprintf("把文生视频节点的 frames 从 %d 提到 ≥%d（24fps 下 帧数 ≈ 秒数×24）",
+				info.frames, need)
+		case "duration_min":
+			c.Fix = fmt.Sprintf("时长 %.2fs 短于下限 %.2fs：把 frames 提到 ≥%d（24fps）",
+				info.seconds, r.durationMin, int(math.Ceil(r.durationMin*24)))
+		case "duration_max":
+			c.Fix = fmt.Sprintf("时长 %.2fs 超过上限 %.2fs：把 frames 降到 ≤%d（24fps），或用剪辑节点裁掉尾部",
+				info.seconds, r.durationMax, int(math.Floor(r.durationMax*24)))
+		case "av_drift":
+			c.Fix = fmt.Sprintf("音画差 %.3fs：给合成命令加 -shortest，或把音轨裁到与视频同长",
+				math.Abs(info.videoSecond-info.audioSecond))
+		case "silence_gap":
+			c.Fix = fmt.Sprintf("最长静音超过 %.2fs：删掉 TTS 里的空段/换行，或补一段环境音填满", r.maxSilenceGap)
+		case "forbid_speech":
+			c.Fix = "氛围模式不允许人声：把该段换成纯环境音轨，或去掉 TTS 节点只保留 BGM"
+		case "loudness_min":
+			c.Fix = fmt.Sprintf("整体响度低于 %.1fdB：ffmpeg -i 输入 -af volume=+%.0fdB 输出（先小步试，别削波）",
+				r.loudnessMinDB, math.Min(12, math.Abs(r.loudnessMinDB-(-16))))
+		}
+	}
 }
 
 // gateRules 声明式质检规则（全部可选，未配不检）

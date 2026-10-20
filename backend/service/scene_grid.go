@@ -163,6 +163,22 @@ func StripSceneLock(prompt string) string {
 //  2. 插在 [Shot 1] 的**第一句之后**——官方要求第一句声明风格，锁句不能抢位；
 //  3. 没有结构化字段时自己套一层三段式，宁可重排也不能把锁丢在字段外面
 //     （字段外的文字模型会当注释忽略）。
+// applySceneLock 把场景锁注入提示词，返回新提示词与「是否真的注入了」。
+//
+// 直通语义（与门禁一致）：提示词里已经有锁句时原样返回，不重复注入。
+// 门禁按字节全等校验（h3.scene_lock_missing / h3.scene_lock_drift），
+// 重复注入会让锁句叠加两次，锁本身反而不再全等——那是把保护措施变成故障源。
+func applySceneLock(prompt, lock string) (string, bool) {
+	if strings.TrimSpace(lock) == "" {
+		return prompt, false
+	}
+	if SceneLockOf(prompt) != "" {
+		return prompt, false // 已有锁：直通，下游不许重编
+	}
+	out := InjectSceneLock(prompt, lock)
+	return out, out != prompt
+}
+
 func InjectSceneLock(prompt, lock string) string {
 	p := StripSceneLock(strings.TrimSpace(prompt))
 	if strings.TrimSpace(lock) == "" {

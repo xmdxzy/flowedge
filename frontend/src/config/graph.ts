@@ -86,7 +86,10 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   http_request: ['text', 'status_code'],
   if_else: ['text', 'branch'],
   loop: ['text', 'all', 'iterations', 'stopped_by'],
-  text2image: ['image', 'images', 'count', 'prompts', 'translated', 'translate_error'],
+  text2image: [
+    'image', 'images', 'count', 'prompts', 'translated', 'translate_error',
+    'scene_lock', 'scene_lock_injected', // P2 跨镜头一致性
+  ],
   video_compose: ['video'],
   tts: ['audio', 'backend'],
   asr: ['text', 'model'],
@@ -102,7 +105,11 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   image2image: ['image', 'kind', 'source', 'strength'],
   inpaint: ['image', 'kind', 'source', 'mask'],
   upscale: ['image', 'kind', 'source', 'width', 'height'],
-  text2video: ['video', 'kind', 'text', 'original_prompt', 'beats', 'parts', 'segments', 'audio_muxed', 'audio_track', 'audio_error'],
+  text2video: [
+    'video', 'kind', 'text', 'original_prompt', 'beats', 'parts', 'segments',
+    'audio_muxed', 'audio_track', 'audio_error',
+    'degraded', 'degrade_level', 'degrade_note', // P3 显存降级留痕
+  ],
   quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
 }
 

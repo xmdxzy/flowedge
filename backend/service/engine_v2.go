@@ -155,6 +155,7 @@ type EngineV2 struct {
 	creds           *CredentialStore // 凭据仓库（HTTP 节点按名称取密钥）
 	visionModel     string           // 自动探测到的本地视觉模型（vision 节点留空时使用）
 	vram            *vramArbiter     // 显存仲裁：同一时刻只跑一个重任务
+	vramMu          sync.Mutex       // 保护 vram 的懒初始化（见 arbiter 注释）
 	deps            *Supervisor      // 依赖进程托管（H3 需要按需切换实例）
 	nodes           nodeRegistry     // 节点类型注册表（内置 15 种 + 可注册自定义）
 	runMu           sync.Mutex
@@ -165,10 +166,37 @@ type EngineV2 struct {
 	// P0 可观测性：按节点类型维护耗时 EWMA（毫秒），供长任务 ETA 与进度心跳下发
 	durMu   sync.Mutex
 	durEWMA map[string]float64
+
+	// P1 编排深度：同层并行度上限。0 = 不限（默认）。
+	// 显存安全由 vram 仲裁器的 heavyMu 保证（重任务天然串行），
+	// 这里限制的是「同一层能同时起飞多少个节点」，防止一张宽图把 CPU/磁盘打满。
+	maxParallel int
 }
 
 // nodeProgressTick 进度心跳间隔。做成包级变量是为了让测试能调快，不必真等 2 秒。
 var nodeProgressTick = 2 * time.Second
+
+// SetMaxParallel 限制同一拓扑层同时执行的节点数（0 或负 = 不限）。
+// 重任务的显存安全不靠它：扩散/语言/语音节点进入执行前会抢 vram 仲裁器的
+// heavyMu，天然串行。这里只是给「宽图并发」加一道总闸。
+func (e *EngineV2) SetMaxParallel(n int) {
+	if n < 0 {
+		n = 0
+	}
+	e.maxParallel = n
+}
+
+// parallelSlots 生成本层的并发令牌通道；无限制时返回 nil（调用方需判空）。
+func (e *EngineV2) parallelSlots() chan struct{} {
+	if e.maxParallel <= 0 {
+		return nil
+	}
+	ch := make(chan struct{}, e.maxParallel)
+	for i := 0; i < e.maxParallel; i++ {
+		ch <- struct{}{}
+	}
+	return ch
+}
 
 // SetLLMStream 注入流式 LLM 服务（nil 则 LLM 节点走非流式）
 func (e *EngineV2) SetLLMStream(s *LLMStreamService) {
@@ -619,6 +647,9 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 		layerFailed := false
 		var layerMu sync.Mutex
 
+		// 并行度总闸：无限制时 slots 为 nil，完全走原来的无约束并发
+		slots := e.parallelSlots()
+
 		// propagate 写出边（调用方必须持有 mu）：
 		//   1. 写入下游输入槽（多前驱时天然形成汇合输入）
 		//   2. 递减前驱计数
@@ -654,9 +685,15 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 
 		// 同一层内所有节点并行执行
 		for _, id := range current {
+			if slots != nil {
+				<-slots // 起飞前占一个令牌（并发已满时在这里排队，不额外起 goroutine）
+			}
 			wg.Add(1)
 			go func(nid string) {
 				defer wg.Done()
+				if slots != nil {
+					defer func() { slots <- struct{}{} }() // 节点结束（含断点暂停）即归还
+				}
 
 				// 单步 / 断点：先向控制对象申请执行许可。
 				// 命中断点或预算用尽时节点保持 pending（不置 running、不写 started_at），
@@ -1305,6 +1342,25 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		}
 	}
 
+	// P2 壁垒：跨镜头一致性——图像节点同样吃场景锁。
+	// 此前锁只作用于文生视频与提示词优化，分镜图 / 角色表这一支不受约束，
+	// 于是同一角色在不同分镜图里长相漂移（视频锁得住、图锁不住 = 半个一致性）。
+	// 锁取自上游 scene_grid 节点，或节点自填 scene_lock / grid。
+	// 注：必须在翻译之后注入——锁是英文物理事实，不能被翻译再改写一遍。
+	sceneLock, lockErr := resolveSceneLock(node, upstream)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	lockInjected := false
+	withLock := func(p string) string {
+		out, inj := applySceneLock(p, sceneLock)
+		if inj {
+			lockInjected = true
+		}
+		return out
+	}
+	prompt = withLock(prompt)
+
 	// 24GB 上不能同时养 flux 与 14B LLM：换侧（清语言侧）并独占执行
 	release := e.enterSide(sideDiffusion)
 	defer release()
@@ -1342,6 +1398,10 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			prompts = splitPromptLines(prompt)
 		}
 	}
+	// 批量出图逐条注入：每张都是独立画面，只锁第一条等于没锁
+	for i := range prompts {
+		prompts[i] = withLock(prompts[i])
+	}
 	if len(prompts) > 1 {
 		if len(prompts) > 12 {
 			prompts = prompts[:12] // 单次图上限：再多只会把排队时间拉长，收益不再增长
@@ -1358,6 +1418,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			"prompts": prompts,
 			"translated":      translated,
 			"translate_error": translateNote,
+			"scene_lock":          sceneLock,
+			"scene_lock_injected": lockInjected,
 		}, nil
 	}
 
@@ -1386,6 +1448,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			"count":  len(paths),
 			"translated":      translated,
 			"translate_error": translateNote,
+			"scene_lock":          sceneLock,
+			"scene_lock_injected": lockInjected,
 		}, nil
 	}
 
@@ -1399,6 +1463,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		"image": imagePath,
 		"translated":      translated,
 		"translate_error": translateNote,
+		"scene_lock":          sceneLock,
+		"scene_lock_injected": lockInjected,
 	}, nil
 }
 

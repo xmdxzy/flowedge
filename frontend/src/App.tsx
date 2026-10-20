@@ -129,6 +129,10 @@ function FlowEditor() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId?: string } | null>(null)
   // 调试：debugMode 只是「这次运行按断点执行」的开关，真正的暂停状态来自后端 run.status=paused
   const [debugMode, setDebugMode] = useState(false)
+  const [preflightResult, setPreflightResult] = useState<
+    { node_id: string; label: string; hint: string; fix: string; fixable: boolean; fix_dep: string }[]
+  >([])
+  const [preflightChecking, setPreflightChecking] = useState(false)
   const [runStatus, setRunStatus] = useState<string>('')
   // P0 可观测性：运行中节点的实时进度（已用 / 预计），来自后端 WS node_progress 心跳
   const [liveProgress, setLiveProgress] = useState<{ nodeId: string; elapsedMs: number; etaMs: number } | null>(null)
@@ -824,6 +828,53 @@ function FlowEditor() {
     }
   }
 
+  /**
+   * 依赖体检（P3-B）：只体检不运行，把当前画布送后端核一遍依赖。
+   * 返回的不只是「缺什么」，还有每项能不能一键拉起、该拉哪个。
+   */
+  const runPreflight = async () => {
+    setMoreOpen(false)
+    setPreflightChecking(true)
+    try {
+      const resp = await fetch('/api/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodes: nodes, edges: edges }),
+      })
+      const data = await resp.json()
+      if (!resp.ok) {
+        setRunResult(data.error || '体检失败')
+        return
+      }
+      setPreflightResult(data.missing || [])
+      if ((data.count || 0) === 0) {
+        setRunResult('依赖体检通过：当前画布需要的服务都已就绪')
+        toast('依赖体检通过', 'success')
+      } else {
+        setRunResult(`依赖体检：${data.count} 项未就绪（${data.fixable} 项可一键修复）`)
+      }
+    } catch (e) {
+      setRunResult(`依赖体检失败: ${e}`)
+    } finally {
+      setPreflightChecking(false)
+    }
+  }
+
+  /** 一键修复：拉起体检报告里可修的那一项（复用依赖面板的启动接口） */
+  const fixDep = async (dep: string) => {
+    toast(`正在启动 ${dep}…`, 'info')
+    try {
+      const resp = await fetch(`/api/deps/${dep}/start`, { method: 'POST' })
+      if (!resp.ok) {
+        toast(`启动 ${dep} 失败`, 'error')
+        return
+      }
+      toast(`${dep} 启动中，约 20–40 秒后再次体检确认`, 'success')
+    } catch (e) {
+      toast(`启动 ${dep} 失败: ${e}`, 'error')
+    }
+  }
+
   /** 切换断点：红点由 CSS 画，状态存进节点 data（保存后依然生效） */
   const toggleBreakpoint = (nodeId: string) => {
     pushHistory()
@@ -1195,6 +1246,33 @@ function FlowEditor() {
             </span>
           )}
 
+          {/* 依赖体检报告：每项 FAIL 都带可执行修复动作，可修的直接给一键拉起 */}
+          {preflightResult.length > 0 && (
+            <div className="fe-preflight">
+              <div className="fe-preflight-hd">
+                <span>依赖未就绪 {preflightResult.length} 项</span>
+                <button onClick={() => setPreflightResult([])} title="关闭">✕</button>
+              </div>
+              <ul className="fe-preflight-list">
+                {preflightResult.map((m, i) => (
+                  <li key={i}>
+                    <div className="fp-title">
+                      {m.label}
+                      <span className="fp-node">节点 {m.node_id}</span>
+                    </div>
+                    {m.hint && <div className="fp-hint">{m.hint}</div>}
+                    {m.fix && <div className="fp-fix">→ {m.fix}</div>}
+                    {m.fixable && m.fix_dep && (
+                      <button className="fp-btn" onClick={() => fixDep(m.fix_dep)}>
+                        一键修复
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="ml-auto flex items-center gap-1.5">
             {/* 一级：高频文件与内容操作 */}
             <button onClick={saveWorkflow} className="fe-tb" title="保存到本地库">
@@ -1246,6 +1324,12 @@ function FlowEditor() {
                       }}
                     >
                       触发 · Webhook / 定时
+                    </button>
+                    <button
+                      onClick={runPreflight}
+                      disabled={preflightChecking}
+                    >
+                      {preflightChecking ? '体检中…' : '依赖体检（不运行）'}
                     </button>
                     <button
                       onClick={() => {
