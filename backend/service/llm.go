@@ -46,6 +46,10 @@ type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 	Stream   bool          `json:"stream"`
+	// Temperature 用指针：nil = 不下发，交给服务端默认（保留既有行为）。
+	// 引擎内部的「文本变换」类调用（翻译 / 提示词优化 / 场景拆解）显式传 0，
+	// 这类调用不掺随机性才能复现、才能安全缓存。
+	Temperature *float64 `json:"temperature,omitempty"`
 }
 
 type chatMessage struct {
@@ -71,7 +75,20 @@ func (s *LLMService) ChatWithModel(prompt, model string) (string, error) {
 }
 
 // ChatWithModelUsage 与 ChatWithModel 相同，额外返回 token 用量（运行级统计用）
+//
+// 调用方若需要可复现的输出（翻译 / 优化 / 拆解这类纯文本变换），
+// 用 e.deterministicChat：temperature=0 + 结果备忘，不要直接走这里。
 func (s *LLMService) ChatWithModelUsage(prompt, model string) (string, LLMUsage, error) {
+	return s.chatWithOptions(prompt, model, nil)
+}
+
+// ChatWithTemperature 指定温度的补全；temp < 0 表示不下发（服务端默认）
+func (s *LLMService) ChatWithTemperature(prompt, model string, temp float64) (string, error) {
+	text, _, err := s.chatWithOptions(prompt, model, &temp)
+	return text, err
+}
+
+func (s *LLMService) chatWithOptions(prompt, model string, temp *float64) (string, LLMUsage, error) {
 	if model == "" {
 		model = s.Model
 	}
@@ -81,7 +98,8 @@ func (s *LLMService) ChatWithModelUsage(prompt, model string) (string, LLMUsage,
 		Messages: []chatMessage{
 			{Role: "user", Content: prompt},
 		},
-		Stream: false,
+		Stream:      false,
+		Temperature: temp,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)

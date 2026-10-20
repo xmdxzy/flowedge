@@ -156,13 +156,6 @@ func StripSceneLock(prompt string) string {
 	return strings.TrimSpace(out)
 }
 
-// InjectSceneLock 把锁句注入提示词的主描述字段。
-//
-// 三条规则：
-//  1. 先剥旧锁，保证幂等（重复注入不会叠句子）；
-//  2. 插在 [Shot 1] 的**第一句之后**——官方要求第一句声明风格，锁句不能抢位；
-//  3. 没有结构化字段时自己套一层三段式，宁可重排也不能把锁丢在字段外面
-//     （字段外的文字模型会当注释忽略）。
 // applySceneLock 把场景锁注入提示词，返回新提示词与「是否真的注入了」。
 //
 // 直通语义（与门禁一致）：提示词里已经有锁句时原样返回，不重复注入。
@@ -179,6 +172,13 @@ func applySceneLock(prompt, lock string) (string, bool) {
 	return out, out != prompt
 }
 
+// InjectSceneLock 把锁句注入提示词的主描述字段。
+//
+// 三条规则：
+//  1. 先剥旧锁，保证幂等（重复注入不会叠句子）；
+//  2. 插在 [Shot 1] 的**第一句之后**——官方要求第一句声明风格，锁句不能抢位；
+//  3. 没有结构化字段时自己套一层三段式，宁可重排也不能把锁丢在字段外面
+//     （字段外的文字模型会当注释忽略）。
 func InjectSceneLock(prompt, lock string) string {
 	p := StripSceneLock(strings.TrimSpace(prompt))
 	if strings.TrimSpace(lock) == "" {
@@ -453,7 +453,9 @@ func (e *EngineV2) execSceneGridNode(ctx context.Context, node *model.NodeInstan
 			return nil, fmt.Errorf("LLM 服务不可用，无法从想法拆九宫格；请直接填 cells")
 		}
 		release := e.enterSide(sideLanguage)
-		out, err := e.llm.ChatWithModel(fmt.Sprintf("%s\n\n场景：%s", sceneGridInstruction, idea), e.llm.Model)
+		// 确定性调用（temperature=0）：同一句想法每次拆出同一套九宫格，
+		// 否则锁句会漂移，跨镜头一致性就失去基准。
+		out, err := e.deterministicChat(e.llm.Model, fmt.Sprintf("%s\n\n场景：%s", sceneGridInstruction, idea))
 		release()
 		if err != nil {
 			return nil, fmt.Errorf("九宫格拆解失败：%w", err)
@@ -491,9 +493,9 @@ func (e *EngineV2) execSceneGridNode(ctx context.Context, node *model.NodeInstan
 	log.Printf("[scene-grid] 锁句已生成（来源 %s，%d 字）：%s", source, len(lock), lock)
 
 	return map[string]interface{}{
-		"text":       lock,  // 直接连到下游 text 端口即可
-		"lock":       lock,  // 明确语义，避免与普通 text 混淆
-		"grid":       g,     // 结构化回流（下游可继续编辑）
+		"text":       lock, // 直接连到下游 text 端口即可
+		"lock":       lock, // 明确语义，避免与普通 text 混淆
+		"grid":       g,    // 结构化回流（下游可继续编辑）
 		"cells":      g.Cells,
 		"cells_text": strings.Join(g.Cells, "\n"),
 		"source":     source,

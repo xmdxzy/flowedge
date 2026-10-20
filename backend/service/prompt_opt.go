@@ -522,7 +522,9 @@ func (e *EngineV2) OptimizePromptForRef2VAWithGrid(ctx context.Context, raw stri
 	}
 	fmt.Fprintf(&b, "原始需求：%s", raw)
 
-	out, err := e.llm.ChatWithModel(fmt.Sprintf("%s\n\n%s", h3Ref2VAInstruction, b.String()), e.llm.Model)
+	// 确定性调用（temperature=0）：同一份输入每次得到同一份优化结果，
+	// 这样「改一个字重跑」时能确定差异来自改动本身，而不是随机采样。
+	out, err := e.deterministicChat(e.llm.Model, fmt.Sprintf("%s\n\n%s", h3Ref2VAInstruction, b.String()))
 	if err != nil {
 		return "", err
 	}
@@ -775,7 +777,7 @@ func (e *EngineV2) OptimizePromptForH3WithGrid(ctx context.Context, raw string, 
 			seconds, l, raw)
 	}
 	modelName := e.llm.Model
-	out, err := e.llm.ChatWithModel(fmt.Sprintf("%s\n\n%s", h3PromptInstruction, user), modelName)
+	out, err := e.deterministicChat(modelName, fmt.Sprintf("%s\n\n%s", h3PromptInstruction, user))
 	if err != nil {
 		return "", err
 	}
@@ -937,7 +939,7 @@ func (e *EngineV2) SplitPromptIntoBeats(prompt string, n int) ([]string, error) 
 		return []string{prompt}, nil
 	}
 	user := fmt.Sprintf("拆成 %d 段。镜头总指令：%s", n, prompt)
-	out, err := e.llm.ChatWithModel(fmt.Sprintf("%s\n\n%s", beatSplitInstruction, user), e.llm.Model)
+	out, err := e.deterministicChat(e.llm.Model, fmt.Sprintf("%s\n\n%s", beatSplitInstruction, user))
 	if err != nil {
 		return nil, err
 	}

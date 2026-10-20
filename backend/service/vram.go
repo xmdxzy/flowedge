@@ -49,6 +49,35 @@ func (e *EngineV2) arbiter() *vramArbiter {
 	return e.vram
 }
 
+// nodeSide 节点类型属于哪一侧显存；返回 "" 表示不吃显存（可自由并行）。
+//
+// 判定口径是「该节点执行时**第一个**进入的侧别」——决定它起飞时会不会引发换侧。
+// 典型例子：text2video 先在语言侧做提示词优化，再进扩散侧生成。按"第一个"
+// 归类到语言侧，它就能和同层的 LLM / VLM 节点凑成一批，只换一次侧；
+// 若按最终侧别（扩散）归类，它会在扩散批次内部又来回切一次。
+//
+// 与节点执行器里的 enterSide(...) 调用一一对应，改节点时必须同步改这里，
+// 否则调度器会把重任务误判成轻任务、按无限并发起飞（24GB 上直接 OOM）。
+// TestNodeSideMappingRegression 会用源码扫描盯住这个对应关系。
+func nodeSide(nodeType string) string {
+	switch nodeType {
+	// 扩散侧：ComfyUI（flux / qwen-image / wan / H3）
+	case "text2image", "image2image", "inpaint", "upscale", "shotlist":
+		return sideDiffusion
+	// 语言侧：Ollama。text2video 归此（先优化再生成，见上）
+	case "llm", "vision", "prompt_opt", "scene_grid", "select", "storyboard", "text2video":
+		return sideLanguage
+	// 语音侧：faster-whisper / Kokoro（CPU 为主，但与扩散权重抢内存带宽）
+	case "asr", "tts":
+		return sideAudio
+	}
+	return ""
+}
+
+// sideOrder 重任务组的执行顺序：扩散（最重、冷启动最贵）→ 语言 → 语音。
+// 固定顺序而非按数量排序：避免每次运行顺序漂移，行为可预期才敢无人值守。
+var sideOrder = []string{sideDiffusion, sideLanguage, sideAudio}
+
 // enterSide 进入某一侧重任务：串行化 + 换侧时卸载另一侧
 func (e *EngineV2) enterSide(side string) func() {
 	a := e.arbiter()

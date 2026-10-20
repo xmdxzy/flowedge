@@ -28,9 +28,9 @@ type DepRequirement struct {
 	Dep      string `json:"dep"` // ollama / comfyui / comfy_h3 / asr / tts / vision
 	Label    string `json:"label"`
 	Hint     string `json:"hint"`
-	Fix      string `json:"fix"`      // 可执行的修复动作（人话，能照做）
-	Fixable  bool   `json:"fixable"`  // 引擎能否代劳（true 时前端给「一键修复」按钮）
-	FixDep   string `json:"fix_dep"`  // 要拉起的依赖名（对应 /api/deps/:name/start）
+	Fix      string `json:"fix"`     // 可执行的修复动作（人话，能照做）
+	Fixable  bool   `json:"fixable"` // 引擎能否代劳（true 时前端给「一键修复」按钮）
+	FixDep   string `json:"fix_dep"` // 要拉起的依赖名（对应 /api/deps/:name/start）
 }
 
 // depFix 缺依赖时的修复路径。

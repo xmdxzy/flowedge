@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,6 +10,22 @@ import (
 
 	"flowedge/backend/model"
 )
+
+// memDB 每个用例一份独立的内存库。
+//
+// 之前用的是 `file::memory:?cache=shared` —— 这个名字在整个进程内共享，
+// 于是同一次运行里所有测试（以及 -count>1 的重跑）都在同一张库上互相看见：
+// 别人的工作流会被本用例的调度器扫到，fired 计数凭空多出几次。
+// 用用例名做 DSN 让每份测试互不干扰，重复跑结果才稳。
+func memDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := fmt.Sprintf("file:%s-%d?mode=memory&cache=shared", t.Name(), time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	return db
+}
 
 func TestCronParseAndMatch(t *testing.T) {
 	base := time.Date(2026, 10, 18, 20, 5, 0, 0, time.Local) // 周日 20:05
@@ -55,10 +72,7 @@ func TestCronParseAndMatch(t *testing.T) {
 
 // 调度器：同一分钟内多次 Tick 只触发一次；cron 不命中则不触发
 func TestCronSchedulerFiresOncePerMinute(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := memDB(t)
 	if err := db.AutoMigrate(&model.Workflow{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

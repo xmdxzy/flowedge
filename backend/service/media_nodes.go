@@ -469,19 +469,19 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 				final = final2
 			}
 		}
-	out := map[string]interface{}{
-		"video": final, "kind": "video", "text": prompt,
-		"segments": segs, "parts": parts, "beats": beats,
-		"duration_sec": float64(segs) * float64(req.Frames) / 24.0,
-		// 降档留痕：用户有权知道这一版是靠降分辨率/帧数跑出来的
-		"degraded": segDegrade > 0, "degrade_level": segDegrade, "degrade_note": segNote,
-	}
-	if sceneLock != "" {
-		out["scene_lock"] = sceneLock
-	}
-	if len(promptWarnings) > 0 {
-		out["prompt_warnings"] = promptWarnings
-	}
+		out := map[string]interface{}{
+			"video": final, "kind": "video", "text": prompt,
+			"segments": segs, "parts": parts, "beats": beats,
+			"duration_sec": float64(segs) * float64(req.Frames) / 24.0,
+			// 降档留痕：用户有权知道这一版是靠降分辨率/帧数跑出来的
+			"degraded": segDegrade > 0, "degrade_level": segDegrade, "degrade_note": segNote,
+		}
+		if sceneLock != "" {
+			out["scene_lock"] = sceneLock
+		}
+		if len(promptWarnings) > 0 {
+			out["prompt_warnings"] = promptWarnings
+		}
 		out["video"] = muxPreparedAudio(node, final, out)
 		return out, nil
 	}
