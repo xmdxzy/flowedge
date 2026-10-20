@@ -4,3 +4,7 @@ faster-whisper>=1.2,<2
 pywin32>=306
 # av 19.x 移除了 metadata_errors，会导致 faster-whisper 1.2 转写崩溃，必须钉在 19 以下
 av<19
+# ordered_set：faster-whisper 的传递依赖，但它不总被自动装上。
+# 实测缺它时服务能起、/health 返回 200，真正调 /asr 才 500
+# （"No module named 'ordered_set'"）——所以显式钉住，别靠传递解析。
+ordered_set>=4.1

@@ -28,6 +28,33 @@ _models = {}
 _ALLOWED_DEVICES = ("cpu", "cuda", "auto")
 
 
+# 深度自检要验证的模块。把 faster-whisper 的**传递依赖**也列全：
+# ordered_set 就不在大多数人的安装清单里，而缺它时服务照样起得来、
+# 照样回 200，只有真正转写才 500（历史故障 #11）。
+_REQUIRED_IMPORTS = (
+    "faster_whisper",
+    "ctranslate2",
+    "av",
+    "ordered_set",
+    "onnxruntime",  # VAD
+)
+
+
+def selfcheck_missing():
+    """深度自检：真正转写要用到的依赖是否都导入得进来。
+
+    故意不加载模型：首次加载会触发几百 MB 下载，把运行前预检拖成分钟级。
+    只验导入已经足以抓到「服务活着但缺包」这一类故障。
+    """
+    missing = []
+    for mod in _REQUIRED_IMPORTS:
+        try:
+            __import__(mod)
+        except Exception:  # noqa: BLE001
+            missing.append(mod)
+    return missing
+
+
 def get_model(name=None, device=None):
     name = (name or MODEL_NAME).strip() or MODEL_NAME
     device = (device or DEVICE).strip() or DEVICE
@@ -104,11 +131,29 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok","service":"flowedge-asr"}')
+        path, _, query = self.path.partition("?")
+        if path == "/health":
+            payload = {"status": "ok", "service": "flowedge-asr"}
+            # deep=1 时验证 faster-whisper 真的导入得进来。
+            # 历史故障：服务能起、/health 也 200，真调 /asr 才 500
+            # （No module named 'ordered_set' —— 一个没被声明的传递依赖）。
+            # 注意这里**不加载模型**：首次加载会触发几百 MB 下载，
+            # 放到健康检查里会把预检拖成分钟级。
+            if "deep=1" in query:
+                missing = selfcheck_missing()
+                if missing:
+                    payload = {
+                        "status": "degraded",
+                        "service": "flowedge-asr",
+                        "missing": missing,
+                        "hint": "缺 Python 依赖：pip install " + " ".join(missing),
+                    }
+                else:
+                    loaded = sorted({k[0] for k in _models})
+                    payload["detail"] = "自检通过（faster-whisper 可导入）"
+                    if loaded:
+                        payload["loaded_models"] = loaded
+            self._json(200, payload)
             return
         self.send_response(404)
         self.end_headers()

@@ -7,6 +7,21 @@ date-based versioning (`vYYYY.MM.DD`).
 ## [v2026.10.20]
 
 ### Added
+- **Deep health checks for the local speech services** — `/health?deep=1` no longer
+  just reports "the process is alive". TTS synthesises a throwaway sample end to end;
+  ASR verifies that every module it needs can actually be imported, including
+  transitively-required ones. Previously a service could answer `/health` with 200 and
+  still return 500 on the first real call (`No module named 'ordered_set'`), so a run
+  wasted 100+ seconds before surfacing an error that was knowable up front.
+  Old service builds that do not understand the query string fall back cleanly to plain
+  `/health`, so upgrading the engine alone does not break a running service.
+- **`Degraded` is now a first-class dependency state** — separate from "not running".
+  A degraded dependency reports the exact `pip install` command and is deliberately
+  *not* marked one-click-fixable: restarting a process that is already alive never
+  fixes a missing package.
+- **`ordered_set` pinned in `requirements.txt`** — it is a transitive dependency of
+  faster-whisper that is not always installed automatically; the service starts fine
+  without it and only fails at transcription time.
 - **P0 Observability** — long multimodal nodes used to render as a spinner with no
   signal. The engine now emits a `node_progress` heartbeat every 2s (`elapsed_ms` /
   `eta_ms`) while a node runs, and stamps `duration_ms` on `node_finished`,

@@ -65,6 +65,14 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 			return
 		}
 		fd, fx, ftext := depFix(dep)
+		// 服务在跑但内部不可用（缺 Python 依赖等）：一键启动帮不上忙，
+		// 必须给出装包命令，否则用户会反复点「一键修复」而毫无变化。
+		if c.Degraded {
+			fd, fx = "", false
+			if c.Hint != "" {
+				ftext = c.Hint
+			}
+		}
 		missing = append(missing, DepRequirement{
 			NodeID: n.ID, NodeType: n.Type, Dep: dep, Label: label, Hint: c.Hint,
 			Fix: ftext, Fixable: fx, FixDep: fd,

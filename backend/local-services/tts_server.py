@@ -17,6 +17,34 @@ import win32com.client
 PORT = int(os.environ.get("TTS_PORT", "8102"))
 
 
+def selfcheck_missing():
+    """深度自检：真的合成一小段，验证整条链路可用。
+
+    为什么不能只查 import：历史故障里服务起得来、顶层 import 也过了，
+    真正调 /tts 时才因为**延迟导入**的传递依赖缺失而 500
+    （No module named 'ordered_set'）。只探端口/只查顶层导入都会放过它。
+
+    代价：一次 SAPI 合成约几十毫秒，只在 deep=1 时执行（运行前预检一次），
+    常规 /health 保持轻量。
+    """
+    try:
+        wav = synth_to_wav("。")
+        if len(wav) < 1000:
+            return ["<sapi produced no audio>"]
+        return []
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        # 把 ModuleNotFoundError 里的模块名提出来，好让提示可以照着装
+        for token in ("No module named '", 'No module named "'):
+            idx = msg.find(token)
+            if idx >= 0:
+                rest = msg[idx + len(token):]
+                name = rest.split("'")[0].split('"')[0]
+                if name:
+                    return [name]
+        return [f"<{msg}>"]
+
+
 def select_chinese_voice(synth):
     """SAPI 官方过滤器 Language=804（zh-CN 的十六进制 LCID）选中文声。"""
     try:
@@ -34,11 +62,25 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok","service":"flowedge-tts"}')
+        path, _, query = self.path.partition("?")
+        if path == "/health":
+            payload = {"status": "ok", "service": "flowedge-tts"}
+            # deep=1 时才走一遍真实合成：验证「服务活着」之外，还验证
+            # 「真的能出声」。历史故障：服务能起、/health 也 200，但真正调
+            # /tts 时才 500 —— No module named 'ordered_set'。
+            # 只探端口永远抓不到这类延迟导入缺失。
+            if "deep=1" in query:
+                missing = selfcheck_missing()
+                if missing:
+                    payload = {
+                        "status": "degraded",
+                        "service": "flowedge-tts",
+                        "missing": missing,
+                        "hint": "缺 Python 依赖：pip install " + " ".join(missing),
+                    }
+                else:
+                    payload["detail"] = "自检通过（已成功合成一段测试音频）"
+            self._json(200, payload)
             return
         self.send_response(404)
         self.end_headers()

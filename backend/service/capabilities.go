@@ -20,6 +20,10 @@ type Capability struct {
 	Models   []string `json:"models,omitempty"`
 	Endpoint string   `json:"endpoint,omitempty"`
 	Path     string   `json:"path,omitempty"`
+	// Degraded 服务进程在跑，但内部不可用（例如缺 Python 依赖）。
+	// 与「没启动」必须分开：前者一键启动没用，只能装依赖；
+	// 混成一个 false 会让预检给出错误的修复动作。
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 // Capabilities 部署环境能力矩阵
@@ -179,10 +183,14 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, comfyH
 		defer wg.Done()
 		c := Capability{Endpoint: base, Hint: hint}
 		if base != "" {
-			if _, err := httpGetBody(base + "/health"); err == nil {
-				c.OK = true
+			pc := probeLocalHealth(base, name)
+			if pc.OK || pc.Degraded {
+				c.OK, c.Detail, c.Degraded = pc.OK, pc.Detail, pc.Degraded
+				// 就绪时清掉「怎么启动」的提示；降级时换成「装哪个包」
 				c.Hint = ""
-				c.Detail = name + " 服务已就绪"
+				if pc.Degraded {
+					c.Hint = pc.Hint
+				}
 			}
 		}
 		setOK(dst, c)
@@ -197,10 +205,16 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, comfyH
 		defer wg.Done()
 		c := Capability{Endpoint: ttsBase, Hint: "未配置：TTS 节点会直接失败（不会写出假音频）。非 Windows 环境请设置 TTS_BASE_URL 指向本地 TTS 服务"}
 		if ttsBase != "" {
-			if _, err := httpGetBody(ttsBase + "/health"); err == nil {
-				c.OK = true
-				c.Hint = ""
-				c.Detail = "TTS 服务已就绪"
+			pc := probeLocalHealth(ttsBase, "TTS")
+			if pc.OK {
+				c.OK, c.Hint, c.Detail = true, "", pc.Detail
+				setOK(&caps.TTS, c)
+				return
+			}
+			if pc.Degraded {
+				// 服务在跑但坏了：不能退回 SAPI——那会让「配置的 TTS 有问题」
+				// 被一条兜底链路掩盖掉。明确报出来，提示精确到装哪个包。
+				c.OK, c.Degraded, c.Detail, c.Hint = false, true, pc.Detail, pc.Hint
 				setOK(&caps.TTS, c)
 				return
 			}
@@ -303,6 +317,55 @@ func PickDefaultModel(ollamaBase string) string {
 		return m
 	}
 	return pick(func(string) bool { return true })
+}
+
+// probeLocalHealth 探测本地语音服务：优先深度自检（/health?deep=1），
+// 旧版服务不支持该 query 时回落普通 /health。
+//
+// 为什么要深度自检：/health 返回 200 只证明进程活着。真实故障记录里 TTS
+// 起来了、/health 也 200，真调 /tts 才 500（缺 Python 传递依赖 ordered_set），
+// 于是一次完整运行白等一百多秒才看到错误。深度自检把这句话提前到入口。
+//
+// 兼容纪律：旧脚本用 `self.path == "/health"` 精确匹配，带 query 会返回 404，
+// 所以必须回落——不能把「旧版服务」误判成「服务不可用」。
+func probeLocalHealth(base, name string) Capability {
+	c := Capability{Endpoint: base}
+	body, err := httpGetBody(base + "/health?deep=1")
+	deep := true
+	if err != nil {
+		body, err = httpGetBody(base + "/health")
+		deep = false
+		if err != nil {
+			return c // 连不上：没启动，交给调用方的 Hint 说明怎么起
+		}
+	}
+	var r struct {
+		Status  string   `json:"status"`
+		Missing []string `json:"missing"`
+		Hint    string   `json:"hint"`
+	}
+	_ = json.Unmarshal(body, &r)
+	if r.Status == "degraded" || len(r.Missing) > 0 {
+		c.OK = false
+		c.Degraded = true
+		if len(r.Missing) > 0 {
+			c.Detail = name + " 服务在跑但不可用（缺 " + strings.Join(r.Missing, "、") + "）"
+		} else {
+			c.Detail = name + " 服务在跑但自检未通过"
+		}
+		c.Hint = r.Hint
+		if c.Hint == "" {
+			c.Hint = "服务进程已启动，但内部依赖缺失，调用时必然失败。请在它的 venv 里 pip install 缺失的包后重启该服务"
+		}
+		return c
+	}
+	c.OK = true
+	if deep {
+		c.Detail = name + " 服务已就绪（深度自检通过）"
+	} else {
+		c.Detail = name + " 服务已就绪"
+	}
+	return c
 }
 
 func httpGetBody(url string) ([]byte, error) {
