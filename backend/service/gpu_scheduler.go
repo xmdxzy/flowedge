@@ -222,10 +222,16 @@ func (s *GPUScheduler) gpuInfoLocked() (*GPUInfo, error) {
 }
 
 // queryGPU 现场执行 nvidia-smi（无锁：调用方自行决定锁策略）
+//
+// 必须走隐藏窗口：这个函数由 StartTelemetry 每 5 秒调一次，
+// 而 nvidia-smi 是控制台程序。Windows 11 把「默认终端应用」指向
+// Windows Terminal 后，任何未声明 CREATE_NO_WINDOW 的控制台子进程
+// 都会被系统重新拉起一个 Windows Terminal 窗口——每 5 秒闪一次黑框。
 func (s *GPUScheduler) queryGPU() (*GPUInfo, error) {
 	cmd := exec.Command("nvidia-smi",
 		"--query-gpu=memory.total,memory.used,memory.free,utilization.gpu",
 		"--format=csv,noheader,nounits")
+	cmd.SysProcAttr = hiddenWindowAttr()
 
 	output, err := cmd.Output()
 	if err != nil {

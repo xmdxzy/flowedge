@@ -6,6 +6,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,9 +235,29 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 
 	original := prompt
 	beats := []string{}
+	// 场景锁在优化之前取：来自上游「场景九宫格」节点（或节点自填）。
+	// 只能取一次——多段各自编译就等于各自解释场景，锁就没有意义了。
+	sceneLock, lockErr := resolveSceneLock(node, upstream)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	// 参考资产先看在优化之前：有图/音频就要按 Ref2VA 的六段式写。
+	// 旧实现一律用 T2VA 指令优化，再拿字符串套一层六段式外壳——
+	// 结果是 subject_definitions 里出现 "<Picture 1> defines the visual identity"，
+	// 而官方要求身份靠 <Subject N> 定义、图片源引在其中，标签语义错，身份就靠运气。
+	refImgHint := stringList(node.Data, "ref_images")
+	refAudHint := stringList(node.Data, "ref_audio")
+	useRef2VA := backend == "h3" && (len(refImgHint) > 0 || len(refAudHint) > 0)
+	var promptWarnings []string
 	if optimize {
 		releaseLang := e.enterSide(sideLanguage)
-		opt, oerr := e.OptimizePromptForH3(ctx, prompt, seconds)
+		var opt string
+		var oerr error
+		if useRef2VA {
+			opt, oerr = e.OptimizePromptForRef2VAWithGrid(ctx, prompt, seconds, len(refImgHint), len(refAudHint), sceneLock)
+		} else {
+			opt, oerr = e.OptimizePromptForH3WithGrid(ctx, prompt, seconds, sceneLock)
+		}
 		if oerr == nil {
 			prompt = opt
 		}
@@ -253,6 +274,9 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 			// 但声音字段仍要兜底——空字段会让 H3 自行脑补人声。
 			prompt = original + ""
 			prompt, _ = ensureH3AudioFields(prompt)
+			if sceneLock != "" {
+				prompt = InjectSceneLock(prompt, sceneLock)
+			}
 			_ = oerr
 		} else {
 			prompt = opt
@@ -267,8 +291,31 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 			for i := range beats {
 				beats[i], _ = ensureH3AudioFields(beats[i])
 				beats[i] = ensureDialogueFree(beats[i])
+				if sceneLock != "" {
+					// 先剥后注：拆段时 LLM 可能改写锁句（换个介词、调个词序），
+					// 肉眼看不出来，但两段已经不是同一串字节——场景就在这一步开始漂。
+					beats[i] = InjectSceneLock(beats[i], sceneLock)
+				}
 				if sharedSound != "" {
 					beats[i] = setH3Field(beats[i], "overall_soundscape", sharedSound)
+				}
+			}
+			// 场景锁门：只检查"有没有写"没有意义，必须按原文全等比对。
+			// 缺段 / 漂移都算 FAIL——成片里表现为接缝处换场地，而时长帧数全部正常。
+			if sceneLock != "" && len(beats) > 0 {
+				for _, it := range auditSceneConsistency(append([]string{prompt}, beats...)) {
+					log.Printf("[h3] 场景锁体检：%s %s", it.Code, it.Msg)
+					promptWarnings = append(promptWarnings, it.Code+": "+it.Msg)
+				}
+			}
+			// 机器体检：官方指南里最容易漏的是结构性缺失（说话人没音色、
+			// 镜头没幅度、身份标签用错、有音频却没 fully_copy），这些能确定性判断
+			if issues := auditH3Prompt(prompt); len(issues) > 0 {
+				log.Printf("[h3] 提示词体检：%s", auditSummary(issues))
+				for _, it := range issues {
+					if it.Level == "FAIL" {
+						promptWarnings = append(promptWarnings, it.Code+": "+it.Msg)
+					}
 				}
 			}
 		}
@@ -389,11 +436,17 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 				final = final2
 			}
 		}
-		out := map[string]interface{}{
-			"video": final, "kind": "video", "text": prompt,
-			"segments": segs, "parts": parts, "beats": beats,
-			"duration_sec": float64(segs) * float64(req.Frames) / 24.0,
-		}
+	out := map[string]interface{}{
+		"video": final, "kind": "video", "text": prompt,
+		"segments": segs, "parts": parts, "beats": beats,
+		"duration_sec": float64(segs) * float64(req.Frames) / 24.0,
+	}
+	if sceneLock != "" {
+		out["scene_lock"] = sceneLock
+	}
+	if len(promptWarnings) > 0 {
+		out["prompt_warnings"] = promptWarnings
+	}
 		out["video"] = muxPreparedAudio(node, final, out)
 		return out, nil
 	}
@@ -414,6 +467,12 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	}
 	out := map[string]interface{}{
 		"video": path, "kind": kindRet, "text": prompt,
+	}
+	if sceneLock != "" {
+		out["scene_lock"] = sceneLock
+	}
+	if len(promptWarnings) > 0 {
+		out["prompt_warnings"] = promptWarnings
 	}
 	if optimize {
 		out["original_prompt"] = original

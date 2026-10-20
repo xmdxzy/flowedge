@@ -57,6 +57,37 @@ def run(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
     return cp.returncode, (cp.stderr or "") + (cp.stdout or "")
 
 
+def polish_voice(src: str, dst: str) -> bool:
+    """裁静音 + 去机械感 + 加空间感 + 归一化。失败返回 False。
+
+    为什么必须做（2026-10-20 实测）：
+      1. Kokoro 每句自带约 0.44s 前导静音、0.6-1.1s 尾部静音。
+         「十年了。」原始 2.23s，真正说话只有 0.72s。不裁的话每句台词都比
+         计划晚 0.44s 开口，而画面是按计划时点切镜头的——这就是"音画不同"的来源。
+      2. TTS 是干声，塞进空旷城门/雪夜的画面里必然"贴上去"。加早期反射 +
+         短混响尾，人声才会落在同一个空间里。
+    """
+    af = (
+        # 裁首尾静音，保留 30/50ms 余量避免切到起音和收尾
+        "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.03,"
+        "areverse,"
+        "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,"
+        "areverse,"
+        # 去机械感：切掉低频嗡、抬一点胸腔共鸣
+        "highpass=f=85,"
+        "equalizer=f=180:t=q:w=1.0:g=1.5,"
+        # 空间感：三个抽头的早期反射（约 2.3m / 4.8m / 8.8m 的墙面反射）
+        "aecho=0.85:0.85:55|115|210:0.22|0.14|0.08,"
+        # 混响尾不要被裁掉
+        "apad=pad_dur=0.2,"
+        "loudnorm=I=-16:TP=-2:LRA=9,"
+        f"aresample={OUT_RATE}"
+    )
+    code, _ = run([FFMPEG, "-y", "-v", "error", "-i", src, "-af", af,
+                   "-ar", str(OUT_RATE), "-ac", "2", dst])
+    return code == 0
+
+
 def tts(text: str, out_wav: str, speed: float = 1.0, voice: str = "") -> None:
     body = json.dumps({"text": text, "speed": speed, **({"voice": voice} if voice else {})}).encode()
     req = urllib.request.Request(TTS_ENDPOINT.rstrip("/") + "/tts", data=body,
@@ -93,8 +124,9 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="输出 wav")
     ap.add_argument("--duration", type=float, default=0.0,
                     help="目标时长（秒）；给定则补静音/截断到该长度，用于对齐视频")
-    ap.add_argument("--ambience", help="环境底噪 wav（会循环铺满并压低混入）")
-    ap.add_argument("--ambience-gain", type=float, default=0.18, help="环境声增益（默认 0.18）")
+    ap.add_argument("--ambience", help="环境底噪 wav（会循环铺满并混入）")
+    ap.add_argument("--ambience-gain", type=float, default=0.85,
+                    help="环境声线性增益（默认 0.85，约等于把底噪定在 -32dB 可闻但远低于人声）")
     ap.add_argument("--lead", type=float, default=0.25, help="开场留白（秒）")
     ap.add_argument("--frames", type=int, default=0, help="按视频帧数对齐时长（优先于 --duration）")
     ap.add_argument("--fps", type=int, default=24)
@@ -123,10 +155,12 @@ def main() -> int:
     report = []
 
     # 开场留白
+    cursor = 0.0
     if args.lead > 0:
         p = os.path.join(tmpdir, "lead.wav")
         silence(p, args.lead)
         parts.append(p)
+        cursor = args.lead
 
     for i, item in enumerate(lines):
         text = (item.get("text") or "").strip()
@@ -134,14 +168,29 @@ def main() -> int:
             continue
         wav = os.path.join(tmpdir, f"line{i}.wav")
         tts(text, wav, float(item.get("speed") or 1.0), item.get("voice") or "")
+        # 逐句整形：裁静音 → 去机械感 → 加空间感 → 单句归一化。
+        # 归一化必须在**单句**上做：整条轨道跑 loudnorm 会被长静音带偏，
+        # 实测把台词从 -18dB 压到 -27dB，底噪反而更响，ASR 直接转不出字。
+        norm = os.path.join(tmpdir, f"line{i}-n.wav")
+        if not polish_voice(wav, norm):
+            # 整形失败不中断，退回原始 TTS（至少还有声音），但要说出来
+            print(json.dumps({"ok": True, "warn": f"第 {i+1} 句整形失败，使用原始 TTS"},
+                             ensure_ascii=False))
+        else:
+            wav = norm
         parts.append(wav)
+        dur = duration_of(wav)
+        # 记录真实起止：台词是否落在镜头切点上，靠这两个数核对，不靠猜
         report.append({"speaker": item.get("speaker") or f"S{i+1}", "text": text,
-                       "seconds": round(duration_of(wav), 3)})
+                       "seconds": round(dur, 3),
+                       "start": round(cursor, 3), "end": round(cursor + dur, 3)})
+        cursor += dur
         pause = float(item.get("pause", 0.35))
         if pause > 0:
             p = os.path.join(tmpdir, f"gap{i}.wav")
             silence(p, pause)
             parts.append(p)
+            cursor += pause
 
     if not parts:
         print(json.dumps({"ok": False, "error": "没有可用台词"}, ensure_ascii=False))
@@ -161,8 +210,16 @@ def main() -> int:
 
     spoken = duration_of(joined)
 
-    # 目标时长对齐：不足补静音，超出截断
+    # 目标时长对齐：不足补静音，超出必须截断。
+    # 不截断会让 wav 比视频长，mux 时 -shortest 会砍掉结尾——如果台词压在末尾就丢字。
     target = args.duration or 0.0
+    if target > 0 and spoken > target + 0.05:
+        print(json.dumps({"ok": True, "warn": f"台词总长 {spoken:.2f}s 超过目标 {target:.2f}s，"
+                                              f"已截断（lead/pause 需要收紧）"}, ensure_ascii=False))
+        cut = os.path.join(tmpdir, "cut.wav")
+        run([FFMPEG, "-y", "-v", "error", "-i", joined, "-t", f"{target:.3f}",
+             "-ar", str(OUT_RATE), "-ac", "2", cut])
+        joined, spoken = cut, target
     if target > 0 and spoken < target:
         pad = os.path.join(tmpdir, "pad.wav")
         silence(pad, target - spoken)
@@ -175,19 +232,26 @@ def main() -> int:
         joined = joined2
 
     final = joined
+    mixed_env = False
     if args.ambience and os.path.isfile(args.ambience):
         mixed = os.path.join(tmpdir, "mixed.wav")
-        # 环境声循环铺满 + 压低；人声保持原电平
+        span = max(spoken, target or spoken)
+        # 顺序很重要：先分别定电平，再相加。
+        # 先 amix 再 loudnorm 会让底噪占掉响度预算 → 人声被压到听不清
+        # （实测：底噪混到 -45dB 后第三段整段被判静音；抬到 -17dB 又让 ASR 转不出字）。
         code, out = run([
             FFMPEG, "-y", "-v", "error",
             "-i", joined, "-stream_loop", "-1", "-i", args.ambience,
             "-filter_complex",
-            f"[1:a]volume={args.ambience_gain},atrim=0:{max(spoken, target or spoken):.3f}[amb];"
-            f"[0:a][amb]amix=inputs=2:duration=first:dropout_transition=0[out]",
+            f"[0:a]anull[voc];"
+            f"[1:a]volume={args.ambience_gain},atrim=0:{span:.3f}[amb];"
+            f"[voc][amb]amix=inputs=2:duration=first:normalize=0,"
+            f"alimiter=limit=0.95[out]",
             "-map", "[out]", "-ar", str(OUT_RATE), "-ac", "2", mixed,
         ])
         if code == 0:
             final = mixed
+            mixed_env = True
         else:
             print(json.dumps({"ok": False, "warn": "环境声混入失败，仅保留人声", "detail": out[:300]},
                              ensure_ascii=False))
@@ -196,8 +260,10 @@ def main() -> int:
     if outdir:
         os.makedirs(outdir, exist_ok=True)
     # 限幅：TTS 原始峰值常顶到 0dB，fully_copy 会把这个削波原样带进成片
+    # 混过环境声的已经在上一步归一化，再 loudnorm 会把底噪重新抬起来
+    af = "alimiter=limit=0.95" if mixed_env else "loudnorm=I=-16:TP=-1.5:LRA=11"
     code, out = run([FFMPEG, "-y", "-v", "error", "-i", final,
-                     "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                     "-af", af,
                      "-ar", str(OUT_RATE), "-ac", "2", "-c:a", "pcm_s16le", args.out])
     if code != 0:
         print(json.dumps({"ok": False, "error": "写出失败", "detail": out[:400]}, ensure_ascii=False))

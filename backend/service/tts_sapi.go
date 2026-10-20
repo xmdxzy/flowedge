@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -65,8 +66,26 @@ func SAPIAvailable() bool {
 	return err == nil
 }
 
-// SAPIInfo 探测已安装语音（供能力面板显示「哪几个嗓子可用」）
+// SAPIInfo 探测已安装语音（供能力面板显示「哪几个嗓子可用」）。
+//
+// 结果在进程内缓存一次：探测本身要 spawn 一个 powershell，
+// 而 ProbeCapabilities 会在每次 /api/capabilities 请求时调用本函数——
+// 前端挂载、窗口聚焦、依赖启停后都会刷能力，不缓存就会周期性在桌面上闪黑框。
+// 语音引擎列表在进程生命周期内不会变，缓存零风险。
+var (
+	sapiInfoOnce  sync.Once
+	sapiInfoCache string
+)
+
 func SAPIInfo() string {
+	sapiInfoOnce.Do(func() {
+		sapiInfoCache = detectSAPIInfo()
+	})
+	return sapiInfoCache
+}
+
+// detectSAPIInfo 真正执行一次探测（单次 powershell，超时 6 秒）
+func detectSAPIInfo() string {
 	if !SAPIAvailable() {
 		return ""
 	}

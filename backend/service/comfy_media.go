@@ -248,6 +248,12 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		seed = time.Now().UnixNano() % (1 << 31)
 	}
 
+	// 兼容矩阵预检：已知不兼容的 checkpoint 在构图前显式失败（VAE 架构误判类），
+	// 不让用户等到 ComfyUI 执行期才看到一句不指向根因的 size mismatch
+	if err := CheckCheckpointCompat(s.Checkpoint); err != nil {
+		return nil, err
+	}
+
 	switch req.Kind {
 	case "img2img":
 		name, err := s.UploadImage(req.Image)
@@ -692,6 +698,10 @@ func (s *Text2ImageService) GenerateImagesFromPrompts(prompts []string, width, h
 	prompts = cleanPrompts(prompts)
 	if len(prompts) == 0 {
 		return nil, fmt.Errorf("批量提示词为空")
+	}
+	// 兼容矩阵预检（见 comfy_compat.go）：不兼容组合构图前显式失败
+	if err := CheckCheckpointCompat(s.Checkpoint); err != nil {
+		return nil, err
 	}
 	if len(prompts) == 1 {
 		one, err := s.GenerateImage(prompts[0], width, height)

@@ -104,9 +104,77 @@ agent 只负责探活、配置、修复，不负责「帮你挂着」。每次�
 
 - [ ] `verify-media.py` 无 FAIL
 - [ ] 抽接缝前后各 1 帧看过（cut 段尤其）
+- [ ] 多段片：`prompt_warnings` 里没有 `scene_lock_missing` / `scene_lock_drift`
 - [ ] ASR 转写确认无人声 / 台词正确
 - [ ] 报耗时报的是**实测区间**，不是估算
 - [ ] 告诉用户「改哪个参数可以重跑」，而不是只给一个成片
+
+### 0.12 六类反复犯的失误（2026-10-20 复盘，每条都对应一次真实返工）
+
+> 这一节不是自我批评，是把「下次怎么不问第二遍」写死。违反任一条 = 返工。
+
+#### ① 把二手的当成一手的
+
+**错**：拿到"优化 H3 提示词"的任务，直接沿用社区博客（reapi.ai / aifinitee）的摘要，把
+`subject_definitions / retention_analysis` 那套当官方要求写进文档。真相是官方仓库
+`MiniMax-AI/MiniMax-H3/skills/h3-prompt-writing/references/` 有两份原文，而且**本地就躺着**
+官方工作流 JSON、`nodes_minimax_h3.py` 源码、`MINIMAX_H3_LOCAL.md`。
+
+**根因**：搜索到了"看起来权威"的总结就停下，没有枚举本地已有资产。这就是 §0.1 那个错的原样复发。
+
+**规则**：任何"标准/规范/最佳实践"类判断，按顺序取证——**本地源码与官方范例 → 官方仓库原文 →
+官方文档页 → 社区博客（只能当索引）**。写进文档前必须能指到原文那一条；指不到就是在猜。
+
+#### ② 验收维度选错，用"工具没报错"当"没问题"
+
+**错**：`verify-media` 报 `av_drift=0`，就认为音画同步。用户听完说"不同"，一量 TTS 才发现
+每句自带 0.44s 前导静音。
+
+**根因**：av_drift 只验容器时长差，不验"语音实际起点 vs 计划时点"。**工具能测的维度 ≠ 用户能感知的维度。**
+
+**规则**：验收清单必须包含"用户能感知的项"，并且都要有数值：
+- 视频：帧数 / 时长 / 接缝（已有）**+ 语音起点 vs 计划时点（差 ≤0.1s）+ 跨段平均亮度 AvgY 光比**
+- 音频：人声与底噪的 SNR（≥8dB）+ ASR 可懂度
+- 提示词：`auditH3Prompt` 全绿 **+ 至少跑一次真实 LLM 并把它的错误记下来**
+
+#### ③ 用调参数掩盖结构错误
+
+**错**：混音顺序错了（先 amix 后 loudnorm），我先把 `--ambience-gain` 从 0.18 调到 1.2 硬顶，
+结果底噪盖住人声、ASR 直接转不出字，比原版更糟。
+
+**规则**：指标不对时先问"链路顺序/结构是否错了"，再问"参数该调多少"。
+**参数化 ≠ 修根因**；连续两次调参没改善，必须停下来读代码。
+
+#### ④ 一次改多个变量
+
+**错**：重拍段 2/3 时同时改了提示词、lead/pause、混音链、环境声素材。出现"段 2 变成白天"时
+分不清是重拍的锅还是调色的锅，多花一轮定位。
+
+**规则**：一轮只动一个变量（这条用户早就定过，我违反了）。同一轮改 ≥2 项时，
+必须在日志里列出变量清单并保留 A/B 版本，否则不许说"已验证"。
+
+#### ⑤ 换轨/装配这类"看起来无害"的操作不验前提
+
+**错**：换音轨用 `-shortest` 让容器比视频流长 4 帧，`stitch` 按容器时长算 xfade offset →
+offset 越过上一段终点 → 整段画面被丢掉，而成片**时长仍然报 30s**，只看时长根本发现不了。
+
+**规则**：任何"重封装/mux/拼接"之后，立刻 `ffprobe` 核对 **`nb_frames` 与视频流 duration**；
+装配器一律用**视频流时长**算偏移，不用容器时长。
+
+#### ⑥ 停服务前没先准备好恢复手段
+
+**错**：为了让改动生效先杀了 8080 引擎，然后才发现 bat 在 Git Bash 下编码失败、PowerShell 拉起的
+进程会被会话清理、COM 方式被安全策略拦。最后服务停着交回用户手动启动。
+
+**规则**：§0.10 已经写明"agent 不负责挂着"。所以**动任何常驻服务之前，先确认恢复路径可用**
+（谁启动、怎么启动、路径是否有中文/编码问题），再停。验证不了就别停。
+
+### 0.13 汇报口径（避免"看起来都做完了"）
+
+结论先行 → 给数值证据 → **把"没验证的部分"单独列一节** → 下一步。
+
+不许把"代码已落地"和"效果已验证"写在同一个语气里。未跑过的路径就写"未验证"，不要用
+"应该可以""理论上"糊过去。
 
 ## 1. 模型与目录
 
@@ -143,6 +211,8 @@ agent 只负责探活、配置、修复，不负责「帮你挂着」。每次�
 - 节点「装了」不等于「注册了」→ 查 `/object_info` 的节点 id 与总数。
 - 视频「生成了」不等于「有画面」→ `ffprobe` 看 stream 列表（video + audio 都要有）。
 - 模型「迁完了」不等于「读得到」→ 查 loader 的枚举列表。
+- 场景「写了锁」不等于「锁住了」→ 多段锁句必须**字节全等**（`auditSceneConsistency`）；
+  文字上"差不多"就等于没锁，接缝处会换场地而帧数时长全部正常。
 - 报错原文优先于任何文档；同一错误在两个不同权重上都出现，就别再换文件试。
 
 ## 5.1 ComfyUI 依赖（血泪）
@@ -530,6 +600,75 @@ python scripts/shot-film.py --plan data/film/jindan/plan.json          # 内部�
 叠加顺序 `DEFAULT < PROFILE < 本片 gates < 命令行显式参数`，所以 `--min-shot` 之类默认必须是
 `None`——给个 1.2 的默认值会把 profile 静默盖掉（当场踩过）。
 序策图：`content/02-H3多段成片-定妆图锁角色`（trigger → shot-film → 门 → 人工签收）
+
+## 5.11 提示词引擎对照官方指南重写（2026-10-20）
+
+**事实源变了**：不再用社区博客。官方仓库 `github.com/MiniMax-AI/MiniMax-H3/skills/h3-prompt-writing`
+里有 `references/base-en.txt`（T2VA/I2VA/FL2VA/L2VA）与 `references/ref-en.txt`（Ref2VA）两份原文，
+本地官方工作流 `D:/AI/ComfyUI/user/default/workflows/MiniMax-H3/*.json` 的 prompt 字段是范例。
+
+### 与旧实现的六处实质差异
+
+| # | 旧实现 | 官方要求 | 后果 |
+|---|---|---|---|
+| 1 | `<Picture 1> defines the visual identity` | 图片只定身份时写 **`<Subject N>`**，图片源引在定义里；`<Picture N>` 只在它是帧/构图锚点时单列 | 标签语义错，身份锁不住 |
+| 2 | LLM 猜 `summary` 任务前缀 | 前缀从固定枚举里选且必须与实际资产一致（无源视频就不能写 video continuation） | 模型把参考当错用的东西 |
+| 3 | 说话人只写 `(S1) says:` | `(S1)` 前必须有可念的**音色/年龄/性别/语速**；身份与动作在 `<d>` 外，`<d>` 内只放语言标签与原文 | 语气与口型失控 |
+| 4 | `outcome_soundscape: N/A`（fully_copy 时） | 不要拿 N/A 当垃圾桶：写「复制的环境层来自 `<Audio 1>` 持续全片」 | 声景字段失效 |
+| 5 | 无风格开场句 | `[Shot 1]` 内第一句先立风格（Live-action, cinematic, ...）；Ref2VA 则放在 `[Shot 1]` **之前** | 画面质感掉档 |
+| 6 | 正文 200 多词 | Ref2VA 的 `detailed_description` **350-500 词** | 细节不足，模型自由发挥 |
+
+另：官方 4.3 明确「幅度与速度只在有意义时写，中等幅度常速通常省略」——
+所以**不能**因为缺 `amplitude` 就报警，只查 `moves forward / camera follows` 这类非官方表达。
+
+### 引擎落实点（`backend/service/prompt_opt.go`）
+
+- `h3PromptInstruction` / `h3Ref2VAInstruction`：两套指令，按是否有参考资产分派（`media_nodes.go`）
+- `auditH3Prompt`：确定性体检（字段缺失 / Picture 身份误用 / 说话人无音色 / 有音频没 fully_copy /
+  非官方镜头词 / 无风格句 / 词数不足 / summary 前缀与实际资产矛盾 / 标签裸写）
+- `normalizeSummaryPrefix`：用资产清单直接改写前缀，**不让模型猜**
+- `patchRefAudioRetention`：多行块安全追加 `fully_copy`（`h3FieldBlock` 支持多行取值）
+- `protectDialogue`：模型改字、翻译或丢 `<d>` 时**退回原文**重搭结构——台词不可让渡
+
+### 实测结论（qwen2.5:14b，2026-10-20）
+
+同一份指令跑三次，输出结构都在，但**每次错的地方不同**：把 `summary` 写成 `video continuation`、
+`<Subject 1>` 丢尖括号、台词改写成 `"十年了." (Ten years have passed.)`。
+**结论：14B 级模型不能作为唯一保障，必须有上面那套确定性兜底。**
+`qwen3.8:27b` 在当前配置下返回空 `response`（推测思考链吃掉 num_predict），暂不作为默认。
+
+## 5.12 与序策引擎合一（工作站，2026-10-20 实测）
+
+FlowEdge 不再单打：**CORE（序策引擎 :30002）编排/门禁/预算 + COMPUTE（本 exe :8080）媒体/模型/工件 + STATION（:30000）单入口**。
+完整评估与证据见 `序策/03-编排内核/FlowEdge-工作站合一-评估与优化-2026-10-20.md`。
+
+**五条必须守的规则（都是本轮踩过的）**
+
+1. **同一件事只能有一个答案**：能力探测判 `tts.ok=true`（SAPI 兜底），合成路径就必须能回退到 SAPI。
+   实测踩坑：配了 `TTS_BASE_URL` 但服务没起 → 预检放行、节点 `connection refused`。
+   现在回退并标 `backend=sapi-fallback` + 日志（真音频，不是假成功）。
+2. **能力要分项**：`ready.audio = asr && tts` 会把「只有 TTS」的活挡死。要单边就查 `ready.tts` / `ready.asr`。
+3. **媒体节点判定以执行器为准，但控制面执行器优先**：`type=step + executor=tts` 算媒体；
+   `upscale` 两边同名，归控制面。子图类型必须归一（`step+tts`→`tts`），否则计算面报「不支持节点类型」。
+4. **常驻进程从会话里拉必然会出问题**：孤儿引擎的 stdout 指向没人读的管道，写满就阻塞事件循环
+   （实测每 ~8 秒 1.3s 卡顿 → governor 进 emergency → 拒绝一切新任务）。
+   四平面一律 `node scripts/start-flowedge.cjs` 分离拉起，stdout 落文件。
+5. **门禁不许「看起来全绿」**：复合任务可选阶段失败要落 `warnings[]`；governor 的 loop p99 要减掉测量地板
+   （100ms 分辨率空转实测 111.4ms），否则空闲引擎常年 warn、`effectiveMax` 打折。
+
+**一分钟自检**（四平面都在跑时）：
+
+```bash
+curl -s http://127.0.0.1:30000/api/flowedge/health          # 两个平面 ok
+curl -s -X POST http://127.0.0.1:30000/api/flowedge/run \
+  -H 'content-type: application/json; charset=utf-8' \
+  -d '{"graph":"flowedge/27-工作站自检-配音到质检门","input":{"text":"两个平面已经合上。"}}'
+```
+
+期望：`status=success`，产物 `tts-*.wav` + `master-*.wav` + `qa-*.json`（verdict=pass）。
+
+**本机 go 可用**（`%LOCALAPPDATA%\Programs\Go\bin\go.exe`，1.22.10，不在 PATH）：
+改后端后 `python scripts/build-windows.py --skip-ui` → 停旧 compute → 覆盖 `运行\FlowEdge.exe` → `node scripts/start-flowedge.cjs`。
 
 ## 6. 已知不可用（别重复投入）
 

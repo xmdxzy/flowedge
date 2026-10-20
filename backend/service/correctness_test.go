@@ -74,6 +74,32 @@ func TestTTS_FallbackNeverFakesAudio(t *testing.T) {
 	}
 }
 
+// ===== TTS：配了服务但服务没起来时，不得让节点直接失败 =====
+// 能力探测早就算出 tts.ok=true（SAPI 可兜底），节点路径却把 connection refused
+// 原样抛出（2026-10-20 实测：预检通过、节点报错）。两者必须给同一个答案。
+
+func TestTTS_DeadServiceFallsBackToSAPI(t *testing.T) {
+	if !SAPIAvailable() {
+		t.Skip("本机没有可用的 SAPI 语音，跳过兜底断言")
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "fallback.wav")
+
+	// 1) 指向一个已经关闭的端口：模拟「TTS_BASE_URL 配了但服务没启动」
+	s := NewTTSService("http://127.0.0.1:59999")
+	backend, err := s.SynthesizeWith("回退测试", out, TTSOptions{})
+	if err != nil {
+		t.Fatalf("服务不可达时应回退 SAPI，却返回错误：%v", err)
+	}
+	if backend != "sapi-fallback" {
+		t.Fatalf("后端应标记 sapi-fallback（可见的降级），got %s", backend)
+	}
+	st, statErr := os.Stat(out)
+	if statErr != nil || st.Size() < 1000 {
+		t.Fatalf("回退路径必须产出真音频（>1KB），statErr=%v", statErr)
+	}
+}
+
 // ===== 向量库 ID 不得碰撞（旧实现 3380 个取值后会误删）=====
 
 func TestGenerateIDUnique(t *testing.T) {

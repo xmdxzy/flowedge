@@ -178,7 +178,7 @@ def asr_transcribe(wav: str, endpoint: str) -> tuple[bool, str]:
 
 
 def verify(path: str, want_asr: bool, frames_dir: str | None, expect: str = "",
-           no_speech: bool = False) -> dict:
+           no_speech: bool = False, max_silence: float = 0.0) -> dict:
     issues: list[tuple[str, str, str]] = []   # (level, code, message)
     info: dict = {"file": os.path.abspath(path)}
 
@@ -259,9 +259,14 @@ def verify(path: str, want_asr: bool, frames_dir: str | None, expect: str = "",
         for s, e in mid_gaps:
             dur = (e - s) if e else (total - s)
             if dur >= SILENCE_MIN:
+                # 门给了上限就按门判：静音缺口是「声音断一下」的直接特征，
+                # 只报 WARN 等于让它溜过去。
+                hard = max_silence > 0 and dur >= max_silence
                 issues.append((
-                    WARN, "silence_gap",
-                    f"中段静音 {dur:.2f}s @ {s:.2f}s：可能是接缝断音或该镜无环境声",
+                    FAIL if hard else WARN, "silence_gap",
+                    f"中段静音 {dur:.2f}s @ {s:.2f}s"
+                    + (f"（门上限 {max_silence}s）" if hard
+                       else "：可能是接缝断音或该镜无环境声"),
                 ))
 
         # 5) 响度
@@ -334,9 +339,19 @@ def main() -> int:
                     help="氛围模式：检测到人声即判 FAIL（这是本模式的验收线）")
     ap.add_argument("--gate", action="store_true",
                     help="流水线门禁模式：只有 FAIL 才返回 2（WARN 返回 0），便于图里判定")
+    ap.add_argument("--max-silence", type=float, default=0.0,
+                    help="中段静音上限（秒）；超过即 FAIL。0 = 只告警")
+    ap.add_argument("--require-expect", action="store_true",
+                    help="台词模式的防呆：--expect 为空时直接 FAIL。"
+                         "门不能形同虚设——忘了传期望台词，不应静默通过")
     args = ap.parse_args()
 
-    results = [verify(f, args.asr, args.frames, args.expect, args.no_speech) for f in args.files]
+    if args.require_expect and not args.expect.strip():
+        print("[FAIL] expect_missing: 台词模式要求 --expect，未提供则无从核对，按失败处理")
+        return 2
+
+    results = [verify(f, args.asr, args.frames, args.expect, args.no_speech,
+                      args.max_silence) for f in args.files]
 
     worst = OK
     for r in results:

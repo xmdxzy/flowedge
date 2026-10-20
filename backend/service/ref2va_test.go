@@ -14,11 +14,12 @@ func TestEnsureRef2VAPrompt(t *testing.T) {
 
 	for _, want := range []string{
 		"subject_definitions:",
-		"<Picture 1>",
+		"<Subject 1> is the character or subject shown in <Picture 1>",
 		"<Audio 1>",
 		"summary: [reference generation + audio reuse]",
 		"retention_analysis:",
-		"fully_copy - is reused 1:1 as the target video's complete final audio track",
+		"<Subject 1> (appears in [Shot 1]): fully_preserved",
+		"<Audio 1>: fully_copy - <Audio 1> is reused 1:1 as the target video's complete final audio track",
 		"detailed_description:",
 		"A middle-aged man sits at a table",
 	} {
@@ -26,9 +27,14 @@ func TestEnsureRef2VAPrompt(t *testing.T) {
 			t.Fatalf("缺少 %q：\n%s", want, got)
 		}
 	}
-	// 音频 1:1 透传时，整体声景必须 N/A，否则模型会往音轨里加东西
-	if !strings.Contains(got, "overall_soundscape: N/A") {
-		t.Fatalf("fully_copy 下声景应写 N/A：\n%s", got)
+	// 官方 6：fully_copy 时不要用 "N/A" 当垃圾桶，
+	// 环境层属于 overall_soundscape、配乐属于 music，各按可听层说明关系
+	if !strings.Contains(got, "overall_soundscape: The complete final audio track is <Audio 1> copied 1:1") {
+		t.Fatalf("fully_copy 下声景应说明复制的音轨层：\n%s", got)
+	}
+	// 官方 2.2：图片只用来定角色时不得单独建 Picture 条目
+	if strings.Contains(got, "<Picture 1> defines the visual identity") {
+		t.Fatalf("图片身份定义写成了 Picture 条目（官方要求写进 Subject 定义）：\n%s", got)
 	}
 	// 不能再冒出旧的 integrated_ 字段（六段式里它叫 detailed_description）
 	if strings.Contains(got, "integrated_multimodal_description:") {

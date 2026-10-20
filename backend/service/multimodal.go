@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -151,6 +152,10 @@ func (s *Text2ImageService) buildGraphFromTemplate(name, prompt, negative string
 func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (string, error) {
 	if s.BaseURL == "" {
 		return "", fmt.Errorf("comfyui not configured")
+	}
+	// 兼容矩阵预检（见 comfy_compat.go）：不兼容组合构图前显式失败
+	if err := CheckCheckpointCompat(s.Checkpoint); err != nil {
+		return "", err
 	}
 	if width <= 0 {
 		width = 1024
@@ -432,16 +437,30 @@ func (s *TTSService) Synthesize(text string, outputPath string) error {
 	return err
 }
 
-// SynthesizeWith 文字转语音，返回实际使用的后端（service / sapi）
+// SynthesizeWith 文字转语音，返回实际使用的后端（service / sapi / sapi-fallback）
 //
 // 降级顺序：显式配置的 TTS_BASE_URL 服务 → Windows 内置 SAPI。
 // 两条路都不通时显式失败——绝不写出假音频让下游「成功」产出垃圾。
+//
+// 「配了服务但服务没起来」也算第一路失败（2026-10-20 修）：
+// 能力探测早就把这种情况判成 tts.ok=true（SAPI 兜底），但节点路径却直接把
+// connection refused 抛出去——预检说能跑、节点说不能跑，同一件事两个答案。
+// 现在统一：服务不可达/报错 → 用 SAPI 真合成，后端标记 sapi-fallback 并留日志，
+// 既不伪造结果，也不让一个没启动的可选服务废掉本来能干的活。
 func (s *TTSService) SynthesizeWith(text string, outputPath string, opt TTSOptions) (string, error) {
 	if s.BaseURL != "" {
-		if err := s.synthesizeHTTP(text, outputPath, opt); err != nil {
+		if err := s.synthesizeHTTP(text, outputPath, opt); err == nil {
+			return "service", nil
+		} else if SAPIAvailable() {
+			if sapiErr := synthesizeSAPI(text, outputPath, opt.Voice, opt.Rate); sapiErr == nil {
+				log.Printf("[tts] 服务 %s 不可用（%v），已回退 Windows 内置 SAPI（产出的是真音频）", s.BaseURL, err)
+				return "sapi-fallback", nil
+			} else {
+				return "", fmt.Errorf("TTS 服务不可用（%v），内置 SAPI 也失败（%v）", err, sapiErr)
+			}
+		} else {
 			return "", err
 		}
-		return "service", nil
 	}
 	if SAPIAvailable() {
 		if err := synthesizeSAPI(text, outputPath, opt.Voice, opt.Rate); err != nil {

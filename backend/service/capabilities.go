@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -221,17 +223,27 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, comfyH
 	// image / h3 / comfy 三者语义必须分开，否则会重演两种假状态（AGENTS §0.6）：
 	//   ① H3 在 8189 跑着，界面却报「文生图缺失」；
 	//   ② 只有 H3、没有主实例，却把文生图标成可用（H3 不出图）。
+	//
+	// audio / asr / tts 同理必须分开（2026-10-20 修）：
+	// TTS 走 Windows 内置 SAPI 时零服务可用（tts.ok=true），但只要 ASR 没起，
+	// 合并口径 audio=false 就会把「配音」整条链路挡在预检外面——能力明明在，
+	// 报错却说「ASR/TTS 服务未启动」。所以：
+	//   asr/tts = 单边真值（各自能不能干）
+	//   audio   = 整条音频链路（双向都通才为真），保留给「要转写又要合成」的图
 	caps.Ready = map[string]bool{
 		"llm":    caps.Ollama.OK && len(caps.Ollama.Models) > 0,
 		"image":  caps.ComfyUI.OK,                    // 出图/重绘/超分：必须主实例 8188
 		"h3":     caps.ComfyH3.OK,                    // 音视频联合生成：H3 实例 8189
 		"comfy":  caps.ComfyUI.OK || caps.ComfyH3.OK, // 任一实例在跑就算「有 ComfyUI」
 		"audio":  caps.ASR.OK && caps.TTS.OK,
+		"asr":    caps.ASR.OK,
+		"tts":    caps.TTS.OK,
 		"video":  caps.FFmpeg.OK,
 		"vision": caps.Vision.OK,
 	}
 	for name, ok := range caps.Ready {
-		if !ok {
+		// asr/tts 是 audio 的分项诊断，不再重复计进 missing，避免缺项清单噪音
+		if !ok && name != "asr" && name != "tts" {
 			caps.Missing = append(caps.Missing, name)
 		}
 	}
@@ -257,17 +269,40 @@ func PickDefaultModel(ollamaBase string) string {
 	for _, m := range tags.Models {
 		names = append(names, m.Name)
 	}
-	for _, m := range names {
-		if containsFold(m, "coder") {
+
+	// 引擎调用 LLM 的场景是分镜、提示词改写、图片判分、文档解析——全是自然语言创作。
+	// 旧逻辑优先返回 coder 模型，实测自动选到 qwen2.5-coder:32b：写出来的镜头描述
+	// 像工程注释，且 32B 与扩散/语音抢显存。改成优先通用对话模型，coder 放到最后。
+	usable := func(m string) bool {
+		l := strings.ToLower(m)
+		return !strings.Contains(l, "embed") && !strings.Contains(l, "bge") && !strings.Contains(l, "rerank")
+	}
+	pick := func(filter func(string) bool) string {
+		cand := make([]string, 0, len(names))
+		for _, m := range names {
+			if usable(m) && filter(m) {
+				cand = append(cand, m)
+			}
+		}
+		if len(cand) == 0 {
+			return ""
+		}
+		// 同类里按名字排序取第一个：qwen2.5:14b 会排在 qwen3.8:27b 之前。
+		// 14B 在 24G 卡上和扩散/语音共存更从容，实测对提示词指令的遵循也更稳。
+		sort.Strings(cand)
+		return cand[0]
+	}
+	for _, key := range []string{"qwen", "glm", "llama", "mistral", "gemma", "deepseek"} {
+		if m := pick(func(s string) bool {
+			return strings.Contains(strings.ToLower(s), key) && !strings.Contains(strings.ToLower(s), "coder")
+		}); m != "" {
 			return m
 		}
 	}
-	for _, m := range names {
-		if containsFold(m, "qwen") {
-			return m
-		}
+	if m := pick(func(s string) bool { return strings.Contains(strings.ToLower(s), "coder") }); m != "" {
+		return m
 	}
-	return names[0]
+	return pick(func(string) bool { return true })
 }
 
 func httpGetBody(url string) ([]byte, error) {

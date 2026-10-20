@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -101,7 +102,33 @@ func collectCandidates(node *model.NodeInstance, upstream map[string]interface{}
 		}
 	}
 
-	for _, up := range upstream {
+	// upstream 是 map，直接 range 会让候选顺序随 Go 的 map 迭代随机变化——
+	// 同一份图输入两次跑出两种顺序，择优结果不可复现，测试也会间歇性失败。
+	// 排序规则不是纯字典序：**直接产出图的上游（image/images）优先于聚合节点
+	// （values）**，同类内再按 key 排，保证顺序既确定又符合优先级语义。
+	keys := make([]string, 0, len(upstream))
+	for k := range upstream {
+		keys = append(keys, k)
+	}
+	rankOf := func(m map[string]interface{}) int {
+		if _, ok := m["image"]; ok {
+			return 0
+		}
+		if _, ok := m["images"]; ok {
+			return 0
+		}
+		return 1
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		mi, _ := upstream[keys[i]].(map[string]interface{})
+		mj, _ := upstream[keys[j]].(map[string]interface{})
+		if ri, rj := rankOf(mi), rankOf(mj); ri != rj {
+			return ri < rj
+		}
+		return keys[i] < keys[j]
+	})
+	for _, k := range keys {
+		up := upstream[k]
 		m, ok := up.(map[string]interface{})
 		if !ok {
 			continue

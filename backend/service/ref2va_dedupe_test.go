@@ -27,8 +27,11 @@ func TestEnsureRef2VAPromptDedupesSoundFields(t *testing.T) {
 	if strings.Contains(got, "high-altitude wind") {
 		t.Fatalf("source soundscape must be stripped when reusing reference audio:\n%s", got)
 	}
-	if !strings.Contains(got, "overall_soundscape: N/A") {
-		t.Fatalf("audio-reuse mode must force N/A soundscape:\n%s", got)
+	// 官方《全参考模式指南》第 6 节：fully_copy 时不要拿 "N/A" 当垃圾桶，
+	// 而要写明「复制的环境层来自参考音频」。真正会导致重新生成的是
+	// 同一份提示词里出现两个矛盾的 overall_soundscape，不是这行写 N/A 还是写描述。
+	if !strings.Contains(got, "overall_soundscape: The complete final audio track is <Audio 1> copied 1:1") {
+		t.Fatalf("audio-reuse mode must state the copied track layer:\n%s", got)
 	}
 	// 画面描述不能被剥掉
 	if !strings.Contains(got, "[Shot 1] a monk speaks to camera.") || !strings.Contains(got, "At 00:07.500") {
