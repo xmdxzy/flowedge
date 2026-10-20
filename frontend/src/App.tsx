@@ -92,6 +92,7 @@ const nodeTypes: NodeTypes = {
   select: EditNode,
   storyboard: TransformNode,
   shotlist: EditNode,
+  quality_gate: EditNode,
   image2image: EditNode,
   inpaint: EditNode,
   upscale: EditNode,
@@ -2019,6 +2020,72 @@ function FlowEditor() {
               </div>
             )}
 
+            {selectedNode.type === 'quality_gate' && (
+              <div className="flex flex-col gap-3">
+                <p className="text-[10px] text-gray-500 leading-relaxed">
+                  对上游产物跑声明式质检，任一项 fail 级不过即阻断下游。
+                  规则全部可留空（留空 = 不检）；产物取自最近一条上游的图片/音频/视频线。
+                </p>
+                <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.data.require_audio !== false}
+                    onChange={(e) => updateSelectedNodeData('require_audio', e.target.checked)}
+                  />
+                  必须有音轨（防 -map 漏写产出纯视频）
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {([['min_frames', '最少帧数'], ['duration_min', '最短(s)'], ['duration_max', '最长(s)']] as const).map(([k, label]) => (
+                    <div key={k}>
+                      <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                      <input
+                        type="number"
+                        value={Number(selectedNode.data[k] ?? 0)}
+                        onChange={(e) => updateSelectedNodeData(k, Number(e.target.value) || 0)}
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {([['min_width', '最小宽'], ['min_height', '最小高'], ['duration_tolerance', '音画容差(s)']] as const).map(([k, label]) => (
+                    <div key={k}>
+                      <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={Number(selectedNode.data[k] ?? 0)}
+                        onChange={(e) => updateSelectedNodeData(k, Number(e.target.value) || 0)}
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {([['max_silence_gap', '最长静音(s)'], ['loudness_min_db', '响度下限(dB)']] as const).map(([k, label]) => (
+                    <div key={k}>
+                      <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={Number(selectedNode.data[k] ?? 0)}
+                        onChange={(e) => updateSelectedNodeData(k, Number(e.target.value) || 0)}
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <label className="flex items-center gap-2 text-[11px] text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={selectedNode.data.forbid_speech === true}
+                    onChange={(e) => updateSelectedNodeData('forbid_speech', e.target.checked)}
+                  />
+                  氛围模式（疑似有人声即 FAIL，能量法判读）
+                </label>
+              </div>
+            )}
+
             {selectedNode.type === 'shotlist' && (
               <div className="flex flex-col gap-3">
                 <div>
@@ -2117,6 +2184,83 @@ function FlowEditor() {
                 </p>
               </div>
             )}
+
+            {selectedNode.type === 'scene_grid' && (() => {
+              const arr = String(selectedNode.data.cells || '').split('\n')
+              const at = (i: number) => arr[i] ?? ''
+              const setAt = (i: number, v: string) => {
+                const next = Array.from({ length: 9 }, (_, k) => (k === i ? v : (arr[k] ?? '')))
+                updateSelectedNodeData('cells', next.join('\n'))
+              }
+              const labels = ['左上', '上中', '右上', '左中', '中心', '右中', '左下', '下中', '右下']
+              return (
+                <div className="flex flex-col gap-3">
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-1">
+                      场景想法（填了由 LLM 拆九格；只填格位则不花 LLM）
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={(selectedNode.data.idea as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('idea', e.target.value)}
+                      placeholder="例：破败山门内的石殿，唯一光源是左中的铁灯，地面积水"
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">
+                      九宫格（英文；写材质/颜色/形状/位置，不写形容词，用 - 留空）
+                    </label>
+                    <div className="grid grid-cols-3 gap-1">
+                      {labels.map((lb, i) => (
+                        <div key={lb} className="relative">
+                          <span className="absolute left-1 top-0.5 text-[9px] text-gray-600 pointer-events-none">{lb}</span>
+                          <textarea
+                            rows={2}
+                            value={at(i)}
+                            onChange={(e) => setAt(i, e.target.value)}
+                            className="w-full pt-3 px-1 pb-1 rounded bg-canvas border border-border text-[10px] leading-snug resize-none"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-[10px] text-gray-500 block mb-1">光位（方向+色温+硬度）</label>
+                      <input
+                        value={(selectedNode.data.light as string) || ''}
+                        onChange={(e) => updateSelectedNodeData('light', e.target.value)}
+                        placeholder="a lone lantern at middle-left, 2700K, hard"
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-[10px]"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-gray-500 block mb-1">主色关系</label>
+                      <input
+                        value={(selectedNode.data.palette as string) || ''}
+                        onChange={(e) => updateSelectedNodeData('palette', e.target.value)}
+                        placeholder="cold grey stone, rust-red cloth"
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-[10px]"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">机位（高度 + 焦段，可选）</label>
+                    <input
+                      value={(selectedNode.data.depth as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('depth', e.target.value)}
+                      placeholder="eye level, 35mm equivalent"
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-[10px]"
+                    />
+                  </div>
+                  <p className="text-[10px] text-gray-500 leading-relaxed">
+                    九格编译成一句 SCENE LOCK，逐字注入每段提示词 —— 场景一致靠的是同一批事实出现在同一空间位置，
+                    不是形容词更多。下游文生视频分段（segments&gt;1）会逐段重注并校验字节全等，漂移直接进 prompt_warnings。
+                  </p>
+                </div>
+              )
+            })()}
 
             {(selectedNode.type === 'image2image' || selectedNode.type === 'inpaint' || selectedNode.type === 'upscale' || selectedNode.type === 'text2video') && (
               <div className="flex flex-col gap-3">
@@ -2229,6 +2373,23 @@ function FlowEditor() {
                       走本地 LLM 约 10 秒；失败自动回退原文
                     </span>
                   </label>
+                )}
+                {selectedNode.type === 'text2video' && selectedNode.data.backend === 'h3' && (
+                  <div>
+                    <label className="text-[11px] text-gray-400 block mb-1">
+                      场景九宫格锁（可留空；也可从上游「场景九宫格」节点连入）
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={(selectedNode.data.scene_grid as string) || ''}
+                      onChange={(e) => updateSelectedNodeData('scene_grid', e.target.value)}
+                      placeholder="九行「左上|...」；或直接粘贴已编译的 SCENE LOCK 句"
+                      className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] resize-y"
+                    />
+                    <p className="text-[10px] text-gray-500 mt-1 leading-relaxed">
+                      分段生成时同一句锁会被逐字重注到每一段；锁句不一致或缺失会写进 prompt_warnings。
+                    </p>
+                  </div>
                 )}
                 {selectedNode.type === 'text2video' && selectedNode.data.backend === 'h3' && (
                   <div className="flex flex-col gap-2">
@@ -2585,6 +2746,8 @@ function getDefaultNodeData(type: string): Record<string, any> {
       return { prompt: '描述这张图片的主体、构图、风格；如果有文字请原样抄下来。', model: '', image_path: '' }
     case 'prompt_opt':
       return { mode: 'h3', text: '', seconds: 5 }
+    case 'scene_grid':
+      return { cells: '', idea: '', style: '', light: '', palette: '', depth: '' }
     case 'storyboard':
       return { brief: '', seconds: 30, max_shots: 6 }
     case 'shotlist':
@@ -2599,9 +2762,18 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'upscale':
       return { prompt: '', image_path: '', model: 'RealESRGAN_x4plus.pth' }
     case 'text2video':
-      return { prompt: '', backend: 'wan', width: 832, height: 480, frames: 33, fps: 16, steps: 20, negative: '', low_vram: false, segments: 1, interp: false, prompt_opt: true, turbo: true, ref_audio: '', ref_images: '', audio_track: '' }
+      return { prompt: '', backend: 'wan', width: 832, height: 480, frames: 33, fps: 16, steps: 20, negative: '', low_vram: false, segments: 1, interp: false, prompt_opt: true, turbo: true, ref_audio: '', ref_images: '', audio_track: '', scene_grid: '' }
     case 'select':
       return { images: '', reference: '', criteria: '', threshold: 60, model: '' }
+    case 'quality_gate':
+      return {
+        require_audio: true,
+        min_frames: 0, duration_min: 0, duration_max: 0,
+        duration_tolerance: 0.15,
+        min_width: 0, min_height: 0,
+        loudness_min_db: 0, max_silence_gap: 0,
+        forbid_speech: false, speech_max_seconds: 1.5,
+      }
     case 'note':
       return { text: '' }
     case 'group':

@@ -286,6 +286,9 @@ func main() {
 	}
 	wfHandler := handler.NewWorkflowHandler(db, engine, jobQueue)
 	wfHandler.SetLineage(lineageStore)
+	// 运行前依赖预检：Ollama/ASR/TTS/视觉模型没就绪时在入口显式失败，
+	// 而不是让节点跑进去报一句连接错误（ComfyUI 两实例由 ensureComfy 自动拉起，不拦）
+	wfHandler.SetPreflight(depSupervisor, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
 	triggerHandler := handler.NewTriggerHandler(db, wfHandler)
 	debugHandler := handler.NewDebugHandler(db, engine, lineageStore)
 

@@ -149,6 +149,7 @@ type mediaCheck struct {
 	EffFPS   float64  `json:"effective_fps"`
 	VSeconds float64  `json:"video_seconds"`
 	ASeconds float64  `json:"audio_seconds"`
+	HasAudio bool     `json:"has_audio"` // 显式化：原来只在 Note 里隐性携带（quality_gate 节点要消费）
 	Size     string   `json:"size,omitempty"`
 	Issues   []string `json:"issues,omitempty"`
 	Note     string   `json:"note,omitempty"`
@@ -276,6 +277,7 @@ func inspectMedia(path string) (mediaCheck, error) {
 			fmt.Sscanf(s.NbReadFrames, "%d", &chk.Frames)
 		case "audio":
 			haveAudio = true
+			chk.HasAudio = true
 			adur = atof(s.Duration)
 			chk.ASeconds = math.Round(adur*1000) / 1000
 		}

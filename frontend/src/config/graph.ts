@@ -38,6 +38,7 @@ export const PALETTE: PaletteSection[] = [
     label: '视频',
     items: [
       { type: 'text2video', label: '文生视频', icon: '▷', tone: 'tone-purple' },
+      { type: 'scene_grid', label: '场景九宫格', icon: '▦', tone: 'tone-ai' },
       { type: 'storyboard', label: '分镜规划', icon: '⊞', tone: 'tone-ai' },
       { type: 'shotlist', label: '分镜执行', icon: '⊙', tone: 'tone-purple' },
       { type: 'video_compose', label: '视频合成', icon: '▤', tone: 'tone-purple' },
@@ -68,6 +69,7 @@ export const PALETTE: PaletteSection[] = [
       { type: 'code', label: '代码执行', icon: '{ }', tone: 'tone-data' },
       { type: 'data_transform', label: '数据转换', icon: '⇋', tone: 'tone-muted' },
       { type: 'aggregate', label: '变量聚合', icon: '⋃', tone: 'tone-muted' },
+      { type: 'quality_gate', label: '质检门', icon: '✓', tone: 'tone-warn' },
     ],
   },
   {
@@ -93,13 +95,15 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   aggregate: ['text', 'count', 'values', 'nodes', 'aggregate'],
   vision: ['text', 'model', 'images', 'tokens', 'reference'],
   select: ['image', 'score', 'passed', 'threshold', 'picked', 'candidates', 'note'],
-  prompt_opt: ['text', 'original', 'mode'],
+  prompt_opt: ['text', 'original', 'mode', 'scene_lock'],
+  scene_grid: ['text', 'lock', 'grid', 'cells', 'cells_text', 'source'],
   storyboard: ['text', 'plan', 'shots', 'title', 'style'],
   shotlist: ['video', 'kind', 'text', 'shots', 'seconds', 'detail'],
   image2image: ['image', 'kind', 'source', 'strength'],
   inpaint: ['image', 'kind', 'source', 'mask'],
   upscale: ['image', 'kind', 'source', 'width', 'height'],
   text2video: ['video', 'kind', 'text', 'original_prompt', 'beats', 'parts', 'segments', 'audio_muxed', 'audio_track', 'audio_error'],
+  quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
 }
 
 // 节点 → 依赖的环境能力（缺了就标灰；用户仍可先编排，环境补齐后直接跑）
@@ -113,6 +117,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   llm: 'llm',
   storyboard: 'llm', // 分镜规划：纯 LLM
   prompt_opt: 'llm', // 提示词优化：纯 LLM
+  scene_grid: 'llm', // 场景九宫格：手填不花 LLM，从想法拆格才要
   rag_query: 'llm', // 检索需要 Ollama 做 embedding
   text2image: 'image',
   image2image: 'image',
@@ -125,6 +130,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   select: 'vision', // 择优要靠 VLM 打分
   text2video: 'comfy',
   shotlist: 'comfy', // 分镜执行：H3 或 Wan 任一实例
+  quality_gate: 'video', // 质检需要 ffmpeg/ffprobe
 }
 
 // 能力键 → 人话（标灰时的提示文案，避免把 'image' / 'comfy' 这种键名直接甩给用户）

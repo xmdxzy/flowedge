@@ -61,13 +61,23 @@ func (q *JobQueue) Enqueue(job model.Job, fn func()) {
 
 // RecoverInterrupted 启动时把上次进程留下的 running 任务标记为 interrupted。
 // 这类任务的结果不可信（可能只跑了一半），用户需显式续跑。
+//
+// 2026-10-20 修复：原来只回收 jobs 表，漏了 workflow_runs 表——
+// 进程被杀后 run 永远卡在 running（现存 3 条 10-19/10-20 的僵尸记录），
+// 执行面板里既不能续跑也不能重跑，只能脏在列表里。两张表必须一起收。
 func (q *JobQueue) RecoverInterrupted() int64 {
+	var total int64
 	res := q.db.Model(&model.Job{}).Where("status = ?", "running").
 		Updates(map[string]interface{}{"status": "interrupted", "error": "进程异常退出，任务被中断"})
-	if res.Error != nil {
-		return 0
+	if res.Error == nil {
+		total += res.RowsAffected
 	}
-	return res.RowsAffected
+	res2 := q.db.Model(&model.WorkflowRun{}).Where("status = ?", "running").
+		Updates(map[string]interface{}{"status": "failed", "error": "进程异常退出，运行被中断（启动时回收）；可在执行记录里续跑"})
+	if res2.Error == nil {
+		total += res2.RowsAffected
+	}
+	return total
 }
 
 // Wait 优雅退出：等待已受理任务结束

@@ -21,7 +21,7 @@ func newTestQueue(t *testing.T) (*JobQueue, *gorm.DB) {
 	if err != nil {
 		t.Fatalf("open sqlite failed: %v", err)
 	}
-	if err := db.AutoMigrate(&model.Job{}); err != nil {
+	if err := db.AutoMigrate(&model.Job{}, &model.WorkflowRun{}); err != nil {
 		t.Fatalf("migrate failed: %v", err)
 	}
 	t.Cleanup(func() {
@@ -113,6 +113,35 @@ func TestJobQueue_RecoverInterrupted(t *testing.T) {
 	db.Where("run_id = ?", 1).First(&job)
 	if job.Status != "interrupted" || job.Error == "" {
 		t.Fatalf("interrupted job must carry a reason, got status=%q err=%q", job.Status, job.Error)
+	}
+}
+
+// TestJobQueue_RecoverInterrupted_ReconcilesRuns 2026-10-20 回归：
+// 原来只回收 jobs 表，workflow_runs 的 running 永远卡死（现存 3 条僵尸记录），
+// 执行面板里不能续跑也不能重跑。两张表必须一起收。
+func TestJobQueue_RecoverInterrupted_ReconcilesRuns(t *testing.T) {
+	q, db := newTestQueue(t)
+
+	now := time.Now()
+	db.Create(&model.WorkflowRun{WorkflowID: 1, Status: "running", StartedAt: &now})
+	db.Create(&model.WorkflowRun{WorkflowID: 1, Status: "running", StartedAt: &now})
+	db.Create(&model.WorkflowRun{WorkflowID: 2, Status: "success", StartedAt: &now})
+
+	n := q.RecoverInterrupted()
+	if n != 2 {
+		t.Fatalf("expected 2 recovered runs, got %d", n)
+	}
+
+	var stuck []model.WorkflowRun
+	db.Where("status = ?", "running").Find(&stuck)
+	if len(stuck) != 0 {
+		t.Fatalf("no runs should remain running, got %d", len(stuck))
+	}
+
+	var run model.WorkflowRun
+	db.Where("workflow_id = ? AND status = ?", 1, "failed").First(&run)
+	if run.Error == "" {
+		t.Fatal("recovered run must carry a reason")
 	}
 }
 

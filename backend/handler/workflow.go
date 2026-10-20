@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +20,13 @@ type WorkflowHandler struct {
 	engine  *service.EngineV2
 	queue   *service.JobQueue      // nil 时退化为直接 goroutine 起跑（保持向后兼容）
 	lineage *service.LineageStore  // nil 时跳过血缘记录
+	// 预检依赖（SetPreflight 注入；nil 时跳过运行前依赖预检）
+	sup               *service.Supervisor
+	ollamaBase        string
+	comfyBase         string
+	comfyH3Base       string
+	asrBase           string
+	ttsBase           string
 }
 
 func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue) *WorkflowHandler {
@@ -28,6 +36,41 @@ func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.Jo
 // SetLineage 注入血缘仓库（运行结束后记录产物来源）
 func (h *WorkflowHandler) SetLineage(l *service.LineageStore) {
 	h.lineage = l
+}
+
+// SetPreflight 注入运行前依赖预检所需的探测器与端点。
+// 预检意义：服务没起时任务在入口处显式失败并说明「缺什么、怎么起」，
+// 而不是让节点跑进去再报一句连接错误（2026-10-20 执行记录审计：
+// 17 次 failed 里 5 次是这类，用户看到的是「工作流失败」而非「TTS 没起」）。
+func (h *WorkflowHandler) SetPreflight(sup *service.Supervisor, ollamaBase, comfyBase, comfyH3Base, asrBase, ttsBase string) {
+	h.sup = sup
+	h.ollamaBase = ollamaBase
+	h.comfyBase = comfyBase
+	h.comfyH3Base = comfyH3Base
+	h.asrBase = asrBase
+	h.ttsBase = ttsBase
+}
+
+// preflight 现场探测依赖并核对节点需求。sup 未注入时直接放行（向后兼容）。
+func (h *WorkflowHandler) preflight(nodesJSON, edgesJSON []byte) []service.DepRequirement {
+	if h.sup == nil {
+		return nil
+	}
+	nodes, err := service.ParseNodeInstances(nodesJSON)
+	if err != nil {
+		return nil // 解析失败交给执行层报，预检不重复拦
+	}
+	caps := service.ProbeCapabilities(nil, "", h.ollamaBase, h.comfyBase, h.comfyH3Base, h.asrBase, h.ttsBase)
+	return service.PreflightDeps(nodes, caps, h.sup)
+}
+
+// preflightErrorText 把缺失清单压成一行错误文本（run 记录的 error 字段用）
+func preflightErrorText(missing []service.DepRequirement) string {
+	parts := make([]string, 0, len(missing))
+	for _, m := range missing {
+		parts = append(parts, fmt.Sprintf("%s（节点 %s）", m.Label, m.NodeID))
+	}
+	return "依赖服务未就绪，工作流未开始执行：" + strings.Join(parts, "、")
 }
 
 // List 获取所有工作流
@@ -72,6 +115,30 @@ func validateGraph(nodes, edges json.RawMessage) (int, gin.H) {
 	return 0, nil
 }
 
+// validateNodeParams 保存期节点参数校验：缺 prompt / 缺输入图这类
+// 「静态可判定的必然失败」不许存进库（2026-10-20 审计：text2image
+// 无 prompt、upscale 缺输入图都能保存并运行，然后必然炸）。
+func validateNodeParams(nodes, edges json.RawMessage) (int, gin.H) {
+	ns, err := service.ParseNodeInstances(nodes)
+	if err != nil {
+		return http.StatusBadRequest, gin.H{"error": err.Error()}
+	}
+	var es []model.EdgeInstance
+	if len(edges) > 0 {
+		if err := json.Unmarshal(edges, &es); err != nil {
+			return http.StatusBadRequest, gin.H{"error": "parse edges failed: " + err.Error()}
+		}
+	}
+	if issues := service.ValidateNodeParams(ns, service.InboundSet(es)); len(issues) > 0 {
+		return http.StatusBadRequest, gin.H{
+			"error":  issues[0].Message,
+			"code":   "node_param_missing",
+			"issues": issues,
+		}
+	}
+	return 0, nil
+}
+
 // Create 创建工作流
 func (h *WorkflowHandler) Create(c *gin.Context) {
 	var wf model.Workflow
@@ -80,6 +147,10 @@ func (h *WorkflowHandler) Create(c *gin.Context) {
 		return
 	}
 	if code, body := validateGraph(wf.Nodes, wf.Edges); code != 0 {
+		c.JSON(code, body)
+		return
+	}
+	if code, body := validateNodeParams(wf.Nodes, wf.Edges); code != 0 {
 		c.JSON(code, body)
 		return
 	}
@@ -127,6 +198,10 @@ func (h *WorkflowHandler) Update(c *gin.Context) {
 			c.JSON(code, body)
 			return
 		}
+		if code, body := validateNodeParams(updates.Nodes, updates.Edges); code != 0 {
+			c.JSON(code, body)
+			return
+		}
 		fields["nodes"] = updates.Nodes
 		fields["edges"] = updates.Edges
 	}
@@ -153,6 +228,21 @@ func (h *WorkflowHandler) Delete(c *gin.Context) {
 func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model.WorkflowRun {
 	nodesJSON := []byte(wf.Nodes)
 	edgesJSON := []byte(wf.Edges)
+
+	// 运行前依赖预检：服务没起时创建一条 failed 记录留痕，不进入执行。
+	// （手动入口 Run 直接 503 返回；cron/trigger 走这里，留痕才能追溯）
+	if missing := h.preflight(nodesJSON, edgesJSON); len(missing) > 0 {
+		now := time.Now()
+		run := model.WorkflowRun{
+			WorkflowID: wf.ID,
+			Status:     "failed",
+			Error:      preflightErrorText(missing),
+			StartedAt:  &now,
+			EndedAt:    &now,
+		}
+		h.db.Create(&run)
+		return &run
+	}
 
 	now := time.Now()
 	run := model.WorkflowRun{
@@ -280,6 +370,16 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 	var wf model.Workflow
 	if err := h.db.First(&wf, c.Param("id")).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
+		return
+	}
+	// 手动入口：预检不过直接 503 + 缺失清单（缺什么、怎么起），不创建 run 记录
+	if missing := h.preflight([]byte(wf.Nodes), []byte(wf.Edges)); len(missing) > 0 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "依赖服务未就绪，工作流未开始执行",
+			"code":    "preflight_failed",
+			"missing": missing,
+			"hint":    "在「环境」面板启动缺失的服务后重试；服务刚启动的话稍等几秒再点",
+		})
 		return
 	}
 	run := h.StartRun(&wf)
