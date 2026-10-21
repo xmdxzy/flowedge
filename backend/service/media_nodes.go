@@ -430,7 +430,8 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 			// 降的是共享的 req，所以后续所有段都用同一档参数。
 			if perr != nil && IsOOMError(perr) && len(parts) == 0 && segDegrade < maxOOMDegrade {
 				e.releaseDiffusionAndWait() // CUDA 异步释放，不等就白降
-				if next, changed := degradeMediaRequest(req); changed {
+				segLadder := e.t2i.Bundles.Ladder(roleForKind(req.Kind))
+				if next, changed := degradeMediaRequest(req, segLadder); changed {
 					segNote = degradeNote(req, next)
 					req = next
 					segDegrade++

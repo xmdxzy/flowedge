@@ -63,6 +63,14 @@ export const PALETTE: PaletteSection[] = [
     ],
   },
   {
+    label: 'ComfyUI 生态',
+    items: [
+      // 导入任意 ComfyUI「导出 (API)」工作流直接执行。
+      // 这是把社区几万个 workflow JSON 接进来的入口——不用等我们写节点。
+      { type: 'comfy_workflow', label: 'ComfyUI 工作流', icon: '⌘', tone: 'tone-purple' },
+    ],
+  },
+  {
     label: '数据处理',
     items: [
       { type: 'http_request', label: 'HTTP 请求', icon: '⇄', tone: 'tone-data' },
@@ -111,6 +119,7 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
     'degraded', 'degrade_level', 'degrade_note', // P3 显存降级留痕
   ],
   quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
+  comfy_workflow: ['files', 'count', 'image', 'images', 'video', 'videos', 'bindings_used'],
 }
 
 // 节点 → 依赖的环境能力（缺了就标灰；用户仍可先编排，环境补齐后直接跑）

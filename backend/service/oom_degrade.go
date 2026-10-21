@@ -16,9 +16,59 @@ import (
 //   - 降级必须留痕：返回降了几档、降成了什么，节点输出里带 degraded 字段
 //   - 降到底还失败就如实报原始错误，不伪装成成功
 
-// maxOOMDegrade 最多降两档。再低（352×208·9帧）已经没有交付价值，
+// maxOOMDegrade 最多降三档（精度 / 分辨率 / 帧数或步数 各一档）。
+// 再低（352×208·9帧）已经没有交付价值，
 // 继续降只会把「出不了片」伪装成「出了个不能用的片」。
-const maxOOMDegrade = 2
+const maxOOMDegrade = 3
+
+// roleForKind 媒体类型 → bundle 角色（精度阶梯按角色取）
+func roleForKind(kind string) string {
+	switch kind {
+	case "h3", "h3_i2v":
+		return RoleVideoH3Fl2va
+	case "h3_r2v":
+		return RoleVideoH3Ref2va
+	case "t2v":
+		return RoleVideoWan
+	case "upscale":
+		return RoleUpscale
+	case "inpaint":
+		return RoleInpaint
+	case "img2img":
+		return RoleImg2Img
+	}
+	return RoleT2IPrimary
+}
+
+// nextPrecision 精度降一档（换更省显存的权重文件）。
+//
+// 为什么排在最前面：换精度只损失细节保真，**不改变构图与时长**；
+// 降分辨率会改构图，减帧数会改时长——用户对后两者的容忍度明显更低。
+//
+// 阶梯为空或长度 1 时直接跳过：本机权重多为 fp8/int8，没有更低档可换。
+// 当前权重不在阶梯里（用户自己指定了别的文件）也不动——猜错的降级
+// 会悄悄换成另一个模型，比 OOM 更难排查。
+func nextPrecision(req MediaRequest, ladder []string) (MediaRequest, bool) {
+	if len(ladder) < 2 {
+		return req, false
+	}
+	cur := req.Precision
+	if cur == "" {
+		cur = ladder[0]
+	}
+	for i, name := range ladder {
+		if name != cur {
+			continue
+		}
+		if i+1 < len(ladder) {
+			out := req
+			out.Precision = ladder[i+1]
+			return out, true
+		}
+		return req, false
+	}
+	return req, false
+}
 
 // oomMarkers ComfyUI / PyTorch 抛 OOM 时的实际文本特征。
 // 全部小写匹配；只收明确指向显存耗尽的说法，避免误伤普通报错。
@@ -47,9 +97,13 @@ func IsOOMError(err error) bool {
 	return false
 }
 
-// degradeMediaRequest 降一档：分辨率 ×0.75（对齐 8，VAE 要求）→ 帧数 ×0.7 → 步数 ×0.6。
+// degradeMediaRequest 降一档：精度 → 分辨率 ×0.75（对齐 8，VAE 要求）→ 帧数 ×0.7 → 步数 ×0.6。
 // 返回是否真的降了——降不动时必须让调用方报原始错误，不能空转重试。
-func degradeMediaRequest(req MediaRequest) (MediaRequest, bool) {
+func degradeMediaRequest(req MediaRequest, ladder []string) (MediaRequest, bool) {
+	// 1) 精度：最无损的一档，先试
+	if next, ok := nextPrecision(req, ladder); ok {
+		return next, true
+	}
 	out := req
 	// 分辨率优先：显存占用与像素数近似线性，且对观感影响最小
 	if out.Width > 256 || out.Height > 256 {
@@ -94,6 +148,9 @@ func align8(n int) int {
 // degradeNote 生成人话降级说明，写进节点输出供用户判断是否接受这一版
 func degradeNote(before, after MediaRequest) string {
 	parts := []string{}
+	if after.Precision != before.Precision && after.Precision != "" {
+		parts = append(parts, fmt.Sprintf("精度档 → %s", after.Precision))
+	}
 	if after.Width != before.Width || after.Height != before.Height {
 		parts = append(parts, fmt.Sprintf("分辨率 %d×%d → %d×%d", before.Width, before.Height, after.Width, after.Height))
 	}
@@ -115,6 +172,11 @@ func (e *EngineV2) generateMediaWithDegrade(req MediaRequest) (string, string, i
 	note := ""
 	cur := req
 	lastErr := error(nil)
+	// 精度阶梯按角色取（t2i 主模型 / H3 / Wan 各自的降级链）
+	var ladder []string
+	if e.t2i != nil {
+		ladder = e.t2i.Bundles.Ladder(roleForKind(req.Kind))
+	}
 	for attempt := 0; attempt <= maxOOMDegrade; attempt++ {
 		path, kind, err := e.t2i.GenerateMedia(cur)
 		if err == nil {
@@ -126,7 +188,7 @@ func (e *EngineV2) generateMediaWithDegrade(req MediaRequest) (string, string, i
 		}
 		// CUDA 显存释放是异步的：不等就「卸载了但没释放」，紧接着重试必然再 OOM
 		e.releaseDiffusionAndWait()
-		next, changed := degradeMediaRequest(cur)
+		next, changed := degradeMediaRequest(cur, ladder)
 		if !changed {
 			break // 降不动了，如实报原始错误
 		}

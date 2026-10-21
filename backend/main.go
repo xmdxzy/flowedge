@@ -23,6 +23,7 @@ import (
 
 	"flowedge/backend/config"
 	"flowedge/backend/handler"
+	"flowedge/backend/mcp"
 	"flowedge/backend/model"
 	"flowedge/backend/service"
 	"flowedge/backend/web"
@@ -45,6 +46,21 @@ func main() {
 	// 子命令：把内嵌的语音服务脚本导出到 exe 旁的 local-services/
 	if len(os.Args) > 1 && (os.Args[1] == "--export-services" || os.Args[1] == "-export-services") {
 		exportServices(baseDir)
+		return
+	}
+
+	// 子命令：MCP server（stdio）。给 Claude Desktop / Cursor 这类客户端接工作流用。
+	//
+	// 刻意做成"瘦客户端转发"而不是在 stdio 进程里再起一套引擎：
+	// 两个引擎会抢同一张卡的显存和同一个 sqlite 文件。
+	// 代价是引擎必须先起来——所以每个工具在不可达时返回能照做的错误。
+	if len(os.Args) > 1 && (os.Args[1] == "--mcp" || os.Args[1] == "-mcp") {
+		srv := mcp.NewServer(
+			getEnv("FLOWEDGE_MCP_BASE_URL", "http://127.0.0.1:"+getEnv("PORT", "8080")),
+			os.Getenv("FLOWEDGE_API_TOKEN"), os.Stdin, os.Stdout)
+		if err := srv.Serve(); err != nil {
+			log.Printf("MCP server 退出：%v", err)
+		}
 		return
 	}
 
@@ -106,7 +122,29 @@ func main() {
 		ttsURL = "http://127.0.0.1:8102"
 	}
 
-	t2iService := service.NewText2ImageService(comfyURL, getEnv("COMFYUI_CHECKPOINT", "flux1-schnell-fp8.safetensors"))
+	// 模型 bundle：逻辑角色 → 权重文件 + 默认参数，落 data/models.json。
+	// 首次运行自动写一份默认配置出来——用户需要看到「原来模型名在这里改」。
+	bundleStore := service.LoadBundleStore(filepath.Join(baseDir, "data", "models.json"))
+	if err := bundleStore.LoadErr(); err != nil {
+		log.Printf("Warning: %v（继续使用内置默认模型配置）", err)
+	}
+	// 优先级：显式 COMFYUI_CHECKPOINT > models.json 里配置的 ckpt > 内置默认
+	ckpt := getEnv("COMFYUI_CHECKPOINT", "")
+	if ckpt == "" {
+		ckpt = bundleStore.ConfiguredFile(service.RoleT2IPrimary, "ckpt")
+	}
+	if ckpt == "" {
+		ckpt = service.DefaultCheckpoint
+	}
+	t2iService := service.NewText2ImageService(comfyURL, ckpt)
+	t2iService.Bundles = bundleStore
+	// 多实例路由：模型 → 实例（H3 的 torch 2.14 独立工作树 vs 主实例 torch 2.6）。
+	// 首次运行落一份默认配置，等价于原来的「h3 走 8189、其余走 8188」。
+	instRegistry := service.LoadInstanceRegistry(filepath.Join(baseDir, "data", "instances.json"), h3URL)
+	if note := instRegistry.LoadNote(); note != "" {
+		log.Printf("Warning: %v", note)
+	}
+	t2iService.Instances = instRegistry
 	// 可选：指定 data/comfy_workflows/<name>.json 作为自定义工作流模板
 	t2iService.Template = getEnv("COMFYUI_TEMPLATE", "")
 	asrService := service.NewASRService(asrURL)
@@ -126,6 +164,10 @@ func main() {
 
 	// 引擎
 	engine := service.NewEngineV2(llmService, t2iService, asrService, ttsService, videoService, httpService, ragService, gpuSched, wsHub)
+
+	// 显存档案：每次重节点执行后累积实测峰值，供提交前预测（data/vram_profiles.json）
+	profileStore := service.LoadProfileStore(filepath.Join(baseDir, "data", "vram_profiles.json"), 24576)
+	engine.SetProfiles(profileStore)
 
 	// 凭据仓库：AES-256-GCM 加密落 data/credentials.json，HTTP 节点按名称引用
 	credStore, credErr := service.NewCredentialStore("data")
@@ -170,19 +212,48 @@ func main() {
 	// 接入后新增节点类型确实可以不改引擎分发逻辑。
 	pluginRegistry := service.NewPluginRegistry()
 	service.RegisterBuiltinPlugins(pluginRegistry)
+
+	// 运行期插件：data/plugins/<name>/plugin.json（script 或 http 型）。
+	// 这是「不重编译 exe 就能加节点」的入口——社区不必为 20 行节点装 Go 工具链。
+	// 加载失败只记日志：一个手写坏的插件不该让引擎起不来。
+	if runtimePlugins, pluginErrs := service.LoadRuntimePlugins("data/plugins"); len(runtimePlugins) > 0 || len(pluginErrs) > 0 {
+		for _, perr := range pluginErrs {
+			log.Printf("Warning: 运行期插件加载失败 %s", perr)
+		}
+		for _, rp := range runtimePlugins {
+			if err := pluginRegistry.Register(rp); err != nil {
+				log.Printf("Warning: 运行期插件注册失败 %s：%v", rp.Type(), err)
+				continue
+			}
+			log.Printf("已加载运行期插件：%s（%s）", rp.Type(), rp.Name())
+		}
+	}
+
 	pluginCount := 0
 	for _, plugin := range pluginRegistry.All() {
 		p := plugin // 闭包捕获
-		engine.RegisterNodeType(p.Type(), func(_ context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-			out, err := p.Execute(upstream, node.Data)
-			if err != nil {
-				return nil, err
+		register := func(side string) {
+			exec := func(_ context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+				out, err := p.Execute(upstream, node.Data)
+				if err != nil {
+					return nil, err
+				}
+				if out == nil {
+					return map[string]interface{}{}, nil
+				}
+				return out, nil
 			}
-			if out == nil {
-				return map[string]interface{}{}, nil
+			if side != "" {
+				engine.RegisterNodeTypeWithSide(p.Type(), side, exec)
+			} else {
+				engine.RegisterNodeType(p.Type(), exec)
 			}
-			return out, nil
-		})
+		}
+		side := ""
+		if rp, ok := plugin.(*service.RuntimePlugin); ok {
+			side = rp.Side()
+		}
+		register(side)
 		pluginCount++
 	}
 	if pluginCount > 0 {
@@ -195,8 +266,8 @@ func main() {
 	// 事件日志：广播与落库并行（node_token 不入库，避免写放大）
 	if eventLogger != nil {
 		engine.SetEventLog(eventLogger)
-	// 镜头级作业：每镜落盘，失败重跑时复用已完成镜头（见 model.ShotJob）
-	engine.SetShotJobs(service.NewShotJobStore(db))
+		// 镜头级作业：每镜落盘，失败重跑时复用已完成镜头（见 model.ShotJob）
+		engine.SetShotJobs(service.NewShotJobStore(db))
 	}
 
 	// GPU 真实遥测轮询（缓存 nvidia-smi 结果，避免每请求拉子进程）
@@ -326,6 +397,10 @@ func main() {
 		api.POST("/runs/:runId/step", debugHandler.Step)
 		api.POST("/runs/:runId/continue", debugHandler.Continue)
 
+		// 镜头级作业：按镜查看 / 只重拍某一镜（不修改用户保存的工作流）
+		api.GET("/runs/:runId/shots", wfHandler.ListShots)
+		api.POST("/runs/:runId/shots/:index/reroll", wfHandler.RerollShot)
+
 		// 运行维度：全局列表（分页/状态过滤）、事件回放、trace 与 token 统计
 		runHandler := handler.NewRunHandler(db, eventLogger)
 		api.GET("/runs", runHandler.ListAll)
@@ -399,8 +474,99 @@ func main() {
 				"ollama_models": ollamaModels,
 				"vision_model":  service.PickVisionModel(cfg.OllamaBaseURL),
 				"models_dir":    modelsRoot,
-				"resident_side":  engine.ResidentSide(),
+				"resident_side": engine.ResidentSide(),
+				"llm_backend":   llmService.BackendLabel(),
+				"bundles_path":  bundleStore.Path(),
 			})
+		})
+
+		// 模型 bundle：逻辑角色 → 权重文件 + 参数。
+		// 只读视图（GET）与就地修改（PUT）分开，改完必须重新预检 object_info。
+		api.GET("/models/bundles", func(c *gin.Context) {
+			roles := bundleStore.Roles()
+			out := make(map[string]interface{}, len(roles))
+			for _, r := range roles {
+				out[r] = bundleStore.Resolve(r)
+			}
+			resp := gin.H{"path": bundleStore.Path(), "roles": out}
+			if err := bundleStore.LoadErr(); err != nil {
+				resp["load_error"] = err.Error()
+			}
+			c.JSON(http.StatusOK, resp)
+		})
+		api.PUT("/models/bundles", func(c *gin.Context) {
+			var req struct {
+				Role   string             `json:"role"`
+				Files  map[string]string  `json:"files"`
+				Params map[string]float64 `json:"params"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "请求体不是合法 JSON：" + err.Error()})
+				return
+			}
+			if strings.TrimSpace(req.Role) == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 role（如 video.h3.fl2va）"})
+				return
+			}
+			if len(req.Files) == 0 && len(req.Params) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "files 与 params 至少给一个"})
+				return
+			}
+			bundleStore.Merge(req.Role, req.Files, req.Params)
+			if err := bundleStore.Save(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "保存模型配置失败：" + err.Error()})
+				return
+			}
+			// 权重可能换了，旧 object_info 缓存立刻作废
+			service.InvalidateObjectInfoCache()
+			c.JSON(http.StatusOK, gin.H{"ok": true, "role": req.Role, "resolved": bundleStore.Resolve(req.Role)})
+		})
+		api.POST("/models/bundles/reload", func(c *gin.Context) {
+			err := bundleStore.Reload()
+			service.InvalidateObjectInfoCache()
+			resp := gin.H{"ok": err == nil, "path": bundleStore.Path()}
+			if err != nil {
+				resp["error"] = err.Error()
+			}
+			c.JSON(http.StatusOK, resp)
+		})
+
+		// 多实例：模型 → ComfyUI 实例路由（data/instances.json）
+		api.GET("/instances", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{
+				"path":      instRegistry.Path(),
+				"default":   instRegistry.DefaultInstance().Name,
+				"instances": instRegistry.All(),
+				"note":      instRegistry.LoadNote(),
+			})
+		})
+		api.PUT("/instances", func(c *gin.Context) {
+			var req struct {
+				Default   string             `json:"default"`
+				Instances []service.Instance `json:"instances"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "请求体不是合法 JSON：" + err.Error()})
+				return
+			}
+			if len(req.Instances) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "instances 不能为空"})
+				return
+			}
+			if err := instRegistry.Replace(req.Instances); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			if strings.TrimSpace(req.Default) != "" {
+				instRegistry.SetDefault(req.Default)
+			}
+			if err := instRegistry.Save(); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "保存实例配置失败：" + err.Error()})
+				return
+			}
+			// 实例地址可能变了，object_info 缓存必须作废
+			service.InvalidateObjectInfoCache()
+			c.JSON(http.StatusOK, gin.H{"ok": true, "instances": instRegistry.All()})
 		})
 
 		// 依赖进程托管（ComfyUI / ASR 一键启停）
@@ -409,6 +575,11 @@ func main() {
 		api.POST("/deps/:name/start", depHandler.Start)
 		api.POST("/deps/:name/stop", depHandler.Stop)
 		api.GET("/deps/:name/wait", depHandler.Wait)
+
+		// 提交前估算：按实测档案预测峰值显存与墙钟（区间 + confidence，不是承诺）
+		estHandler := handler.NewEstimateHandler(db, profileStore, 24576)
+		api.POST("/estimate", estHandler.Estimate)
+		api.GET("/vram/profiles", estHandler.ListProfiles)
 
 		// 触发器：Webhook（外部调用）+ Cron（定时）
 		api.GET("/workflows/:id/trigger", triggerHandler.Get)
@@ -427,6 +598,33 @@ func main() {
 		healthHandler.SetNodeTypeLister(engine)
 		api.GET("/health", healthHandler.Health)
 		api.GET("/capabilities", healthHandler.Capabilities)
+	}
+
+	// ---------- OpenAI 兼容出口 ----------
+	//
+	// 让 FlowEdge 直接出现在「模型服务器」位置：Open WebUI / SillyTavern /
+	// Chatbox / LangChain 把 Base URL 指向 http://127.0.0.1:8080/v1 即可
+	// 用本地 GPU 对话、出图、转写、配音，客户端零改动。
+	//
+	// 与 /api 的关系：/api 是「编排」接口（工作流、运行、血缘），
+	// /v1 是「能力」接口（单一模型调用）。两者共用同一批底层服务。
+	oaiHandler := handler.NewOpenAICompatHandler(t2iService, asrService, ttsService,
+		llmService, llmStreamService, filepath.Join(baseDir, "data", "generated"))
+	v1 := r.Group("/v1")
+	{
+		v1.GET("/models", func(c *gin.Context) {
+			// 客户端启动时会探测模型列表；返回本地真实可用的模型，
+			// 而不是编一个 "gpt-4"。谎报模型名会让用户以为换模型生效了。
+			data := []gin.H{{"id": llmModel, "object": "model", "owned_by": "flowedge"}}
+			if t2iService.Checkpoint != "" {
+				data = append(data, gin.H{"id": t2iService.Checkpoint, "object": "model", "owned_by": "flowedge"})
+			}
+			c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
+		})
+		v1.POST("/images/generations", oaiHandler.ImagesGenerations)
+		v1.POST("/audio/transcriptions", oaiHandler.AudioTranscriptions)
+		v1.POST("/audio/speech", oaiHandler.AudioSpeech)
+		v1.POST("/chat/completions", oaiHandler.ChatCompletions)
 	}
 
 	// 前端入口：外部目录优先（便于替换），否则用 exe 内嵌产物

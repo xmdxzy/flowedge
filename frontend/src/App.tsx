@@ -2268,6 +2268,82 @@ function FlowEditor() {
               </div>
             )}
 
+            {selectedNode.type === 'comfy_workflow' && (
+              <div className="flex flex-col gap-3">
+                <div className="text-[10px] leading-relaxed text-gray-500 bg-canvas border border-border rounded-lg p-2">
+                  在 ComfyUI 里用菜单 <span className="text-gray-300">Workflow → Export (API)</span> 导出，
+                  把 JSON 粘到下面。UI 格式（含 nodes/links 数组）无法执行。
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 block mb-1">
+                    工作流文件（data/comfy_workflows/ 下的文件名，可留空）
+                  </label>
+                  <input
+                    value={(selectedNode.data.workflow_file as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('workflow_file', e.target.value)}
+                    placeholder="my_workflow"
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">ComfyUI 工作流 JSON（API 格式）</label>
+                  <textarea
+                    rows={6}
+                    value={typeof selectedNode.data.workflow === 'string'
+                      ? selectedNode.data.workflow
+                      : JSON.stringify(selectedNode.data.workflow ?? {}, null, 2)}
+                    onChange={(e) => updateSelectedNodeData('workflow', e.target.value)}
+                    placeholder='{"3":{"class_type":"KSampler","inputs":{...}},"9":{"class_type":"SaveImage","inputs":{...}}}'
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] font-mono resize-y"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 block mb-1">
+                    输入绑定（一行一条：节点id.输入名=值）
+                  </label>
+                  <textarea
+                    rows={3}
+                    value={Object.entries((selectedNode.data.bindings as Record<string, string>) || {})
+                      .map(([k, v]) => `${k}=${v}`)
+                      .join('\n')}
+                    onChange={(e) => {
+                      // 逐行「path=value」而不是 JSON：用户正在敲 JSON 时中间态必然非法，
+                      // 会在输入过程中把配置清空。这种格式任何中间态都是合法的。
+                      const obj: Record<string, string> = {}
+                      e.target.value.split('\n').forEach((line) => {
+                        const i = line.indexOf('=')
+                        if (i > 0) obj[line.slice(0, i).trim()] = line.slice(i + 1).trim()
+                      })
+                      updateSelectedNodeData('bindings', obj)
+                    }}
+                    placeholder={'6.text={{prompt}}\n5.width=1024'}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] font-mono resize-y"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 block mb-1">
+                    提示词（自动绑到 {'{{prompt}}'}，留空取上游 text）
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={(selectedNode.data.prompt as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('prompt', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 block mb-1">超时（秒）</label>
+                  <input
+                    type="number"
+                    min={30}
+                    value={Number(selectedNode.data.timeout_sec ?? 900)}
+                    onChange={(e) => updateSelectedNodeData('timeout_sec', Number(e.target.value) || 900)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+              </div>
+            )}
+
             {selectedNode.type === 'prompt_opt' && (
               <div className="flex flex-col gap-3">
                 <div>
@@ -2946,6 +3022,10 @@ function getDefaultNodeData(type: string): Record<string, any> {
       return { text: '' }
     case 'group':
       return { label: '分组' }
+    case 'comfy_workflow':
+      // workflow 存字符串（后端同时接受字符串与对象）；bindings 在面板里用
+      // 「path=value」逐行编辑，避免用户正在敲 JSON 时被中间态打断。
+      return { workflow: '', workflow_file: '', bindings: {}, prompt: '', timeout_sec: 900 }
     default:
       return {}
   }

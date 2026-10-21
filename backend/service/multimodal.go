@@ -24,7 +24,31 @@ type Text2ImageService struct {
 	Checkpoint string
 	OutputDir  string // 生成图片落盘目录（默认 data/generated）
 	Template   string // ComfyUI 工作流模板名（data/comfy_workflows/<name>.json）
-	client     *http.Client
+
+	// Bundles 逻辑角色 → 权重文件 + 默认参数的配置仓库（data/models.json）。
+	// nil 时所有读取回落到内置默认，行为与改造前一致。
+	Bundles *BundleStore
+
+	// Instances 模型 → ComfyUI 实例路由（data/instances.json）。
+	// nil 时按 kind 直接选 BaseURL / H3BaseURL，行为与改造前一致。
+	Instances *InstanceRegistry
+
+	client *http.Client
+}
+
+// defaultHTTPClient 兜底 HTTP 客户端。
+//
+// 为什么需要：服务可能被结构体字面量构造（测试、以及将来别的装配路径），
+// 此时 client 为 nil，直接调 s.client.Post 会 **nil pointer panic**——
+// 表现是进程崩掉而不是返回一个错误。这里给共享兜底，
+// 让装配失误退化成「正常请求」而不是「崩溃」。
+var defaultHTTPClient = &http.Client{Timeout: 300 * time.Second}
+
+func (s *Text2ImageService) httpClient() *http.Client {
+	if s != nil && s.client != nil {
+		return s.client
+	}
+	return defaultHTTPClient
 }
 
 func NewText2ImageService(baseURL, checkpoint string) *Text2ImageService {
@@ -200,8 +224,8 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 			"class_type": "KSampler",
 			"inputs": map[string]interface{}{
 				"seed":         time.Now().UnixNano(),
-				"steps":        4,
-				"cfg":          1.0,
+				"steps":        s.bundleParamInt(RoleT2IPrimary, "steps", 4),
+				"cfg":          s.bundleParam(RoleT2IPrimary, "cfg", 1.0),
 				"sampler_name": "euler",
 				"scheduler":    "simple",
 				"denoise":      1.0,
@@ -244,7 +268,7 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 		return "", fmt.Errorf("marshal workflow failed: %w", err)
 	}
 
-	resp, err := s.client.Post(s.BaseURL+"/prompt", "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := s.httpClient().Post(s.BaseURL+"/prompt", "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("comfyui request failed: %w", err)
 	}
@@ -266,7 +290,7 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 	for time.Now().Before(deadline) {
 		time.Sleep(1500 * time.Millisecond)
 
-		hresp, err := s.client.Get(s.BaseURL + "/history/" + queued.PromptID)
+		hresp, err := s.httpClient().Get(s.BaseURL + "/history/" + queued.PromptID)
 		if err != nil {
 			continue
 		}
@@ -304,7 +328,7 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 
 		viewURL := fmt.Sprintf("%s/view?filename=%s&subfolder=%s&type=%s",
 			s.BaseURL, url.QueryEscape(imgFile), url.QueryEscape(imgSub), url.QueryEscape(imgType))
-		dresp, err := s.client.Get(viewURL)
+		dresp, err := s.httpClient().Get(viewURL)
 		if err != nil {
 			return "", fmt.Errorf("comfyui download failed: %w", err)
 		}

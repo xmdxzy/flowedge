@@ -13,10 +13,11 @@ func TestNodeRegistry_HasAllBuiltins(t *testing.T) {
 	eng := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	types := eng.NodeTypes()
 	want := []string{
-		"aggregate", "asr", "code", "data_transform", "end", "http_request", "if_else",
-		"image2image", "inpaint", "llm", "loop", "prompt_opt", "quality_gate", "rag_query",
-		"scene_grid", "select", "shotlist", "start", "storyboard", "sub_workflow",
-		"text2image", "text2video", "tts", "upscale", "video_compose", "vision",
+		"aggregate", "asr", "code", "comfy_workflow", "data_transform", "end",
+		"http_request", "if_else", "image2image", "inpaint", "llm", "loop", "prompt_opt",
+		"quality_gate", "rag_query", "scene_grid", "select", "shotlist", "start",
+		"storyboard", "sub_workflow", "text2image", "text2video", "tts", "upscale",
+		"video_compose", "vision",
 	}
 	if len(types) != len(want) {
 		t.Fatalf("registered %d types, want %d: %v", len(types), len(want), types)
@@ -227,3 +228,54 @@ func TestCheckCodeSafety(t *testing.T) {
 }
 
 func contextBackground() context.Context { return context.Background() }
+
+// TestCheckCodeSafety_IgnoresComments 注释里提到危险包名不能导致代码被拒。
+// 2026-10-21 真实事故：插件示例注释写了 `import "os" 会被拒绝`，
+// 旧实现用 strings.Contains 匹配，直接把整个插件拦下。
+func TestCheckCodeSafety_IgnoresComments(t *testing.T) {
+	code := `// 注意：这里不能用 import "os"，也不能 import "net/http"
+// 只能写 import "strings" 这样的白名单包
+result := strings.ToUpper("ok")
+_ = result`
+	if err := checkCodeSafety(code); err != nil {
+		t.Fatalf("comments must not trigger the blocklist: %v", err)
+	}
+	// 真正的 import 仍要拦
+	if err := checkCodeSafety(`import (
+	"fmt"
+	"os"
+)`); err == nil {
+		t.Error("real forbidden import in a block must still be blocked")
+	}
+	// 子路径也要拦（os/exec 已在黑名单里，这里验证前缀判定）
+	if err := checkCodeSafety(`import "os/exec"`); err == nil {
+		t.Error("os/exec must be blocked")
+	}
+	// 允许的包不能误伤
+	if err := checkCodeSafety(`import "strings"`); err != nil {
+		t.Errorf("strings must be allowed: %v", err)
+	}
+}
+
+// TestImportedPackages 解析器本身的行为
+func TestImportedPackages(t *testing.T) {
+	code := `package x
+import "fmt"
+import alias "encoding/json"
+import (
+	"strings"
+	// 注释行不算
+	"strconv"
+)
+func f() { s := "import \"os\""; _ = s }`
+	got := importedPackages(code)
+	want := map[string]bool{"fmt": true, "encoding/json": true, "strings": true, "strconv": true}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("unexpected package parsed: %q (all=%v)", p, got)
+		}
+	}
+	if len(got) < 4 {
+		t.Errorf("expected 4 packages, got %v", got)
+	}
+}

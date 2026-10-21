@@ -38,10 +38,14 @@ type MediaRequest struct {
 	Strength float64 // img2img 去噪强度 / inpaint denoise
 	Seed     int64
 	Model    string // 模型名覆盖：超分模型（upscale）/ checkpoint（inpaint，如 Flux-Fill）；空 = 服务默认
-	LowVRAM  bool   // H3：用分块注意力/分块 FFN 换显存，换更高分辨率
-	Segments int    // H3：分几段生成再拼接（每段 124 帧 ≈ 5 秒）
-	Interp   bool   // 出片后帧率翻倍（ffmpeg minterpolate，CPU，不占显存）
-	Turbo    bool   // H3 turbo LoRA：20 步 → 8 步（约 2.5 倍速）
+	// Precision 精度档覆盖（权重文件名）。只由 OOM 降级链写入：
+	// 优先换更省显存的权重（如 gguf/Q4），而不是先降分辨率——
+	// 换精度不改变构图，降分辨率会。空 = 用 bundle 默认。
+	Precision string
+	LowVRAM   bool // H3：用分块注意力/分块 FFN 换显存，换更高分辨率
+	Segments  int  // H3：分几段生成再拼接（每段 124 帧 ≈ 5 秒）
+	Interp    bool // 出片后帧率翻倍（ffmpeg minterpolate，CPU，不占显存）
+	Turbo     bool // H3 turbo LoRA：20 步 → 8 步（约 2.5 倍速）
 
 	// h3_r2v（ref2va）：参考图 + 参考音频 → 口型同步的视频。
 	//
@@ -133,15 +137,33 @@ func (s *Text2ImageService) RunGraphAt(base string, graph map[string]interface{}
 		timeout = 10 * time.Minute
 	}
 
+	// 提交前预检（/object_info）：把「模型名写错 / 节点没装」拦在这里，
+	// 而不是等 ComfyUI 返回 400 validation failed。
+	//
+	// 关键语义：探不到 object_info **不阻断**（老实例、自定义节点包返回畸形 JSON、
+	// 代理劫持都会让探活失败），但会把原因写进返回的警告里——
+	// 「没预检」与「预检通过」必须能被区分（AGENTS §0.6）。
+	issues, pfErr := preflightGraph(base, graph)
+	if pfErr == nil {
+		if err := blockingIssues(issues); err != nil {
+			return nil, err
+		}
+	}
+
 	payload, _ := json.Marshal(map[string]interface{}{"prompt": graph})
-	resp, err := s.client.Post(base+"/prompt", "application/json", bytes.NewBuffer(payload))
+	resp, err := s.httpClient().Post(base+"/prompt", "application/json", bytes.NewBuffer(payload))
 	if err != nil {
 		return nil, fmt.Errorf("comfyui request failed: %w", err)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("comfyui rejected prompt (%d): %.400s", resp.StatusCode, string(body))
+		msg := fmt.Sprintf("comfyui rejected prompt (%d): %.400s", resp.StatusCode, string(body))
+		if pfErr != nil {
+			// 400 时说清「预检没能跑成」——否则用户会以为是预检放过了这个错误
+			msg += "（提交前预检未执行：" + pfErr.Error() + "）"
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 	var queued struct {
 		PromptID string `json:"prompt_id"`
@@ -154,7 +176,7 @@ func (s *Text2ImageService) RunGraphAt(base string, graph map[string]interface{}
 	for time.Now().Before(deadline) {
 		time.Sleep(1500 * time.Millisecond)
 
-		hresp, err := s.client.Get(base + "/history/" + queued.PromptID)
+		hresp, err := s.httpClient().Get(base + "/history/" + queued.PromptID)
 		if err != nil {
 			continue
 		}
@@ -212,7 +234,7 @@ func (s *Text2ImageService) collectOutputsAt(base string, entry comfyHistoryEntr
 			q.Set("filename", im.Filename)
 			q.Set("subfolder", im.Subfolder)
 			q.Set("type", im.Type)
-			dresp, err := s.client.Get(base + "/view?" + q.Encode())
+			dresp, err := s.httpClient().Get(base + "/view?" + q.Encode())
 			if err != nil {
 				continue
 			}
@@ -262,20 +284,20 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		}
 		strength := req.Strength
 		if strength <= 0 {
-			strength = 0.6
+			strength = s.bundleParam(RoleImg2Img, "strength", 0.6)
 		}
 		steps := req.Steps
 		if steps <= 0 {
-			steps = 8
+			steps = s.bundleParamInt(RoleImg2Img, "steps", 8)
 		}
 		return map[string]interface{}{
-			"4":  ckptNode(s.Checkpoint),
+			"4":  ckptNode(firstNonEmpty(req.Precision, s.ckptName())),
 			"10": map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": name}},
 			"11": map[string]interface{}{"class_type": "VAEEncode", "inputs": map[string]interface{}{"pixels": link("10", 0), "vae": link("4", 2)}},
 			"6":  clipEncode(req.Prompt, "4"),
 			"33": clipEncode(req.Negative, "4"),
 			"3": map[string]interface{}{"class_type": "KSampler", "inputs": map[string]interface{}{
-				"seed": seed, "steps": steps, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+				"seed": seed, "steps": steps, "cfg": s.bundleParam(RoleImg2Img, "cfg", 1.0), "sampler_name": "euler", "scheduler": "simple",
 				"denoise": strength, "model": link("4", 0), "positive": link("6", 0),
 				"negative": link("33", 0), "latent_image": link("11", 0),
 			}},
@@ -294,17 +316,17 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		}
 		denoise := req.Strength
 		if denoise <= 0 {
-			denoise = 1.0
+			denoise = s.bundleParam(RoleInpaint, "denoise", 1.0)
 		}
 		steps := req.Steps
 		if steps <= 0 {
-			steps = 10
+			steps = s.bundleParamInt(RoleInpaint, "steps", 10)
 		}
 		// 蒙版按原图尺寸缩放，避免尺寸不一致导致 latent 对不上
 		// checkpoint 可被节点覆盖：填 Flux-Fill 得专业重绘（~11GB，先落位
 		// D:/AI/Models 再用），留空走服务默认（flux-schnell，弱修补）
 		return map[string]interface{}{
-			"4":  ckptNode(firstNonEmpty(req.Model, s.Checkpoint)),
+			"4":  ckptNode(firstNonEmpty(req.Precision, req.Model, s.ckptName())),
 			"10": map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": name}},
 			"20": map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": maskName}},
 			"11": map[string]interface{}{"class_type": "VAEEncode", "inputs": map[string]interface{}{"pixels": link("10", 0), "vae": link("4", 2)}},
@@ -314,7 +336,7 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 			"6":  clipEncode(req.Prompt, "4"),
 			"33": clipEncode(req.Negative, "4"),
 			"3": map[string]interface{}{"class_type": "KSampler", "inputs": map[string]interface{}{
-				"seed": seed, "steps": steps, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+				"seed": seed, "steps": steps, "cfg": s.bundleParam(RoleInpaint, "cfg", 1.0), "sampler_name": "euler", "scheduler": "simple",
 				"denoise": denoise, "model": link("4", 0), "positive": link("6", 0),
 				"negative": link("33", 0), "latent_image": link("12", 0),
 			}},
@@ -329,7 +351,7 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		}
 		model := req.Model
 		if model == "" {
-			model = "RealESRGAN_x4plus.pth"
+			model = s.bundleFile(RoleUpscale, "model")
 		}
 		return map[string]interface{}{
 			"1":  map[string]interface{}{"class_type": "UpscaleModelLoader", "inputs": map[string]interface{}{"model_name": model}},
@@ -339,30 +361,36 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		}, nil
 
 	case "t2v":
-		// Wan2.1-T2V-1.3B：官方推荐的轻量视频底座，24GB 可跑
+		// Wan2.1-T2V-1.3B：官方推荐的轻量视频底座，24GB 可跑。
+		// 全部参数与权重名走 bundle（data/models.json），换底座不用改代码。
 		width, height, frames, fps, steps := req.Width, req.Height, req.Frames, req.FPS, req.Steps
 		if width <= 0 {
-			width = 832
+			width = s.bundleParamInt(RoleVideoWan, "width", 832)
 		}
 		if height <= 0 {
-			height = 480
+			height = s.bundleParamInt(RoleVideoWan, "height", 480)
 		}
 		if frames <= 0 {
-			frames = 33
+			frames = s.bundleParamInt(RoleVideoWan, "frames", 33)
 		}
 		if fps <= 0 {
-			fps = 16
+			fps = s.bundleParamInt(RoleVideoWan, "fps", 16)
 		}
 		if steps <= 0 {
-			steps = 20
+			steps = s.bundleParamInt(RoleVideoWan, "steps", 20)
 		}
+		wanUNet := firstNonEmpty(req.Precision, s.bundleFile(RoleVideoWan, "unet"))
+		wanCLIP := s.bundleFile(RoleVideoWan, "clip")
+		wanVAE := s.bundleFile(RoleVideoWan, "vae")
+		wanCFG := s.bundleParam(RoleVideoWan, "cfg", 6.0)
+		wanShift := s.bundleParam(RoleVideoWan, "shift", 8.0)
 		return map[string]interface{}{
 			"1": map[string]interface{}{"class_type": "UNETLoader", "inputs": map[string]interface{}{
-				"unet_name": "wan2.1_t2v_1.3B_fp16.safetensors", "weight_dtype": "default",
+				"unet_name": wanUNet, "weight_dtype": "default",
 			}},
-			"2": map[string]interface{}{"class_type": "ModelSamplingSD3", "inputs": map[string]interface{}{"model": link("1", 0), "shift": 8.0}},
+			"2": map[string]interface{}{"class_type": "ModelSamplingSD3", "inputs": map[string]interface{}{"model": link("1", 0), "shift": wanShift}},
 			"3": map[string]interface{}{"class_type": "CLIPLoader", "inputs": map[string]interface{}{
-				"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan",
+				"clip_name": wanCLIP, "type": "wan",
 			}},
 			"4": map[string]interface{}{"class_type": "CLIPTextEncode", "inputs": map[string]interface{}{"text": req.Prompt, "clip": link("3", 0)}},
 			"5": map[string]interface{}{"class_type": "CLIPTextEncode", "inputs": map[string]interface{}{"text": req.Negative, "clip": link("3", 0)}},
@@ -370,11 +398,11 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 				"width": width, "height": height, "length": frames, "batch_size": 1,
 			}},
 			"7": map[string]interface{}{"class_type": "KSampler", "inputs": map[string]interface{}{
-				"seed": seed, "steps": steps, "cfg": 6.0, "sampler_name": "euler", "scheduler": "simple",
+				"seed": seed, "steps": steps, "cfg": wanCFG, "sampler_name": "euler", "scheduler": "simple",
 				"denoise": 1.0, "model": link("2", 0), "positive": link("4", 0),
 				"negative": link("5", 0), "latent_image": link("6", 0),
 			}},
-			"8":  map[string]interface{}{"class_type": "VAELoader", "inputs": map[string]interface{}{"vae_name": "wan_2.1_vae.safetensors"}},
+			"8":  map[string]interface{}{"class_type": "VAELoader", "inputs": map[string]interface{}{"vae_name": wanVAE}},
 			"9":  map[string]interface{}{"class_type": "VAEDecode", "inputs": map[string]interface{}{"samples": link("7", 0), "vae": link("8", 0)}},
 			"10": map[string]interface{}{"class_type": "CreateVideo", "inputs": map[string]interface{}{"images": link("9", 0), "fps": float64(fps)}},
 			"11": map[string]interface{}{"class_type": "SaveVideo", "inputs": map[string]interface{}{
@@ -388,18 +416,24 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		//   608x352 / 124 帧(=5.17s@24fps) / 20 步 / res_multistep / simple
 		//   172 秒出片，峰值显存 21.4GB（--reserve-vram 4）
 		// 帧数必须落在 17k+5 网格上（124=17*7+5），否则采样器直接报错。
+		// 权重与分辨率走 bundle：fl2va 与 ref2va 是**两个不同的 checkpoint**，
+		// 各自一条角色记录，换权重只改 data/models.json。
+		h3Role := RoleVideoH3Fl2va
+		if req.Kind == "h3_r2v" {
+			h3Role = RoleVideoH3Ref2va
+		}
 		width, height, frames, steps := req.Width, req.Height, req.Frames, req.Steps
 		if width <= 0 {
-			width = 608
+			width = s.bundleParamInt(h3Role, "width", 608)
 		}
 		if height <= 0 {
-			height = 352
+			height = s.bundleParamInt(h3Role, "height", 352)
 		}
 		if frames <= 0 {
-			frames = 124
+			frames = s.bundleParamInt(h3Role, "frames", 124)
 		}
 		if steps <= 0 {
-			steps = 20
+			steps = s.bundleParamInt(h3Role, "steps", 20)
 		}
 		if (frames-5)%17 != 0 {
 			return nil, fmt.Errorf("H3 帧数必须满足 17k+5（如 124 / 141 / 158），当前 %d", frames)
@@ -412,7 +446,7 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 			if req.Image == "" {
 				return nil, fmt.Errorf("H3 图生视频缺少首帧图片")
 			}
-			imgName, err := s.UploadImageAt(s.H3BaseURL, req.Image)
+			imgName, err := s.UploadImageAt(s.baseForKind(req.Kind), req.Image)
 			if err != nil {
 				return nil, err
 			}
@@ -451,7 +485,7 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 				if strings.TrimSpace(p) == "" {
 					continue
 				}
-				name, err := s.UploadImageAt(s.H3BaseURL, p)
+				name, err := s.UploadImageAt(s.baseForKind(req.Kind), p)
 				if err != nil {
 					return nil, fmt.Errorf("参考图上传失败：%w", err)
 				}
@@ -466,7 +500,7 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 					continue
 				}
 				// LoadAudio 读的是 input 目录；/upload/image 接受任意文件并落到同一目录
-				name, err := s.UploadImageAt(s.H3BaseURL, p)
+				name, err := s.UploadImageAt(s.baseForKind(req.Kind), p)
 				if err != nil {
 					return nil, fmt.Errorf("参考音频上传失败：%w", err)
 				}
@@ -540,22 +574,23 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		}
 		// r2v 不是"图生视频的升级版"，而是**另一个 checkpoint**：
 		// 只有 ref2va 的节点暴露 ref_audios，也只有它做口型同步。
-		unetName := "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
-		if req.Kind == "h3_r2v" {
-			unetName = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-		}
+		// bundle 里 fl2va / ref2va 各有一份 unet，这里按 kind 取。
+		unetName := firstNonEmpty(req.Precision, s.bundleFile(h3Role, "unet"))
+		h3Clip := s.bundleFile(h3Role, "clip")
+		h3VideoVAE := s.bundleFile(h3Role, "video_vae")
+		h3AudioVAE := s.bundleFile(h3Role, "audio_vae")
 		graph := map[string]interface{}{
 			"1": map[string]interface{}{"class_type": "UNETLoader", "inputs": map[string]interface{}{
 				"unet_name": unetName, "weight_dtype": "default",
 			}},
 			"2": map[string]interface{}{"class_type": "CLIPLoader", "inputs": map[string]interface{}{
-				"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default",
+				"clip_name": h3Clip, "type": "minimax", "device": "default",
 			}},
 			"3": map[string]interface{}{"class_type": "VAELoader", "inputs": map[string]interface{}{
-				"vae_name": "minimax_h3_video_vae_fp16.safetensors",
+				"vae_name": h3VideoVAE,
 			}},
 			"4": map[string]interface{}{"class_type": "VAELoader", "inputs": map[string]interface{}{
-				"vae_name": "minimax_h3_audio_vae_fp32.safetensors",
+				"vae_name": h3AudioVAE,
 			}},
 			"5": map[string]interface{}{"class_type": "MiniMaxH3ImageToVideo", "inputs": map[string]interface{}{
 				"clip": link("2", 0), "vae": link("3", 0), "prompt": req.Prompt,
@@ -600,12 +635,16 @@ func (s *Text2ImageService) GenerateMedia(req MediaRequest) (string, string, err
 		return "", "", err
 	}
 	timeout := 10 * time.Minute
-	base := s.BaseURL
+	// 实例路由：按实际权重名决定跑哪套环境（H3 要 torch 2.14 的独立工作树）。
+	// 没有配置 registry 时等价于旧逻辑（h3 → H3BaseURL，其余 → BaseURL）。
+	base := s.baseForKind(req.Kind)
+	// 互斥组：同组实例不能同时驻留，锁到执行结束（旧行为靠"人记得先停一个"）
+	unlock := s.Instances.LockForBase(base)
+	defer unlock()
 	switch req.Kind {
 	case "t2v":
 		timeout = 25 * time.Minute // 视频首次要加载 10GB 权重
 	case "h3", "h3_i2v", "h3_r2v":
-		base = s.H3BaseURL
 		timeout = 45 * time.Minute // 40GB 权重 + 40GB 内存工作集，慢是正常的
 	}
 	outs, err := s.RunGraphAt(base, graph, timeout)
@@ -669,7 +708,7 @@ func (s *Text2ImageService) GenerateImages(prompt string, width, height, batch i
 			"width": width, "height": height, "batch_size": batch,
 		}},
 		"3": map[string]interface{}{"class_type": "KSampler", "inputs": map[string]interface{}{
-			"seed": time.Now().UnixNano() % (1 << 31), "steps": 4, "cfg": 1.0,
+			"seed": time.Now().UnixNano() % (1 << 31), "steps": s.bundleParamInt(RoleT2IBatch, "steps", 4), "cfg": s.bundleParam(RoleT2IBatch, "cfg", 1.0),
 			"sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
 			"model": link("4", 0), "positive": link("6", 0),
 			"negative": link("33", 0), "latent_image": link("5", 0),
@@ -737,7 +776,7 @@ func (s *Text2ImageService) GenerateImagesFromPrompts(prompts []string, width, h
 			"width": width, "height": height, "batch_size": 1,
 		}}
 		graph[ks] = map[string]interface{}{"class_type": "KSampler", "inputs": map[string]interface{}{
-			"seed": seed + int64(i), "steps": 4, "cfg": 1.0,
+			"seed": seed + int64(i), "steps": s.bundleParamInt(RoleT2IMultiPrompt, "steps", 4), "cfg": s.bundleParam(RoleT2IMultiPrompt, "cfg", 1.0),
 			"sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
 			"model": link("1", 0), "positive": link(pos, 0),
 			"negative": link(neg, 0), "latent_image": link(lat, 0),

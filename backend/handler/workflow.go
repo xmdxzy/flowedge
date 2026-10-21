@@ -18,15 +18,15 @@ import (
 type WorkflowHandler struct {
 	db      *gorm.DB
 	engine  *service.EngineV2
-	queue   *service.JobQueue      // nil 时退化为直接 goroutine 起跑（保持向后兼容）
-	lineage *service.LineageStore  // nil 时跳过血缘记录
+	queue   *service.JobQueue     // nil 时退化为直接 goroutine 起跑（保持向后兼容）
+	lineage *service.LineageStore // nil 时跳过血缘记录
 	// 预检依赖（SetPreflight 注入；nil 时跳过运行前依赖预检）
-	sup               *service.Supervisor
-	ollamaBase        string
-	comfyBase         string
-	comfyH3Base       string
-	asrBase           string
-	ttsBase           string
+	sup         *service.Supervisor
+	ollamaBase  string
+	comfyBase   string
+	comfyH3Base string
+	asrBase     string
+	ttsBase     string
 }
 
 func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue) *WorkflowHandler {
@@ -450,6 +450,15 @@ func (h *WorkflowHandler) ResumeFromRun(c *gin.Context) {
 
 // resumeFrom 断点续跑公共实现；fromNode 为空时等同整体续跑
 func (h *WorkflowHandler) resumeFrom(c *gin.Context, fromNode string) {
+	h.resumeFromWithOverride(c, fromNode, nil)
+}
+
+// resumeFromWithOverride 同 resumeFrom，但允许传入改过的节点图。
+//
+// 为什么需要：单镜重跑只改内存里的 `reroll` 字段，**不能**写回数据库——
+// 否则用户保存的工作流会被一次临时操作永久改掉（下次正常运行还是会重拍那一镜）。
+// nodesOverride 为 nil 时行为与原实现完全一致。
+func (h *WorkflowHandler) resumeFromWithOverride(c *gin.Context, fromNode string, nodesOverride []byte) {
 	runID := c.Param("runId")
 	var run model.WorkflowRun
 	if err := h.db.First(&run, runID).Error; err != nil {
@@ -517,7 +526,11 @@ func (h *WorkflowHandler) resumeFrom(c *gin.Context, fromNode string) {
 
 	exec := func() {
 		// 走带 runID 的可取消入口：续跑的事件也要归属性，否则执行面板看不到重跑过程
-		nodeStates, err := h.engine.ResumeFromWithRunID([]byte(wf.Nodes), []byte(wf.Edges), prev, fromNode, run.ID, persist)
+		nodesJSON := []byte(wf.Nodes)
+		if len(nodesOverride) > 0 {
+			nodesJSON = nodesOverride
+		}
+		nodeStates, err := h.engine.ResumeFromWithRunID(nodesJSON, []byte(wf.Edges), prev, fromNode, run.ID, persist)
 
 		endNow := time.Now()
 		run.EndedAt = &endNow

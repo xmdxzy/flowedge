@@ -54,14 +54,87 @@ var codeForbiddenImport = []string{
 // 比普通节点的 180s 短得多：本地脚本跑越久越可能死循环，而 yaegi 无法硬中断。
 const codeDefaultTimeout = 30 * time.Second
 
-// checkCodeSafety 静态预检：禁止 import 危险包
+// checkCodeSafety 静态预检：禁止 import 危险包。
+//
+// 必须解析**真正的 import 语句**，不能对整段源码做 `strings.Contains(code, "\"os\"")`。
+// 那个写法在 2026-10-21 咬过一次：插件示例的注释里写了 `import "os" 之类会被拒绝`，
+// 结果整个插件被拦下——注释不是代码，却决定了代码能不能跑。
 func checkCodeSafety(code string) error {
-	for _, f := range codeForbiddenImport {
-		if strings.Contains(code, `"`+f+`"`) {
-			return fmt.Errorf("import %q 在代码沙箱中被禁止", f)
+	for _, pkg := range importedPackages(code) {
+		for _, f := range codeForbiddenImport {
+			if pkg == f || strings.HasPrefix(pkg, f+"/") {
+				return fmt.Errorf("import %q 在代码沙箱中被禁止", pkg)
+			}
 		}
 	}
 	return nil
+}
+
+// importedPackages 提取代码里真正 import 的包路径。
+//
+// 支持 `import "x"`、`import alias "x"` 与 `import ( ... )` 块。
+// 先剥行注释，避免注释里的引号被当成 import。
+func importedPackages(code string) []string {
+	var out []string
+	inBlock := false
+	for _, raw := range strings.Split(code, "\n") {
+		line := strings.TrimSpace(stripLineComment(raw))
+		if line == "" {
+			continue
+		}
+		if !inBlock {
+			if line == "import (" || strings.HasPrefix(line, "import (") {
+				inBlock = true
+				continue
+			}
+			if strings.HasPrefix(line, "import ") {
+				out = append(out, quotedPaths(line)...)
+			}
+			continue
+		}
+		if line == ")" || strings.HasPrefix(line, ")") {
+			inBlock = false
+			continue
+		}
+		out = append(out, quotedPaths(line)...)
+	}
+	return out
+}
+
+// quotedPaths 取出一行里所有双引号内的内容（import 路径）
+func quotedPaths(line string) []string {
+	var out []string
+	for {
+		i := strings.Index(line, `"`)
+		if i < 0 {
+			return out
+		}
+		rest := line[i+1:]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			return out
+		}
+		out = append(out, rest[:j])
+		line = rest[j+1:]
+	}
+}
+
+// stripLineComment 去掉行注释（字符串里的 // 不算）
+func stripLineComment(line string) string {
+	inStr := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '"':
+			if i == 0 || line[i-1] != '\\' {
+				inStr = !inStr
+			}
+		case '/':
+			if !inStr && i+1 < len(line) && line[i+1] == '/' {
+				return line[:i]
+			}
+		}
+	}
+	return line
 }
 
 // buildCodeInterpreter 构造只注入白名单符号的解释器。

@@ -29,13 +29,29 @@ func (u LLMUsage) add(o LLMUsage) LLMUsage {
 type LLMService struct {
 	BaseURL string
 	Model   string
+	// Backend 后端类型（ollama / openai）。空 = 按 BaseURL 与 LLM_PROVIDER 现场判定，
+	// 这样老的 NewLLMService 调用路径不用改。见 llm_provider.go。
+	Backend string
 	client  *http.Client
+}
+
+// defaultLLMHTTPClient LLM 兜底客户端（长上下文/慢生成需要比默认更宽的窗口）。
+// 与 Text2ImageService.httpClient 同一动机：字面量构造时 client 为 nil 会 panic，
+// 装配失误应该退化成可用行为而不是崩进程。
+var defaultLLMHTTPClient = &http.Client{Timeout: 300 * time.Second}
+
+func (s *LLMService) httpClient() *http.Client {
+	if s != nil && s.client != nil {
+		return s.client
+	}
+	return defaultLLMHTTPClient
 }
 
 func NewLLMService(baseURL, model string) *LLMService {
 	return &LLMService{
 		BaseURL: baseURL,
 		Model:   model,
+		Backend: ResolveLLMBackend(baseURL, os.Getenv("LLM_PROVIDER")),
 		client: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -108,14 +124,14 @@ func (s *LLMService) chatWithOptions(prompt, model string, temp *float64) (strin
 	}
 
 	url := s.BaseURL + "/v1/chat/completions"
-	resp, err := s.client.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := s.httpClient().Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return "", LLMUsage{}, fmt.Errorf("ollama request failed: %w", err)
+		return "", LLMUsage{}, fmt.Errorf("%s 请求失败（%s）：%w", s.BackendLabel(), url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", LLMUsage{}, fmt.Errorf("ollama returned status %d", resp.StatusCode)
+		return "", LLMUsage{}, fmt.Errorf("%s 返回 %d（%s）", s.BackendLabel(), resp.StatusCode, url)
 	}
 
 	var chatResp chatResponse
@@ -124,7 +140,7 @@ func (s *LLMService) chatWithOptions(prompt, model string, temp *float64) (strin
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return "", LLMUsage{}, fmt.Errorf("empty response from ollama")
+		return "", LLMUsage{}, fmt.Errorf("%s 返回空内容（模型 %s）", s.BackendLabel(), model)
 	}
 
 	return chatResp.Choices[0].Message.Content, chatResp.Usage, nil
@@ -135,6 +151,11 @@ func (s *LLMService) chatWithOptions(prompt, model string, temp *float64) (strin
 // 用 /api/generate + keep_alive:0（Ollama 文档做法）比 OpenAI 兼容端点可靠：
 // 兼容端点不一定透传 keep_alive。请求本身 1 秒内返回。
 func (s *LLMService) UnloadModel(model string) error {
+	if !s.SupportsNativeUnload() {
+		// 不是故障，是能力边界：OpenAI 兼容后端（vLLM / LM Studio / 商业端点）
+		// 没有「从外部卸载」这个动作，显存由它自己管。
+		return unloadUnsupportedError{backend: s.backend()}
+	}
 	if model == "" {
 		model = s.Model
 	}
@@ -204,14 +225,14 @@ func (s *LLMService) ChatWithToolsUsage(messages []toolChatMessage, tools []Tool
 	}
 
 	url := s.BaseURL + "/v1/chat/completions"
-	resp, err := s.client.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := s.httpClient().Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return nil, LLMUsage{}, fmt.Errorf("ollama request failed: %w", err)
+		return nil, LLMUsage{}, fmt.Errorf("%s 请求失败（%s）：%w", s.BackendLabel(), url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, LLMUsage{}, fmt.Errorf("ollama returned status %d", resp.StatusCode)
+		return nil, LLMUsage{}, fmt.Errorf("%s 返回 %d（%s）", s.BackendLabel(), resp.StatusCode, url)
 	}
 
 	var out toolChatResponse
@@ -255,6 +276,11 @@ type ollamaChatResponse struct {
 }
 
 // VisionChat 图文问答：prompt + 若干本地图片路径
+//
+// 两种后端的图片传法不同，必须分开：
+//   - ollama：原生 /api/chat 的 images 数组（base64 不带前缀）
+//   - openai 兼容（vLLM / LM Studio / llama.cpp）：content 数组里的 image_url
+//     （data: URI，OpenAI 标准）。用 ollama 格式去打这些后端会 400。
 func (s *LLMService) VisionChat(prompt string, imagePaths []string, model string) (string, LLMUsage, error) {
 	if model == "" {
 		model = s.Model
@@ -277,6 +303,10 @@ func (s *LLMService) VisionChat(prompt string, imagePaths []string, model string
 			return "", LLMUsage{}, fmt.Errorf("读取图片失败：%w", err)
 		}
 		images = append(images, base64.StdEncoding.EncodeToString(raw))
+	}
+
+	if s.backend() == BackendOpenAI {
+		return s.visionChatOpenAICompatible(prompt, imagePaths, images, model)
 	}
 
 	reqBody := ollamaChatRequest{
@@ -310,6 +340,73 @@ func (s *LLMService) VisionChat(prompt string, imagePaths []string, model string
 		return "", LLMUsage{}, fmt.Errorf("视觉模型返回空内容（模型 %s 可能不支持图片输入）", model)
 	}
 	return out.Message.Content, LLMUsage{PromptTokens: out.PromptEvalCount, CompletionTokens: out.EvalCount}, nil
+}
+
+// visionChatOpenAICompatible OpenAI 标准的多模态消息（content 数组 + image_url）
+func (s *LLMService) visionChatOpenAICompatible(prompt string, paths, images []string, model string) (string, LLMUsage, error) {
+	type imageURL struct {
+		URL string `json:"url"`
+	}
+	type contentPart struct {
+		Type     string    `json:"type"`
+		Text     string    `json:"text,omitempty"`
+		ImageURL *imageURL `json:"image_url,omitempty"`
+	}
+	type msg struct {
+		Role    string        `json:"role"`
+		Content []contentPart `json:"content"`
+	}
+	parts := make([]contentPart, 0, len(images)+1)
+	parts = append(parts, contentPart{Type: "text", Text: prompt})
+	for i, b64 := range images {
+		parts = append(parts, contentPart{
+			Type:     "image_url",
+			ImageURL: &imageURL{URL: "data:" + imageMIME(paths[i]) + ";base64," + b64},
+		})
+	}
+	body := map[string]interface{}{
+		"model":    model,
+		"messages": []msg{{Role: "user", Content: parts}},
+		"stream":   false,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return "", LLMUsage{}, err
+	}
+	url := s.BaseURL + "/v1/chat/completions"
+	client := &http.Client{Timeout: 300 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(raw))
+	if err != nil {
+		return "", LLMUsage{}, fmt.Errorf("%s 视觉请求失败（%s）：%w", s.BackendLabel(), url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+		return "", LLMUsage{}, fmt.Errorf("%s 视觉接口返回 %d：%s", s.BackendLabel(), resp.StatusCode, string(b))
+	}
+	var out chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", LLMUsage{}, fmt.Errorf("解析视觉响应失败：%w", err)
+	}
+	if len(out.Choices) == 0 || strings.TrimSpace(out.Choices[0].Message.Content) == "" {
+		return "", LLMUsage{}, fmt.Errorf("视觉模型返回空内容（模型 %s 可能不支持图片输入）", model)
+	}
+	return out.Choices[0].Message.Content, out.Usage, nil
+}
+
+// imageMIME 按扩展名推断 MIME。猜错只会让个别后端拒图，
+// 因此默认给 image/png（本地出图绝大多数是 png）。
+func imageMIME(p string) string {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	default:
+		return "image/png"
+	}
 }
 
 // visionModelHints 常见视觉模型的命名特征（用于自动挑选）

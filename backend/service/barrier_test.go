@@ -86,7 +86,7 @@ func TestIsOOMErrorRecognizesVRAMFailures(t *testing.T) {
 // 分辨率对观感影响最小、对显存最有效，步数代价最大留最后。
 func TestDegradeMediaRequestPrefersResolution(t *testing.T) {
 	req := MediaRequest{Kind: "t2v", Width: 608, Height: 352, Frames: 124, Steps: 20}
-	d1, ok := degradeMediaRequest(req)
+	d1, ok := degradeMediaRequest(req, nil)
 	if !ok {
 		t.Fatal("第一档应能降")
 	}
@@ -102,14 +102,14 @@ func TestDegradeMediaRequestPrefersResolution(t *testing.T) {
 
 	// 分辨率降到底之后才动帧数
 	small := MediaRequest{Kind: "t2v", Width: 16, Height: 16, Frames: 124, Steps: 20}
-	d2, ok2 := degradeMediaRequest(small)
+	d2, ok2 := degradeMediaRequest(small, nil)
 	if !ok2 || d2.Frames >= small.Frames {
 		t.Fatalf("分辨率不可降时应降帧数，实际 frames=%d ok=%v", d2.Frames, ok2)
 	}
 
 	// 全都降到底：必须返回 false，让调用方如实报错而不是空转重试
 	bottom := MediaRequest{Kind: "t2v", Width: 16, Height: 16, Frames: 17, Steps: 6}
-	if _, ok3 := degradeMediaRequest(bottom); ok3 {
+	if _, ok3 := degradeMediaRequest(bottom, nil); ok3 {
 		t.Fatal("降到底后必须返回 false（否则会无限重试）")
 	}
 }

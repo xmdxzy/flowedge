@@ -36,6 +36,14 @@ func (e *EngineV2) SetShotJobs(store *ShotJobStore) {
 	}
 }
 
+// Shots 某次运行某节点的镜头作业（无 store 时返回 nil，调用方按空处理）
+func (e *EngineV2) Shots(runID uint, nodeID string) []model.ShotJob {
+	if e == nil {
+		return nil
+	}
+	return e.shotJobs.ListByNode(runID, nodeID)
+}
+
 // interruptComfy 让 ComfyUI 立刻停手。
 //
 // 只为「取消」服务：引擎的取消原先只在层边界检查 ctx，而长片单镜要跑 3–5 分钟，

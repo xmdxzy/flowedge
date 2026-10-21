@@ -158,6 +158,7 @@ type EngineV2 struct {
 	vram            *vramArbiter     // 显存仲裁：同一时刻只跑一个重任务
 	vramMu          sync.Mutex       // 保护 vram 的懒初始化（见 arbiter 注释）
 	deps            *Supervisor      // 依赖进程托管（H3 需要按需切换实例）
+	profiles        *ProfileStore    // 显存档案（实测峰值，供提交前预测；可 nil）
 	nodes           nodeRegistry     // 节点类型注册表（内置 15 种 + 可注册自定义）
 	runMu           sync.Mutex
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
@@ -1173,6 +1174,8 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"text2video":     e.execText2VideoNode,
 		"end":            plain(e.execEndNode),
 		"code":           e.execCodeNode,
+		// 导入任意 ComfyUI API 格式工作流（社区几万个 workflow JSON 的接入点）
+		"comfy_workflow": plain(e.execComfyWorkflowNode),
 	}
 }
 
@@ -1190,10 +1193,26 @@ func (e *EngineV2) executeNode(ctx context.Context, node *model.NodeInstance, up
 	}
 
 	if fn, ok := e.nodes[node.Type]; ok {
+		// 重节点：局部采样显存峰值，落显存档案（供下次提交前预测）。
+		// 只在执行窗口内采样，空闲不烧 CPU（见 vram_sampler.go）。
+		if e.profiles != nil && isHeavyNode(node.Type) {
+			start := time.Now()
+			smp := newVRAMSampler(e.gpuSched)
+			out, err := fn(ctx, node, upstream)
+			peak, samples := smp.Stop()
+			e.recordProfile(node, time.Since(start), peak, samples)
+			return out, err
+		}
 		return fn(ctx, node, upstream)
 	}
 	return nil, fmt.Errorf("unknown node type: %s", node.Type)
 }
+
+// SetProfiles 注入显存档案仓库（nil 时不做档案记录）
+func (e *EngineV2) SetProfiles(p *ProfileStore) { e.profiles = p }
+
+// Profiles 当前档案仓库（可能为 nil）
+func (e *EngineV2) Profiles() *ProfileStore { return e.profiles }
 
 // RegisterNodeType 注册自定义节点类型（插件 / 测试替身入口）
 func (e *EngineV2) RegisterNodeType(typ string, fn NodeExecutor) {

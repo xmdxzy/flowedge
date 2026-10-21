@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -20,13 +21,23 @@ type StreamChunk struct {
 type LLMStreamService struct {
 	BaseURL string
 	Model   string
+	// Backend 后端类型（ollama / openai）；空 = 按 BaseURL 现场判定。见 llm_provider.go
+	Backend string
 	client  *http.Client
+}
+
+func (s *LLMStreamService) httpClient() *http.Client {
+	if s != nil && s.client != nil {
+		return s.client
+	}
+	return defaultLLMHTTPClient
 }
 
 func NewLLMStreamService(baseURL, model string) *LLMStreamService {
 	return &LLMStreamService{
 		BaseURL: baseURL,
 		Model:   model,
+		Backend: ResolveLLMBackend(baseURL, os.Getenv("LLM_PROVIDER")),
 		client: &http.Client{
 			Timeout: 120 * time.Second,
 		},
@@ -102,14 +113,14 @@ func (s *LLMStreamService) streamRequest(payload interface{}) (<-chan StreamChun
 	}
 
 	url := s.BaseURL + "/v1/chat/completions"
-	resp, err := s.client.Post(url, "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := s.httpClient().Post(url, "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return nil, fmt.Errorf("ollama request failed: %w", err)
+		return nil, fmt.Errorf("%s 请求失败（%s）：%w", s.BackendLabel(), url, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("ollama returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("%s 返回 %d（%s）", s.BackendLabel(), resp.StatusCode, url)
 	}
 
 	ch := make(chan StreamChunk, 100)
