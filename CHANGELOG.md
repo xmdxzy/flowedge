@@ -150,11 +150,27 @@ date-based versioning (`vYYYY.MM.DD`).
 | 互斥组串行 | 同 group 两个实例，第二次进入等待 ≥140ms（第一次持锁 150ms） |
 | OpenAI 兼容（真机 exe + mock 上游） | `/v1/models` 返回真实模型；非流式 chat 把 system+user 压平后转发；流式 SSE 首块带 `role`、增量 content、`finish_reason:stop`、`[DONE]`；空 messages / `n>8` / 空 input 均返回标准错误体 |
 
+**真机端到端（2026-10-21 16:00–16:06，RTX 3090，显存峰值 19677 MiB = 80.0%）**
+
+`comfy_workflow` 用真实 ComfyUI 0.31（8188，833 个节点）跑通两次：
+
+| 次 | 绑定 | 产物 | 结果 |
+|---|---|---|---|
+| run 1 | `6.text={{prompt}}` + `3.seed=42`，prompt = "a red apple on a wooden table" | `flowedge-e2e_00001_.png` 512×512 327KB | 红苹果木桌 |
+| run 2 | 改 prompt = "a blue ceramic teapot, studio lighting" + `3.seed=77` | `flowedge-e2e_00002_.png` 512×512 268KB | 蓝色陶瓷茶壶 |
+
+**两张图内容完全不同**——这是绑定真的生效的铁证，不是「跑通了但用的 JSON 原值」。
+节点输出 `bindings_used: ["3.seed", "6.text"]`，`count: 1`，产物已下载到 `data/generated`。
+
+顺带确认：提交前预检在真实 `/object_info`（833 节点）下放行了这张图（没误拦），
+第二次运行 8 秒完成（模型已驻留，验证了「少一次驱逐 ≈ 省 180 秒」的实际效果）。
+
+显存全程 1–2 秒采样：**峰值 19677 MiB / 24576 = 80.0%**，无一次超过 90% 阈值。
+完成后回落到 2528 MiB，用户原有进程不受影响。
+
 **仍未验证**
 
-- **`comfy_workflow` 端到端出图**：mock 只证明「发出的请求符合预期」，不能证明 ComfyUI
-  接受它。需要一次真实实例跑一张 API 格式图（GPU 空闲时）。
-- **带自定义节点包的社区 workflow**：未拿到真实样本。
+- **带自定义节点包的社区 workflow**：真机跑的是标准节点（flux t2i），未拿到带自定义包的样本。
 - **第三方客户端 UI 联调**：协议层已通，未在 Open WebUI / SillyTavern 界面里点过。
 - **精度降级在真实多精度权重上**：本机只有单档权重，mock 用的是虚构的第二档文件名。
 
