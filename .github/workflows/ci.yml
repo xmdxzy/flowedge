@@ -34,6 +34,10 @@ jobs:
         run: cd frontend && npm ci
       - name: Type check
         run: cd frontend && npx tsc --noEmit
+      - name: Unit tests
+        # 零新增依赖：esbuild（vite 自带）打包 *.test.ts，node:test 执行。
+        # 其中包含前后端契约测试（后端节点类型必须出现在调色板里）。
+        run: cd frontend && npm test
       - name: Build
         run: cd frontend && npm run build
 

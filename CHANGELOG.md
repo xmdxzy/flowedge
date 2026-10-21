@@ -233,6 +233,43 @@ date-based versioning (`vYYYY.MM.DD`).
 - 竖屏裁切后主体是否居中：源片是测试图案，真实片子需要人眼确认构图。
 - BGM 与成片的响度归一（`loudnorm`）仍未接入后期链，只做了相对增益。
 
+### 前端测试从 0 到 28（2026-10-21 17:34–17:55）
+
+> 评估里 S4 是"全项目最薄的一环"：前端 9.7k 行、0 测试，改 UI 只能靠手点。
+> 这一轮先建安全网，**再**拆文件——反过来会没有回退依据。
+
+- **零新增运行时依赖的测试通道**：`frontend/scripts/run-tests.mjs` 用 vite 自带的 esbuild
+  把 `src/**/*.test.ts` 打成单个 ESM 包，交给 `node:test` 跑。只加了 `@types/node`（devDependency，
+  不进 exe）。`npm test` 一条命令，已接进 CI 的 frontend job。
+- **27 个用例分三组**
+  - `graphUtils.test.ts`（9 个）：批注/分组剔除、连线过滤、分层布局（含"取最长路径"、
+    环内节点不丢不堆原点）、包围盒（含缺测量值不产生 NaN）、ID 生成。
+  - `graph.test.ts`（9 个）：**前后端契约测试**——从 `backend/service/nodespec.go` 解析节点类型，
+    断言每一个都出现在前端调色板里；反向断言"调色板没有幽灵节点"；输出字段/依赖表只登记已知节点；
+    依赖键必须有中文提示；预置模板的节点与连线两端都真实存在、模板 id 不重复。
+  - `nodeDefaults.test.ts`（5 个）：调色板每种节点都有默认 data、默认值不出现 `undefined`
+    （唯一例外 `workflow_id` 有注释说明）、字幕/后期节点的关键字段与默认值（后期默认 9:16 + 模糊垫底 + duck 开）。
+  - `errorHints.test.ts`（5 个）：从 `backend/model/workflow.go` 解析 `ErrorCode*` 常量，
+    逐个断言有中文提示而不是落到兜底；`isRetryable` 与 `retry-node` 动作自洽。
+- **顺手拆掉 App.tsx 里 97 行纯数据**：`getDefaultNodeData` 移到 `src/config/nodeDefaults.ts`。
+  `App.tsx` 3,226 → **3,129** 行。抽它的理由不是行数好看，而是它现在是**可测的纯数据**
+  （见上面第三组用例）；属性面板与画布逻辑没动，重构风险为零。
+- README/AGENTS 的构建命令同步：`go test` 338、`npm test` 28、`tsc --noEmit` 均列出。
+
+**Verified（Measured）**
+
+- `npm test`：**28 passed / 0 failed**；`tsc --noEmit` 干净；`vite build` 通过（553KB bundle）。
+- `go test ./...` 仍全绿（338 个）；`go vet` 干净。
+- 冒烟：新 exe（32.3MB）起在 8099，`/` 200、bundle 200 且含「字幕烧录」「后期包装」文案；
+  验完停服、删 `dist/data`，8080 复查 200；`运行/FlowEdge.exe` 已替换。
+
+**未验证 / 未做**
+
+- 组件级测试（React 渲染）一个都没有——本轮只覆盖纯函数与配置契约。
+  真正会腐坏的是那 3,129 行 JSX，这需要 @testing-library + jsdom，是下一轮的事。
+- 属性面板仍然只能人眼确认；本机截图通道不可用（见本文件 16:20 的记录）。
+- S3（`handler/workflow.go` 的 123 行编排逻辑）未动。
+
 ### Verified
 
 - `go test ./...` 全绿；测试函数 **306**（改造前 212）；`go vet ./...` 干净；

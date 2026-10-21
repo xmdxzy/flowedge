@@ -744,11 +744,17 @@ curl -s -X POST http://127.0.0.1:30000/api/flowedge/run \
 
 ```bash
 export PATH="$PATH:/c/Users/Administrator/AppData/Local/Programs/Go/bin"
-python scripts/build-windows.py            # 前端 + 单文件 exe → dist/FlowEdge.exe（31.4MB）
+python scripts/build-windows.py            # 前端 + 单文件 exe → dist/FlowEdge.exe（32.3MB）
 python scripts/build-windows.py --skip-ui  # 只重编后端（不复制前端，见下方警告）
-cd backend && go test ./...                # 112 个测试
+cd backend && go test ./...                # 338 个测试
+cd frontend && npm test                    # 28 个前端用例（零新增依赖，见下）
+cd frontend && npx tsc --noEmit            # 类型检查（测试文件也在内）
 ```
 
+- **前端测试不引入 vitest**：`frontend/scripts/run-tests.mjs` 用 vite 自带的 esbuild
+  把 `src/**/*.test.ts` 打成一个 ESM 包，再用 `node:test` 跑。测试用 `node:test` + `node:assert`。
+  其中包含**前后端契约测试**：从 `backend/service/nodespec.go` 解析出节点类型，
+  断言每一个都出现在前端调色板里——「后端有、UI 点不到」这类漂移从此是红灯。
 - **`--skip-ui` 不复制前端**：它只内嵌 `backend/web/static` 里已有的产物。改了前端却用 `--skip-ui`，
   打出来的 exe 界面还是旧的（或直接 500）。要么不带该参数完整构建，要么先手动
   `cp -r frontend/dist/* backend/web/static/`。
