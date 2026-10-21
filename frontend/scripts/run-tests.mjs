@@ -45,9 +45,14 @@ await mkdir(OUT_DIR, { recursive: true })
 // 拆成多包反而要多次起进程，且共享的模块状态会被重复初始化。
 const entry = path.join(OUT_DIR, 'entry.ts')
 const fs = await import('node:fs/promises')
+// 先装浏览器垫片（jsdom → globalThis），再加载测试；顺序不能反，
+// 否则 @testing-library/react 在 import 期就会判定「没有 DOM」而退化。
+const setup = path.join(SRC, 'test-setup.ts')
 await fs.writeFile(
   entry,
-  files.map((f) => `import ${JSON.stringify(f.replace(/\\/g, '/'))}`).join('\n') + '\n',
+  [`import ${JSON.stringify(setup.replace(/\\/g, '/'))}`]
+    .concat(files.map((f) => `import ${JSON.stringify(f.replace(/\\/g, '/'))}`))
+    .join('\n') + '\n',
   'utf8',
 )
 
@@ -58,6 +63,10 @@ await build({
   platform: 'node',
   format: 'esm',
   target: 'node20',
+  jsx: 'automatic', // 组件测试里有 JSX
+  // jsdom 是 CJS 且大量动态 require，打进 ESM 会报 "Dynamic require is not supported"。
+  // 外部化后由 Node 在运行期从 node_modules 解析。
+  external: ['jsdom'],
   outfile,
   logLevel: 'warning',
   // 打包后 import.meta.url 指向 .test-build，测试里找仓库根要靠 cwd 上溯，
