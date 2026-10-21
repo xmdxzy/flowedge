@@ -171,6 +171,9 @@ type EngineV2 struct {
 	nodeSides map[string]string // 自定义节点声明的显存侧别（插件入口）
 	memo      *llmMemo          // 确定性 LLM 调用备忘（翻译 / 优化 / 拆解）
 	memoMu    sync.Mutex
+	// 侧别感知调度的逃生阀门：false（零值）= 开启分组调度。
+	// 置 true 时退回「所有重任务一次性起飞」的旧行为，便于对照测量或排障。
+	sideAwareOff bool
 	// P1 编排深度：同层并行度上限。0 = 不限（默认）。
 	// 显存安全由 vram 仲裁器的 heavyMu 保证（重任务天然串行），
 	// 这里限制的是「同一层能同时起飞多少个节点」，防止一张宽图把 CPU/磁盘打满。
@@ -188,6 +191,38 @@ func (e *EngineV2) SetMaxParallel(n int) {
 		n = 0
 	}
 	e.maxParallel = n
+}
+
+// SetSideAwareScheduling 开关侧别感知调度（默认开启）。
+//
+// 关闭后退回旧行为：同层所有重任务一次性起飞，执行顺序由 goroutine 调度决定
+// （等价于随机）。保留这个开关是为了两件事：
+//  1. 对照测量——同一张图前后各跑一次，直接看换侧次数差多少；
+//  2. 逃生——万一调度分组在某张图上引入问题，能立刻退回原路径。
+func (e *EngineV2) SetSideAwareScheduling(enabled bool) {
+	e.sideAwareOff = !enabled
+}
+
+// SideSwitchCount 本引擎实例累计的逻辑换侧次数（诊断/对照测量用）。
+func (e *EngineV2) SideSwitchCount() int {
+	e.vramMu.Lock()
+	defer e.vramMu.Unlock()
+	if e.vram == nil {
+		return 0
+	}
+	return e.vram.switches
+}
+
+// SideUnloadCount 累计**真实**卸载扩散模型的次数。
+// 与 SideSwitchCount 的区别：只有它才对应一次约 180 秒的冷加载
+// （实测冷加载 183s / 热生成 3s）。做效率评估时看这个数，不要看逻辑换侧。
+func (e *EngineV2) SideUnloadCount() int {
+	e.vramMu.Lock()
+	defer e.vramMu.Unlock()
+	if e.vram == nil {
+		return 0
+	}
+	return e.vram.unloads
 }
 
 // memoStore 备忘实例（懒加载：既有测试用结构体字面量构造引擎，字段为 nil）
@@ -1011,14 +1046,23 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 		// 不吃显存的节点（HTTP / 模板 / 数据流等）始终全速并行
 		launch(light, &wg)
 
-		// 重任务成批推进：扩散（最重）→ 语言 → 语音，组间设屏障
-		for _, s := range sideOrder {
-			if len(heavy[s]) == 0 {
-				continue
-			}
+		if e.sideAwareOff {
+			// 回退路径（旧行为）：重任务一次性全起飞，顺序交给 goroutine 调度
 			var hwg sync.WaitGroup
-			launch(heavy[s], &hwg)
+			for _, ids := range heavy {
+				launch(ids, &hwg)
+			}
 			hwg.Wait()
+		} else {
+			// 重任务成批推进：扩散（最重）→ 语言 → 语音，组间设屏障
+			for _, s := range sideOrder {
+				if len(heavy[s]) == 0 {
+					continue
+				}
+				var hwg sync.WaitGroup
+				launch(heavy[s], &hwg)
+				hwg.Wait()
+			}
 		}
 
 		wg.Wait()

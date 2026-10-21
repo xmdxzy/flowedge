@@ -23,6 +23,13 @@ import (
 type vramArbiter struct {
 	heavyMu  sync.Mutex
 	lastSide string // diffusion | language | audio | ""
+
+	// switches 逻辑换侧次数（lastSide 非空且与新侧不同）。
+	switches int
+	// unloads 真实执行了卸载的次数。与 switches 分开统计：
+	// 扩散侧本来就没驻留时，换侧是空操作、不掏冷加载的钱。
+	// 只有 unloads 才对得上那 180 秒（实测冷加载 183s / 热生成 3s）。
+	unloads int
 }
 
 // 侧别常量
@@ -82,6 +89,9 @@ var sideOrder = []string{sideDiffusion, sideLanguage, sideAudio}
 func (e *EngineV2) enterSide(side string) func() {
 	a := e.arbiter()
 	a.heavyMu.Lock()
+	if a.lastSide != "" && a.lastSide != side {
+		a.switches++ // 真正的换侧（有卸载成本）；从空进入第一侧不算
+	}
 	if a.lastSide != side {
 		switch side {
 		case sideDiffusion:
@@ -91,10 +101,14 @@ func (e *EngineV2) enterSide(side string) func() {
 			}
 		case sideLanguage:
 			// 语言/视觉模型进显存前，先把 ComfyUI 里的扩散模型释放并等它真的归还
-			e.releaseDiffusionAndWait()
+			if e.releaseDiffusionAndWait() {
+				a.unloads++
+			}
 		case sideAudio:
 			// 语音两侧都让位（whisper large-v3 也要 3GB）
-			e.releaseDiffusionAndWait()
+			if e.releaseDiffusionAndWait() {
+				a.unloads++
+			}
 			if e.llm != nil {
 				e.llm.UnloadAllLoaded()
 			}
@@ -109,21 +123,26 @@ func (e *EngineV2) enterSide(side string) func() {
 // 实测：/free 返回后要 5–10 秒才把 17GB 交还（CUDA 异步释放）。
 // 不等就会「卸载了但没释放」，紧接着 VLM 进来直接顶到 23.9GB/24GB。
 // 这里最多等 12 秒，够就提前走；ComfyUI 没起或已空载时立即返回。
-func (e *EngineV2) releaseDiffusionAndWait() {
+// 返回是否**真的**执行了卸载（本身就没驻留时是空操作）。
+// 这个布尔值很关键：实测冷加载一张 512×512 要 183s、热生成只要 3s，
+// 差 61 倍。所以「逻辑换侧」与「真实卸载」必须分开统计——
+// 只有后者才真掏那 180 秒。
+func (e *EngineV2) releaseDiffusionAndWait() bool {
 	if e.t2i == nil {
-		return
+		return false
 	}
 	if free, err := e.t2i.FreeVRAMMB(); err == nil && free > 16000 {
-		return // 本来就没驻留，免一次往返
+		return false // 本来就没驻留，免一次往返
 	}
 	_ = e.t2i.UnloadModels()
 	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(600 * time.Millisecond)
 		if free, err := e.t2i.FreeVRAMMB(); err == nil && free > 16000 {
-			return
+			break
 		}
 	}
+	return true
 }
 
 // ResidentSide 当前驻留侧别（供能力面板/调试显示）

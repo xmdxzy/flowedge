@@ -175,6 +175,36 @@ func TestSideAwareSchedulingKeepsBranchesParallel(t *testing.T) {
 	}
 }
 
+// TestUnloadCountSeparateFromSwitch 逻辑换侧与真实卸载必须分开计数。
+//
+// 实测依据：冷加载一张 512×512 要 183s、热生成只要 3s（差 61 倍）。
+// 所以「换了一次侧」不等于「掏了 180 秒」——扩散侧本来就没驻留时，
+// 换侧是空操作。效率评估只能看 unloads，看 switches 会高估代价。
+func TestUnloadCountSeparateFromSwitch(t *testing.T) {
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil) // t2i == nil：没有扩散服务
+
+	e.enterSide(sideDiffusion)() // 从空进入第一侧：不算换侧
+	if got := e.SideSwitchCount(); got != 0 {
+		t.Fatalf("从空进入第一侧不该计换侧，实际 %d", got)
+	}
+
+	e.enterSide(sideLanguage)() // 扩散 → 语言：算一次逻辑换侧，但没有 t2i 服务可卸载
+	if got := e.SideSwitchCount(); got != 1 {
+		t.Fatalf("扩散→语言应计 1 次逻辑换侧，实际 %d", got)
+	}
+	if got := e.SideUnloadCount(); got != 0 {
+		t.Fatalf("没有 ComfyUI 服务时不该计真实卸载，实际 %d", got)
+	}
+
+	e.enterSide(sideDiffusion)() // 语言 → 扩散
+	if got := e.SideSwitchCount(); got != 2 {
+		t.Fatalf("应累计 2 次逻辑换侧，实际 %d", got)
+	}
+	if got := e.SideUnloadCount(); got != 0 {
+		t.Fatalf("全程没有可卸载的扩散服务，卸载计数应恒为 0，实际 %d", got)
+	}
+}
+
 // TestNodeSideMappingRegression 守卫「nodeSide 映射」与「执行器实际 enterSide」的一致性。
 //
 // 自定义节点类型若会加载大模型，必须用 RegisterNodeTypeWithSide 声明侧别；

@@ -6,7 +6,39 @@ date-based versioning (`vYYYY.MM.DD`).
 
 ## [v2026.10.20]
 
+### Measured (2026-10-21, RTX 3090 24GB / flux1-schnell-fp8 @512×512)
+
+These are measured numbers, not estimates. They decide where optimisation effort is worth
+spending, so they are recorded here rather than left in a session log.
+
+| Scenario | Time | Note |
+|---|---|---|
+| First image after model eviction | **183.3 s** | includes loading 17 GB of weights |
+| Subsequent images, weights resident | **3.0 s** | same 512×512, same 4-step sampler |
+| Side-switch benchmark, 2 diffusion + 2 language, grouped | 166.6 s, 1 logical switch | |
+| Side-switch benchmark, same graph, ungrouped | 158.4 s, 2 logical switches | |
+
+**Cold load is 98% of the first image's wall time (61× the actual generation).** That
+single ratio reorders the whole optimisation backlog: saving one model eviction is worth
+~180 s, while tuning sampler steps or resolution moves single-digit seconds. It also means
+a "logical side switch" is not the same thing as a real eviction — the engine now counts
+both separately (`SideSwitchCount` vs `SideUnloadCount`), because only the latter costs
+that 180 s.
+
+The 2+2 benchmark above did **not** get faster with grouping (−8.2 s is inside GPU
+warm/cold noise at this size). That is the honest result: at two nodes per side there is
+only one eviction to save, and the noise floor is larger than the saving. Grouping pays off
+as `2NM/(N+M)` grows — with six nodes per side the ungrouped expectation is ~6 switches vs
+a fixed 1 when grouped. Reproduce with
+`FLOWEDGE_REAL_BENCH=1 go test ./service/ -run TestReal(SideSwitchBenchmark|ImageLatencySplit) -v`.
+
 ### Added
+- **Reproducible real-hardware benchmarks** — `realbench_test.go` measures (a) grouped vs
+  ungrouped scheduling on the same fan-out graph and (b) the cold-load/generation split.
+  Both skip unless `FLOWEDGE_REAL_BENCH=1`, so CI stays hermetic.
+- **`SetSideAwareScheduling(bool)`** — escape hatch for the side-aware scheduler; turning it
+  off restores the previous "launch everything at once" behaviour, which is also what the
+  A/B benchmark uses as its control.
 - **Deep health checks for the local speech services** — `/health?deep=1` no longer
   just reports "the process is alive". TTS synthesises a throwaway sample end to end;
   ASR verifies that every module it needs can actually be imported, including
