@@ -72,6 +72,19 @@ func ParseComfyWorkflow(raw []byte) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("工作流 JSON 解析失败（复制可能不完整）：%w", err)
 	}
 	if _, isUI := parsed["nodes"]; isUI {
+		// 区分两种 UI 格式：普通图，与「含子图定义」的新版格式。
+		//
+		// 实测（2026-10-21，本机 D:/AI/ComfyUI/blueprints 全部 89 个官方模板）：
+		// 官方模板库里的节点 type 是 UUID（如 916dff42-...），真正的节点定义在
+		// definitions.subgraphs 里，需要递归展开才能变成可执行的 API 图。
+		// 这不是「换个导出方式」就能解决的，所以错误信息不能只说「请用 Export (API)」——
+		// 那会让用户以为自己的操作错了。
+		if hasSubgraphDefinition(parsed) {
+			return nil, fmt.Errorf("这是含子图定义（subgraph）的 UI 格式工作流——" +
+				"ComfyUI 官方模板库（blueprints）都是这种形态，节点 type 是 UUID 而非节点类名，" +
+				"必须先展开子图才能执行。请在 ComfyUI 里打开它，右键 → 转换/展开子图，" +
+				"再用「导出 (API) / Export (API)」导出")
+		}
 		return nil, fmt.Errorf("这是 ComfyUI 的 UI 格式（含 nodes/links），无法直接执行；" +
 			"请在 ComfyUI 里用「导出 (API) / Export (API)」重新导出——API 格式的每个键都是数字节点 id")
 	}
@@ -97,6 +110,18 @@ func ParseComfyWorkflow(raw []byte) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("工作流里没有任何节点（每个节点都需要 class_type 与 inputs）")
 	}
 	return graph, nil
+}
+
+// hasSubgraphDefinition 判断 UI 格式里是否含子图定义（新版 ComfyUI 模板的形态）
+func hasSubgraphDefinition(parsed map[string]interface{}) bool {
+	defs, ok := parsed["definitions"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if sg, ok := defs["subgraphs"].([]interface{}); ok && len(sg) > 0 {
+		return true
+	}
+	return false
 }
 
 // LoadComfyWorkflowFile 从 data/comfy_workflows/<name>.json 读（name 可带或不带 .json）
@@ -149,6 +174,16 @@ func ApplyBindings(graph map[string]interface{}, bindings map[string]string, var
 			inputs = map[string]interface{}{}
 			obj["inputs"] = inputs
 		}
+		// 目标字段已经有连线时必须拒绝。
+		//
+		// 实测（2026-10-21，官方 89 个 blueprint 全部是这种形态）：API 图里
+		// 上游连接是 ["6", 0] 这样的数组。无条件覆盖成字符串会让 ComfyUI 把
+		// 它当成字面量，上游节点变成孤儿——图照样提交成功，只是输出和原来完全不同。
+		// 这种「跑通了但结果不对」比直接失败难查十倍。
+		if existing, has := inputs[field]; has && isLinkValue(existing) {
+			return nil, fmt.Errorf("绑定 %q 指向已有连线的输入（当前是 %v）；"+
+				"改它会让上游节点变成孤儿，图能跑但结果错。若要断开连线请先从工作流里删掉该连线", path, existing)
+		}
 		val, err := resolveBindingValue(field, raw, vars)
 		if err != nil {
 			return nil, fmt.Errorf("绑定 %q：%w", path, err)
@@ -175,6 +210,26 @@ func resolveBindingValue(field, raw string, vars map[string]string) (interface{}
 		return map[string]interface{}{comfyUploadMarker: strings.TrimPrefix(trimmed, "@file:")}, nil
 	}
 	return coerceByField(field, raw), nil
+}
+
+// isLinkValue 判断一个输入值是不是「连到上游节点」的链接。
+//
+// ComfyUI API 格式里链接是 [nodeIDString, outputSlotInt]；
+// 而普通数组型输入（如 ref_images 的 map、frames 列表）不长这样。
+func isLinkValue(v interface{}) bool {
+	arr, ok := v.([]interface{})
+	if !ok || len(arr) != 2 {
+		return false
+	}
+	nodeID, ok := arr[0].(string)
+	if !ok || strings.TrimSpace(nodeID) == "" {
+		return false
+	}
+	switch arr[1].(type) {
+	case float64, int, int64:
+		return true
+	}
+	return false
 }
 
 // comfyUploadMarker 标记「这个值是待上传的本地文件」

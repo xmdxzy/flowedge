@@ -188,6 +188,11 @@ func (e *EngineV2) generateMediaWithDegrade(req MediaRequest) (string, string, i
 		}
 		// CUDA 显存释放是异步的：不等就「卸载了但没释放」，紧接着重试必然再 OOM
 		e.releaseDiffusionAndWait()
+		// 已经用掉全部重试次数：再降一档也没机会执行，不能把这一档算进 level
+		// （否则返回的「降了几档」比实际生效的多一档，用户按它判断画质会判断错）
+		if attempt >= maxOOMDegrade {
+			break
+		}
 		next, changed := degradeMediaRequest(cur, ladder)
 		if !changed {
 			break // 降不动了，如实报原始错误

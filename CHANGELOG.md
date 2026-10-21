@@ -105,16 +105,58 @@ date-based versioning (`vYYYY.MM.DD`).
 - MCP 用真实 exe 验证：`initialize` → 2024-11-05、`tools/list` → 5 个工具、
   `tools/call flowedge_list_workflows` 成功转发。
 
-### 未验证（诚实披露）
+### 验证轮（2026-10-21 15:45–16:10，零 GPU 占用）
 
-- **精度阶梯降级**：本机权重只有一档（fp8/int8），`ladder` 为空时该档被跳过。
-  逻辑有单测（`TestDegradeMediaRequest_PrecisionFirst` 等），但**没有在真实多精度权重上跑过**。
-- **真实 OOM 降级全链**：降级顺序与留痕有单测，未在真机上制造 OOM 复验。
-- **`comfy_workflow` 对真实社区 workflow 的兼容度**：只验证了自造 API 格式 JSON 的解析、
-  绑定与拒绝路径；未拿社区真实 workflow（含自定义节点包）跑通端到端。
-- **OpenAI 兼容端点的第三方客户端实测**：协议形状、SSE 分块、错误体有单测，
-  未用 Open WebUI / SillyTavern 真机联调。
-- **多实例互斥的真实收益**：逻辑有测试（同组串行），未在双实例真机上测「避免了几次 OOM」。
+用户当时在跑其他 GPU 任务，所以这一轮**不启动任何模型**：全部用 mock ComfyUI（httptest）
+与 mock OpenAI 上游（Python stdlib）在 HTTP 层验证引擎决策，再用真实数据打自己。
+
+**验证中发现并修掉的 3 个问题**
+
+1. **绑定到已有连线的输入会静默破坏图**。API 图里上游连接是 `["6", 0]`；`ApplyBindings`
+   无条件覆盖成字符串后，ComfyUI 把它当字面量，上游节点变孤儿——图提交成功、输出完全不对。
+   现在检测链接形态并拒绝，错误里说明「要断开连线请先从工作流里删掉该连线」。
+2. **降级档位虚报一档**。`generateMediaWithDegrade` 在最后一次重试失败后仍执行 `level++`，
+   但那一档并没有机会执行；用户按 level 判断画质会判断错。已改为「用掉全部重试次数就不再降」。
+3. **`comfy_workflow` 的「吃社区 workflow」说法不成立**（见下）。已修正对外表述。
+
+**关键事实：ComfyUI 官方模板库全是 UI 格式**
+
+本机 `D:/AI/ComfyUI/blueprints` 共 **89 个**官方模板，实测：
+
+| 格式 | 数量 |
+|---|---|
+| UI 格式（含 `nodes`/`links`） | **89** |
+| API 格式（可执行） | **0** |
+
+而且它们全部带 `definitions.subgraphs`——节点 `type` 是 UUID 而非节点类名，需要递归展开子图
+才能变成可执行的 API 图。因此：
+
+- 「直接把社区的几万个 workflow JSON 吃进来」**不成立**，必须由用户在 ComfyUI 里
+  Export (API)。已从 README 删除该表述。
+- 检测器对真实数据有效：`TestParseRealBlueprints` 跑完 89 个文件，**89/89 正确拒绝、0 泄漏**
+  （泄漏 = 把 UI 格式当 API 格式放行 → 提交空图 → 得到一句看不懂的成功）。
+- 错误信息现在区分「普通 UI 格式」与「含子图定义的 UI 格式」——后者不是换个导出方式
+  就能解决，得先展开子图，提示必须说清。
+
+**已验证（mock / 真实数据，零 GPU）**
+
+| 项 | 证据 |
+|---|---|
+| Wan 全链路：构图 → 提交 → 轮询 → 下载 → 落盘 | 提交的图含 bundle 里的 `unet_name`、正确 `width`、`SaveVideo` 节点 |
+| OOM 降级（无精度阶梯时） | mock 返回 `CUDA out of memory` → 重试 1 次，宽度 608 → 456（×0.75 对齐 8），帧数不变，note 写清降了什么 |
+| 精度阶梯降级 | 配两档 ladder → 重试时 `unet_name` 换成低精度档，**分辨率不变**（换精度不改构图） |
+| 降到底 | 一直 OOM → 尝试 `level+1` 次后如实返回原始 OOM 错误，`level` 不超过 3 |
+| 多实例路由 | 两个 mock 实例，`minimax_h3*` 命中 h3、`wan*` 命中主实例；同时把 `H3BaseURL` 指向死端口，证明路由按配置走而不是靠那个字段 |
+| 互斥组串行 | 同 group 两个实例，第二次进入等待 ≥140ms（第一次持锁 150ms） |
+| OpenAI 兼容（真机 exe + mock 上游） | `/v1/models` 返回真实模型；非流式 chat 把 system+user 压平后转发；流式 SSE 首块带 `role`、增量 content、`finish_reason:stop`、`[DONE]`；空 messages / `n>8` / 空 input 均返回标准错误体 |
+
+**仍未验证**
+
+- **`comfy_workflow` 端到端出图**：mock 只证明「发出的请求符合预期」，不能证明 ComfyUI
+  接受它。需要一次真实实例跑一张 API 格式图（GPU 空闲时）。
+- **带自定义节点包的社区 workflow**：未拿到真实样本。
+- **第三方客户端 UI 联调**：协议层已通，未在 Open WebUI / SillyTavern 界面里点过。
+- **精度降级在真实多精度权重上**：本机只有单档权重，mock 用的是虚构的第二档文件名。
 
 ## [v2026.10.20]
 

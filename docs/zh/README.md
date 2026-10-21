@@ -77,7 +77,7 @@
 |---|---|
 | **OpenAI 兼容出口** | `/v1/images/generations`、`/v1/audio/transcriptions`、`/v1/audio/speech`、`/v1/chat/completions`（SSE 流式）、`/v1/models`。Open WebUI / SillyTavern / Chatbox / LangChain 把 Base URL 指到 `http://127.0.0.1:8080/v1` 就能用本地 GPU，客户端零改动。 |
 | **MCP server** | `FlowEdge.exe --mcp` 走 stdio JSON-RPC。Claude Desktop / Cursor 可直接调用 `flowedge_run_workflow` / `run_status` / `estimate` / `generate_image`。 |
-| **ComfyUI 工作流导入** | `comfy_workflow` 节点直接执行 ComfyUI「导出 (API)」的 JSON。UI 格式会被拒绝并告知正确导出方式——猜着转换会得到一张「看着能跑但接错线」的图。 |
+| **ComfyUI 工作流导入** | `comfy_workflow` 节点执行 ComfyUI「导出 (API)」的图，按 `节点id.输入名=值` 绑定，数值字段自动转 number。诚实说明：UI 格式是**拒绝**而不是转换——官方 89 个模板实测全部是 UI 格式且带 `definitions.subgraphs`（节点 type 是 UUID），必须先展开子图再导出。猜着转换会得到一张「看着能跑但接错线」的图，所以错误信息会区分「普通 UI 格式」和「含子图的 UI 格式」，因为两者的修法不同。 |
 | **运行期插件** | `data/plugins/<name>/plugin.json`，`http` 型（任何语言）或 `script` 型（yaegi 进程内解释）。加节点不用重编译 exe。示例见 `examples/plugins/text_stats/`。 |
 
 ## 配置即数据（不再是代码）

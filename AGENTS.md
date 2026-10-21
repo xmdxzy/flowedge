@@ -767,7 +767,28 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/api
 就把整个插件拒了。现在走 `importedPackages()`：解析 `import "x"` / `import alias "x"` /
 `import (...)` 块，先剥行注释。**扩展黑名单时不要再退回字符串包含**。
 
-### 8.7 本轮的未验证项（别当成已验证去引用）
+### 8.7 comfy_workflow 只吃 API 格式，这是权衡不是疏忽
 
-精度阶梯降级（无多精度权重可测）、真实 OOM 全链复验、社区真实 workflow 端到端、
-第三方 OpenAI 客户端联调、双实例真机 OOM 收益。详见 `CHANGELOG.md` 的「未验证」节。
+**实测（2026-10-21）**：`D:/AI/ComfyUI/blueprints` 89 个官方模板，**89 个都是 UI 格式，
+0 个 API 格式**，且全部带 `definitions.subgraphs`（节点 `type` 是 UUID）。
+
+所以「吃社区 workflow」这个说法**不成立**，对外必须写「需要 Export (API)」。
+不做 UI→API 转换的理由：要递归展开 subgraph + 用 `/object_info` 的 schema 把
+`widgets_values` 数组映射回输入名，猜错会产出「跑得通但接错线」的图——
+那比直接拒绝难查十倍。
+
+`TestParseRealBlueprints` 用这 89 个真实文件守着检测器：**必须 89/89 拒绝、0 泄漏**。
+泄漏 = 把 UI 格式当 API 格式放行 → 提交空图 → 用户得到一句看不懂的成功。
+
+### 8.8 已验证 vs 仍未验证（2026-10-21 验证轮，零 GPU）
+
+**已验证（mock ComfyUI + mock OpenAI 上游 + 真实 blueprint 数据）**：
+Wan 全链路落盘、OOM 降级（分辨率 ×0.75 且帧数不动）、精度阶梯（换 unet 不改构图）、
+降到底如实报原错、多实例路由（含把 H3BaseURL 指向死端口仍正确的反证）、
+互斥组串行、OpenAI 非流式/流式/错误体。
+
+**仍未验证**：comfy_workflow 端到端真出图（mock 只能证明请求形状，不能证明 ComfyUI 接受）、
+带自定义节点包的真实 workflow、第三方客户端 UI 点击联调、真实多精度权重。
+
+验证方法记在这里，下次照做：**真机验证一律 `PORT=8099` 起第二个实例**，
+不要动用户的 8080；验完 TaskStop + 删 `dist/data` + 确认 8080 仍 200。
