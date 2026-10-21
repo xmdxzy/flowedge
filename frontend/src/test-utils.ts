@@ -19,8 +19,11 @@ export function fire(fn: () => void) {
   })
 }
 
-/** 模拟用户往输入框/文本域输入：改值 + 触发 onChange */
-export function typeInto(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
+/** 模拟用户往输入框/文本域/下拉框输入：改值 + 触发 onChange */
+export function typeInto(
+  el: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+  value: string,
+) {
   act(() => {
     Simulate.change(el, { target: { value } } as never)
   })

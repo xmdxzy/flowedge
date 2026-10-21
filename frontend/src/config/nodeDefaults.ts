@@ -90,7 +90,7 @@ export function getDefaultNodeData(type: string): Record<string, any> {
       // 竖屏默认 9:16 + 模糊垫底（横屏改竖屏不丢内容）；BGM 留空则不混
       return {
         aspect: '9:16', fit: 'blur', video_path: '',
-        bgm: '', bgm_gain: -12, duck: true,
+        bgm: '', bgm_gain: -12, duck: true, loudness: 0, true_peak: -1.5,
         srt_path: '', plan: '', dialogues: '', font_size: 20, margin_v: 28,
       }
     case 'comfy_workflow':

@@ -122,3 +122,18 @@ test('Tab 切换按钮可点（此前是死按钮）', () => {
   fire(() => getByText('输出').click())
   assert.deepEqual(tabs, ['output'])
 })
+
+test('后期节点有响度归一选项，选了目标值会回传数字', () => {
+  const updates: Array<[string, unknown]> = []
+  const { container } = renderPanel(mk('post_production', { loudness: 0 }), {
+    onUpdate: (k, v) => updates.push([k, v]),
+  })
+  assert.ok((container.textContent ?? '').includes('响度归一'), '缺响度归一字段')
+  // 面板里还有「构图 / 填充方式」两个下拉，按选项文本挑出响度那个
+  const select = Array.from(container.querySelectorAll('select')).find((el) =>
+    Array.from(el.options).some((o) => o.value === '-14'),
+  ) as HTMLSelectElement | undefined
+  assert.ok(select, '没找到响度下拉')
+  typeInto(select, '-14')
+  assert.deepEqual(updates, [['loudness', -14]], '选项没回传成 LUFS 数字')
+})

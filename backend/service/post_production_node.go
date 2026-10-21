@@ -72,6 +72,15 @@ func (e *EngineV2) execPostProductionNode(node *model.NodeInstance, upstream map
 		}
 	}
 
+	// ---- 响度归一（两遍法）----
+	// 默认关：开了就会重编音频，且会改变成片"听感"。需要的场景显式给目标值。
+	if v, ok := node.Data["loudness"].(float64); ok && v != 0 {
+		spec.LoudnessTarget = v
+	}
+	if v, ok := node.Data["true_peak"].(float64); ok && v != 0 {
+		spec.TruePeak = v
+	}
+
 	// ---- 字幕：只有真的给了来源才做，避免"没字幕需求却报错" ----
 	strField := func(k string) string {
 		v, _ := node.Data[k].(string)
@@ -97,8 +106,8 @@ func (e *EngineV2) execPostProductionNode(node *model.NodeInstance, upstream map
 	}
 
 	// 什么都没配就不该白付一次重编码
-	if spec.Width == 0 && spec.Height == 0 && spec.BGM == "" && spec.SRT == "" {
-		return nil, fmt.Errorf("后期节点没有可做的动作：至少配 aspect（竖屏）、bgm（配乐）或字幕来源之一")
+	if spec.Width == 0 && spec.Height == 0 && spec.BGM == "" && spec.SRT == "" && spec.LoudnessTarget == 0 {
+		return nil, fmt.Errorf("后期节点没有可做的动作：至少配 aspect（竖屏）、bgm（配乐）、字幕来源或响度归一之一")
 	}
 
 	if err := e.video.PostProcess(in.Video, outPath, spec); err != nil {
@@ -116,6 +125,9 @@ func (e *EngineV2) execPostProductionNode(node *model.NodeInstance, upstream map
 	if spec.BGM != "" {
 		out["bgm"] = filepath.Base(spec.BGM)
 		out["duck"] = spec.Duck
+	}
+	if spec.LoudnessTarget != 0 {
+		out["loudness"] = spec.LoudnessTarget
 	}
 	if spec.SRT != "" {
 		absSRT, _ := filepath.Abs(spec.SRT)

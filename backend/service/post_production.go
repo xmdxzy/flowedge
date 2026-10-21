@@ -27,6 +27,11 @@ type PostSpec struct {
 	SRT           string  // 已就绪的字幕文件（烧录用）
 	FontSize      int
 	MarginV       int
+	// LoudnessTarget 目标响度（LUFS）；0 表示不做响度归一。
+	// 做的时候走两遍法：先渲一条混音音轨测，再带实测值归一（见 loudness.go）。
+	LoudnessTarget float64
+	// TruePeak 真峰上限（dBTP），默认 -1.5
+	TruePeak float64
 }
 
 // buildPostFilter 生成 filter_complex 与输入/输出标签（纯函数，便于单测）。
@@ -75,49 +80,8 @@ func buildPostFilter(spec PostSpec, hasAudio bool) (string, string, string) {
 	}
 
 	// ---- 声音：BGM 混音 + 侧链闪避 ----
-	//
-	// amix 必须 normalize=0：默认 normalize=1 会按输入数把每路压低（约 -6dB），
-	// 叠上侧链压缩后 BGM 只剩 -34dB —— 实测「660Hz 频段能量比母片还低」，
-	// 也就是"混了但听不见"。这条是 A/B 测出来的，不是推的。
-	a := ""
-	switch {
-	case spec.BGM != "" && hasAudio:
-		gain := spec.BGMGainDB
-		if gain == 0 {
-			gain = -12
-		}
-		if spec.Duck {
-			// 人声分两路：一路参与混音，一路只当侧链信号。
-			// sidechaincompress 第一个输入是被压的对象（BGM），第二个是参照（人声）：
-			// 人声一响，BGM 自动退下去，不用手写关键帧。
-			parts = append(parts,
-				"[0:a]asplit=2[voice][sc]",
-				fmt.Sprintf("[1:a]volume=%.1fdB[bgm]", gain),
-				// 参数是实测扫出来的（660Hz 窄带测 BGM 电平）：
-				//   threshold 0.05 / ratio 8 → 有人声时压 5.9dB，静音时 0dB（不误压）
-				//   threshold 0.08 / ratio 4 → 只压 2.8dB，等于没闪避
-				//   threshold 0.03 / ratio 6 → 压 8.4dB，但 AAC 底噪也会被压（BGM 整体矮 3dB）
-				"[bgm][sc]sidechaincompress=threshold=0.05:ratio=8:attack=10:release=250[bgmduck]",
-				"[voice][bgmduck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]",
-			)
-		} else {
-			// 不闪避时**不能**保留 asplit：旁路输出 [sc] 没人消费，
-			// ffmpeg 直接报 "Filter asplit has an unconnected output"（EINVAL）。
-			parts = append(parts,
-				fmt.Sprintf("[1:a]volume=%.1fdB[bgm]", gain),
-				"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]",
-			)
-		}
-		a = "aout"
-	case spec.BGM != "" && !hasAudio:
-		// 原片没音轨：BGM 直接当主音轨（长度由末尾 -t 兜住）
-		gain := spec.BGMGainDB
-		if gain == 0 {
-			gain = -6
-		}
-		parts = append(parts, fmt.Sprintf("[1:a]volume=%.1fdB[aout]", gain))
-		a = "aout"
-	}
+	aparts, a := buildAudioMix(spec, hasAudio)
+	parts = append(parts, aparts...)
 
 	return strings.Join(parts, ";"), v, a
 }
@@ -129,16 +93,41 @@ func (s *VideoService) PostProcess(in, out string, spec PostSpec) error {
 		return err
 	}
 	filter, vLabel, aLabel := buildPostFilter(spec, info.hasAudio)
-	if filter == "" {
-		// 什么都没配：不重编码，直接复制——"无操作"不该付出一次画质损失
-		return copyFile(in, out)
-	}
 
 	tmp, err := os.MkdirTemp("", "flowedge-post-*")
 	if err != nil {
 		return fmt.Errorf("建临时目录失败：%w", err)
 	}
 	defer os.RemoveAll(tmp)
+
+	// 响度两遍法：先单渲一条混音音轨测响度，再把实测值喂回第二遍。
+	// 只在有音轨且显式要求时才做——纯画面任务不该多付一次渲染。
+	if spec.LoudnessTarget != 0 && info.hasAudio {
+		mixOut := filepath.Join(tmp, "mix.wav")
+		if err := s.renderMixAudio(in, spec, info.hasAudio, mixOut, info.dur); err != nil {
+			return err
+		}
+		st, merr := measureLoudnessFile(s.FFmpegPath, mixOut)
+		if merr != nil {
+			return merr
+		}
+		src := aLabel
+		if src == "" {
+			src = "0:a" // 没有混音链，直接对原音轨归一
+		}
+		seg := fmt.Sprintf("[%s]%s[anorm]", src, loudnormFilter(st, spec.LoudnessTarget, spec.TruePeak))
+		if filter == "" {
+			filter = seg
+		} else {
+			filter += ";" + seg
+		}
+		aLabel = "anorm"
+	}
+
+	if filter == "" {
+		// 什么都没配：不重编码，直接复制——"无操作"不该付出一次画质损失
+		return copyFile(in, out)
+	}
 
 	absIn, _ := filepath.Abs(in)
 	absOut, _ := filepath.Abs(out)
@@ -161,9 +150,19 @@ func (s *VideoService) PostProcess(in, out string, spec PostSpec) error {
 		}
 	}
 
-	args = append(args, "-filter_complex", filter, "-map", "["+vLabel+"]")
+	// 标签可能有两种形态：滤镜输出（vsub / anorm）要写成 [label]；
+	// 没有滤镜时是原始流（0:v / 0:a），**不能**加方括号——否则 ffmpeg 报
+	// "Invalid file index"（EINVAL）。以前只在"只配了 BGM、没改画面"时才会踩到。
+	mapArg := func(l string) string {
+		if strings.Contains(l, ":") {
+			return l
+		}
+		return "[" + l + "]"
+	}
+
+	args = append(args, "-filter_complex", filter, "-map", mapArg(vLabel))
 	if aLabel != "" {
-		args = append(args, "-map", "["+aLabel+"]", "-c:a", "aac", "-b:a", "192k")
+		args = append(args, "-map", mapArg(aLabel), "-c:a", "aac", "-b:a", "192k")
 	} else if info.hasAudio {
 		args = append(args, "-map", "0:a?", "-c:a", "copy")
 	}
@@ -186,6 +185,71 @@ func (s *VideoService) PostProcess(in, out string, spec PostSpec) error {
 	}
 	if _, statErr := os.Stat(absOut); statErr != nil {
 		return fmt.Errorf("ffmpeg 返回成功但产物不存在：%s", absOut)
+	}
+	return nil
+}
+
+// buildAudioMix 只生成"混音"那段链（音频部分），返回片段与输出标签。
+//
+// 单独抽出来是为了响度两遍法：第一遍只需要这条链（-vn 渲一条 wav），
+// 第二遍把它和视频链拼在一起。两处各写一份必然漂移。
+func buildAudioMix(spec PostSpec, hasAudio bool) ([]string, string) {
+	var parts []string
+	a := ""
+	switch {
+	case spec.BGM != "" && hasAudio:
+		gain := spec.BGMGainDB
+		if gain == 0 {
+			gain = -12
+		}
+		if spec.Duck {
+			parts = append(parts,
+				"[0:a]asplit=2[voice][sc]",
+				fmt.Sprintf("[1:a]volume=%.1fdB[bgm]", gain),
+				"[bgm][sc]sidechaincompress=threshold=0.05:ratio=8:attack=10:release=250[bgmduck]",
+				"[voice][bgmduck]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]",
+			)
+		} else {
+			parts = append(parts,
+				fmt.Sprintf("[1:a]volume=%.1fdB[bgm]", gain),
+				"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]",
+			)
+		}
+		a = "aout"
+	case spec.BGM != "" && !hasAudio:
+		gain := spec.BGMGainDB
+		if gain == 0 {
+			gain = -6
+		}
+		parts = append(parts, fmt.Sprintf("[1:a]volume=%.1fdB[aout]", gain))
+		a = "aout"
+	}
+	return parts, a
+}
+
+// renderMixAudio 只渲染混音音轨（-vn），供响度第一遍测量。
+// 秒级开销：没有视频编码，只是把 voice+BGM 混成一条 pcm wav。
+func (s *VideoService) renderMixAudio(in string, spec PostSpec, hasAudio bool, out string, dur float64) error {
+	parts, label := buildAudioMix(spec, hasAudio)
+	// 没配 BGM 时没有混音链，直接拿原音轨测——这是最常见的情况（只做归一）。
+	if label == "" && !hasAudio {
+		return fmt.Errorf("原片没有音轨，无法做响度归一")
+	}
+	absIn, _ := filepath.Abs(in)
+	args := []string{"-y", "-v", "error", "-i", absIn}
+	if spec.BGM != "" {
+		absBGM, _ := filepath.Abs(spec.BGM)
+		args = append(args, "-stream_loop", "-1", "-i", absBGM)
+	}
+	if label != "" {
+		args = append(args, "-filter_complex", strings.Join(parts, ";"), "-map", "["+label+"]")
+	} else {
+		args = append(args, "-map", "0:a")
+	}
+	args = append(args, "-vn", "-c:a", "pcm_s16le", "-t", fmt.Sprintf("%.3f", dur), out)
+	cmd := exec.Command(s.FFmpegPath, args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("渲染混音音轨失败：%w，输出：%s", err, truncateRunes(string(output), 400))
 	}
 	return nil
 }

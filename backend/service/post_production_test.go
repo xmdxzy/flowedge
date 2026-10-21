@@ -186,6 +186,17 @@ func TestRealPostProcess(t *testing.T) {
 	if dk > nd-3 {
 		t.Fatalf("侧链没压住 BGM：duck=off %.1fdB，duck=on %.1fdB（应至少低 3dB）", nd, dk)
 	}
+
+	// ---- 用例 3：只混 BGM、不改构图 ----
+	// 这条曾经直接失败：没有视频滤镜时 vLabel 是原始流 "0:v"，旧代码仍给它套方括号
+	// 变成 -map "[0:v]"，ffmpeg 报 Invalid file index（EINVAL）。
+	outBGMOnly := filepath.Join(dir, "bgmonly.mp4")
+	if err := svc.PostProcess(voice, outBGMOnly, PostSpec{BGM: bgm, BGMGainDB: -12}); err != nil {
+		t.Fatalf("只混 BGM（不改构图）失败：%v", err)
+	}
+	if info, err := probeMedia(outBGMOnly); err != nil || !info.hasAudio {
+		t.Fatalf("只混 BGM 的产物异常：%v %+v", err, info)
+	}
 	t.Logf("竖屏 1080x1920 + BGM + 字幕一次通行；静音母片 660Hz %.1fdB → 产物 %.1fdB；"+
 		"侧链 A/B：off %.1fdB / on %.1fdB", silentBand, out1Band, nd, dk)
 }

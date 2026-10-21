@@ -759,6 +759,22 @@ export default function NodeInspector({
               </label>
             </div>
             <div>
+              <label className="text-xs text-gray-400 block mb-1">响度归一（两遍法，改听感但更稳）</label>
+              <select
+                value={String((node.data.loudness as number) || 0)}
+                onChange={(e) => onUpdate('loudness', Number(e.target.value))}
+                className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+              >
+                <option value="0">关闭（保持原音量）</option>
+                <option value="-14">-14 LUFS（短视频通用）</option>
+                <option value="-16">-16 LUFS（口播 / 播客）</option>
+                <option value="-23">-23 LUFS（广播）</option>
+              </select>
+              <p className="text-[10px] text-gray-600 mt-1">
+                先渲一条混音音轨测量，再带实测值归一；不是动态压平，段内起伏保留。
+              </p>
+            </div>
+            <div>
               <label className="text-xs text-gray-400 block mb-1">字幕（可选：.srt 路径）</label>
               <input
                 value={(node.data.srt_path as string) || ''}

@@ -54,6 +54,8 @@ test('关键节点的默认值要能直接跑（而不是全空字段）', () =>
   assert.equal(post.fit, 'blur', '默认模糊垫底：横屏改竖屏不丢内容')
   assert.equal(post.duck, true, '人声压 BGM 默认开')
   assert.equal(post.bgm_gain, -12)
+  assert.equal(post.loudness, 0, '响度归一默认关：开了会改变听感，得用户明确要')
+  assert.equal(post.true_peak, -1.5)
 })
 
 test('布尔型默认值必须是真布尔（面板用 !== false 判定，字符串 "false" 会误判）', () => {
