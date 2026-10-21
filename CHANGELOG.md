@@ -387,6 +387,47 @@ date-based versioning (`vYYYY.MM.DD`).
   逻辑层由 62 条用例覆盖，**像素层仍需人眼**。
 - 8080 当时仍处停止状态，本轮 exe 未在实机跑过。
 
+### 响度归一改两遍法（2026-10-21 18:37–19:00）
+
+> 评估里 §5.2 记的最后一条后期缺口：「BGM 与成片的响度归一仍未接入，只做了相对增益」。
+> 原 `assembleShots` 里用的是**单遍** `loudnorm`——动态归一，段内起伏被压平、开头几秒常偏离，
+> 且没有真峰限幅。
+
+- **`service/loudness.go`**
+  - `parseLoudnormJSON`：从 ffmpeg 的 stderr 里截出那段 JSON（取**最后一个**含 `input_i` 的块，
+    而不是从第一个大括号开始扫）。解析失败返回 `Valid=false`——宁可退回动态归一，
+    也不把 0 当实测值喂回去。
+  - `loudnormFilter`：带 `measured_I/TP/LRA/thresh` + **`linear=true`**（恒定增益，不压动态），
+    末尾接 `alimiter` 兜真峰（`limit = 10^(TP/20)`）。
+- **两遍法流程**（`PostProcess`）：先只渲一条混音音轨（`-vn`，秒级）→ 测量 → 把实测值喂回第二遍。
+  没有混音链时（只做归一）直接测原音轨。
+- **节点侧**：`post_production` 新增 `loudness`（LUFS，0=关）与 `true_peak`（默认 -1.5）。
+  默认**关**——开启会改变成片听感，必须用户明确要。面板给 关闭 / -14（短视频）/ -16（口播）/ -23（广播）四档。
+
+**顺手修掉两个真 bug**
+
+1. **只混 BGM、不改画面时直接失败**：没有视频滤镜时 `vLabel` 是原始流 `0:v`，
+   旧代码仍套方括号变成 `-map "[0:v]"` → ffmpeg `Invalid file index`（EINVAL）。
+   现在按标签形态决定要不要方括号。这个坑只有在「只加 BGM」时才会踩到，之前所有测试都带竖屏。
+2. **「无可做动作」判断漏了响度**：只配 `loudness` 时被误判成空操作并报错（E2E 首次跑就撞上）。
+
+**Verified（Measured）**
+
+- 测试 **343 → 348**（新增 5 条：JSON 解析/垃圾输入/滤镜参数/无实测值降级/真机归一）；
+  `go vet` 干净；前端 **63** 用例全绿。
+- 真机 `TestRealLoudnessNormalize`：原片 **-21.8 LUFS → 产物 -14.0 LUFS**（目标 -14）。
+- E2E（真实 exe @8099，`post_production` 节点、aspect=keep、loudness=-14）：
+  节点返回 `loudness: -14`，产物实测 **-14.0 LUFS**。
+- `TestRealPostProcess` 增补「只混 BGM」用例，锁住上面第 1 个 bug。
+- 验完停服删 `dist/data`；exe 重建并部署到 `运行/`。
+
+**未验证**
+
+- 目标值是否适合**人声素材**：测试用的是 440Hz 纯音。真实配音 + BGM 的 I/TP 分布不同，
+  -14 LUFS 对白片可能偏响，需人耳复核。
+- 两遍法的额外耗时：当前素材 3s，未在 1 分钟成片上量过。
+- 8080 全程处于停止状态，本轮改动未在用户实机跑过。
+
 ### Verified
 
 - `go test ./...` 全绿；测试函数 **306**（改造前 212）；`go vet ./...` 干净；
