@@ -1,0 +1,11 @@
+{
+  "name": "text_stats",
+  "title": "文本统计",
+  "version": "1.0.0",
+  "description": "统计上游文本的字符数、行数与非空行数。零依赖脚本插件示例——把整个目录复制到 data/plugins/ 即可用，不需要重编译 exe。",
+  "category": "text",
+  "type": "script",
+  "entry": "main.go",
+  "side": "",
+  "timeout_ms": 5000
+}

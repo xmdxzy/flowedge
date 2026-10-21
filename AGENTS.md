@@ -717,3 +717,57 @@ curl -s --noproxy '*' -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/api
 ```
 
 部署：`Copy-Item dist\FlowEdge.exe 运行\FlowEdge.exe`（先停旧进程），从 `运行\` 启动。
+
+## 8. 配置即数据（2026-10-21，P0–P5 改造后的新契约）
+
+> 这一节是给「未来的我」看的：模型名不在代码里了，别再去 `comfy_media.go` 里改字符串。
+
+### 8.1 三份配置文件（都在 `data/`，首次启动自动落默认）
+
+| 文件 | 管什么 | 代码入口 |
+|---|---|---|
+| `models.json` | 逻辑角色 → 权重文件 + 默认参数 + 精度降级阶梯 | `service/model_bundle.go` |
+| `instances.json` | 模型 → ComfyUI 实例路由；`exclusive_group` 互斥 | `service/instances.go` |
+| `plugins/<name>/plugin.json` | 运行期节点（http / script 两种） | `service/plugin_loader.go` |
+
+**改模型只改 JSON**：`PUT /api/models/bundles {"role":"video.h3.fl2va","files":{"unet":"..."}}`，
+未写的字段继承内置默认。改完 `object_info` 缓存自动作废。
+
+### 8.2 三条铁律（违反会静默跑坏）
+
+1. **内置默认必须与历史硬编码逐字相同**。`TestBuiltinBundlesMatchLegacyHardcode` 锁着这件事。
+   任何「顺手换个默认模型」都会让升级变成静默换模型，用户只会看到「画风变了」。
+2. **探不到 `object_info` ≠ 预检通过**。预检失败不阻断（老实例/畸形 JSON/代理都会失败），
+   但 400 时会把「预检未执行」附在错误里。别把这条降级逻辑删掉，也别把它当成通过。
+3. **跨参数不给数字**。`/api/estimate` 跨档位时只给上界并标 `extrapolated`；
+   样本 <3 降 confidence；采样漏峰标 `peak_underestimated` + `source=model_size`。
+   加新估算维度前先问：这个数字是测到的还是算出来的？说不清就别输出。
+
+### 8.3 显存采样只看执行窗口
+
+`vram_sampler.go` 在**重节点自己的执行窗口内**以 1 秒间隔采 `nvidia-smi`，节点结束即停。
+不要改成全局常驻轮询：空闲时烧 CPU，而且 5 秒全局间隔本来就采不到 3 秒的出图峰值。
+
+### 8.4 单镜重跑不许改持久化工作流
+
+`POST /api/runs/:runId/shots/:index/reroll` 只把 `reroll` 写进**这次调用的内存节点图**
+（`resumeFromWithOverride`）。写回 DB 会让 `reroll: 3` 永久留下——以后每次正常运行都重拍第 3 镜，
+而且没人记得为什么。
+
+### 8.5 新增的对外协议面
+
+- `/v1/*`：OpenAI 兼容（出图/转写/配音/对话）。**不做 DAG 编排、不经显存仲裁**，
+  与编排任务并跑时仍可能互相挤显存——这是刻意取舍，端点要能当无状态服务器用。
+- `FlowEdge.exe --mcp`：stdio JSON-RPC，**瘦客户端转发**到本机引擎。
+  不要在 stdio 进程里初始化全栈（会抢显存和 sqlite 文件）。
+
+### 8.6 沙箱黑名单要按 import 解析，不能按字符串包含
+
+`checkCodeSafety` 曾用 `strings.Contains(code, "\"os\"")`，结果注释里提到 `import "os"`
+就把整个插件拒了。现在走 `importedPackages()`：解析 `import "x"` / `import alias "x"` /
+`import (...)` 块，先剥行注释。**扩展黑名单时不要再退回字符串包含**。
+
+### 8.7 本轮的未验证项（别当成已验证去引用）
+
+精度阶梯降级（无多精度权重可测）、真实 OOM 全链复验、社区真实 workflow 端到端、
+第三方 OpenAI 客户端联调、双实例真机 OOM 收益。详见 `CHANGELOG.md` 的「未验证」节。

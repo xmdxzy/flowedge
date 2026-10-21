@@ -9,7 +9,7 @@
 **编排引擎**
 - ✅ 可视化拖拽编排（React Flow v12，侧边栏拖拽 + 吸附网格 + 连线校验）
 - ✅ 分层并行 DAG 执行引擎（Go），含菱形汇合、条件分支、`join: any`、`continue_on_error`
-- ✅ **15 种节点**：开始 / 结束 / LLM / 文生图 / 语音转写 / 语音合成 / 视频合成 / 条件分支 / 循环 / 子工作流 / HTTP / 数据转换 / 知识库检索 / 代码执行 / **变量聚合**
+- ✅ **27 种内置节点 + 3 个插件**：控制（开始/结束/条件分支/循环/子工作流）、AI（LLM/文生图/知识库检索/视觉理解/择优/提示词优化/场景九宫格/分镜规划/分镜执行）、媒体（文生视频/图生图/局部重绘/超分/视频合成/语音转写/语音合成）、数据（HTTP/代码执行/数据转换/变量聚合/质检门）、以及 **comfy_workflow**（导入任意 ComfyUI API 格式工作流）
 - ✅ **单步调试 + 断点**：节点上右键打断点，运行到断点停住，可「单步 / 继续 / 停止」，进度实时落库（`status=paused` + `paused_at`）
 - ✅ **凭据加密存储**：API Key 用 AES-256-GCM 加密落 `data/credentials.json`，HTTP 节点只写凭据名，导出工作流不再泄密
 - ✅ **产物血缘**：每张图 / 每段音 / 每个视频都可溯源到「哪个工作流、哪个运行、哪个节点、上游用了什么」
@@ -68,6 +68,41 @@
 - ✅ 安全：默认只监听 127.0.0.1；对外必须显式 `FLOWEDGE_HOST=0.0.0.0` + `FLOWEDGE_API_TOKEN`
 - ✅ 单文件 exe（前端与语音脚本内嵌）；SQLite 零依赖，数据始终跟随 exe 目录
 - ✅ 插件注册表（新增节点类型不需改引擎分发逻辑）
+
+## 互操作：四个接入点
+
+不做连接器军备竞赛，用协议借别人的生态：
+
+| 方向 | 拿到什么 |
+|---|---|
+| **OpenAI 兼容出口** | `/v1/images/generations`、`/v1/audio/transcriptions`、`/v1/audio/speech`、`/v1/chat/completions`（SSE 流式）、`/v1/models`。Open WebUI / SillyTavern / Chatbox / LangChain 把 Base URL 指到 `http://127.0.0.1:8080/v1` 就能用本地 GPU，客户端零改动。 |
+| **MCP server** | `FlowEdge.exe --mcp` 走 stdio JSON-RPC。Claude Desktop / Cursor 可直接调用 `flowedge_run_workflow` / `run_status` / `estimate` / `generate_image`。 |
+| **ComfyUI 工作流导入** | `comfy_workflow` 节点直接执行 ComfyUI「导出 (API)」的 JSON。UI 格式会被拒绝并告知正确导出方式——猜着转换会得到一张「看着能跑但接错线」的图。 |
+| **运行期插件** | `data/plugins/<name>/plugin.json`，`http` 型（任何语言）或 `script` 型（yaegi 进程内解释）。加节点不用重编译 exe。示例见 `examples/plugins/text_stats/`。 |
+
+## 配置即数据（不再是代码）
+
+| 文件 | 管什么 |
+|---|---|
+| `data/models.json` | 逻辑角色 → 权重文件 + 默认参数（步数/CFG/分辨率/帧数）+ 精度降级阶梯 |
+| `data/instances.json` | 模型 → ComfyUI 实例路由；`exclusive_group` 让不能共存的两个实例自动串行 |
+| `data/plugins/` | 运行期节点 |
+
+改造前这些权重名硬编码在 8 处，换 checkpoint 要改 Go 重编；
+而且在没有同名文件的机器上，第一次运行就会得到 ComfyUI 的 `400 prompt_outputs_failed_validation`。
+
+## 提交前估算
+
+每个重节点执行时在**自己的执行窗口内**采样 `nvidia-smi`（1 秒一次，空闲不轮询），
+累积进 `data/vram_profiles.json`（按 模型 × 分辨率 × 帧数 × 步数 分档）。
+
+`POST /api/estimate` 会在提交前回答：
+
+> 峰值 21.8 GB（区间 18.5–25.1），耗时 26–41 分钟，confidence: medium（5 次样本）
+
+三条纪律：不跨参数外推（跨档位时只给上界并标 `extrapolated`）、样本 <3 时降 confidence、
+采样漏峰时标 `peak_underestimated` 并用 `source=model_size` 区分「测到的」与「算出来的」。
+`fits` 按上界判，不按期望值。
 
 ## 在 Windows 上运行（推荐：不需要 Docker / WSL）
 
@@ -325,6 +360,7 @@ ollama pull qwen2.5:7b
 | 视觉理解 | ai | 图片 + 提问 → 文字（本地 VLM，走 Ollama /api/chat）；支持「参考主题」入参，判断是否与要求一致 |
 | 择优挑选 | ai | K 个候选图 → VLM 逐个打分（0–100）→ 只输出最高分那张；单候选不打分（省一次换侧） |
 | 代码执行 | data | yaegi 跑 Go 子集，stdlib 白名单 |
+| ComfyUI 工作流 | ai | 直接执行 ComfyUI「导出 (API)」JSON；绑定按 `节点id.输入名=值`，数值字段自动转 number |
 | 结束 | control | 输出最终结果 |
 
 > 另有仅存在于画布的 **批注（note）** 与 **分组（group）**：保存与运行时会自动剔除，不会进工作流定义。
@@ -354,8 +390,22 @@ ollama pull qwen2.5:7b
 - `GET /api/artifacts` - 列出生成的图片 / 视频 / 音频
 - `GET /api/artifacts/:name` - 获取单个产物
 - `DELETE /api/artifacts/:name` - 删除产物
+- `GET /api/runs/:runId/shots` - 按镜查看本次运行的每镜状态
+- `POST /api/runs/:runId/shots/:index/reroll` - **只重拍某一镜**（不改用户保存的工作流）
+- `POST /api/estimate` - 提交前估算峰值显存与耗时（区间 + confidence）
+- `GET /api/vram/profiles` - 查看累积的实测显存档案
 - `GET /api/capabilities` - 部署环境自检（GPU / Ollama / ComfyUI / ffmpeg / ASR / TTS）
 - `GET /api/health` - 轻量探活
+
+### 配置（数据而非代码）
+- `GET /api/models/bundles` - 逻辑角色 → 权重文件 + 参数
+- `PUT /api/models/bundles` - 就地改某个角色（只写想覆盖的字段）
+- `POST /api/models/bundles/reload` - 重新读取 `data/models.json`
+- `GET /api/instances` / `PUT /api/instances` - 模型 → ComfyUI 实例路由
+
+### OpenAI 兼容（给第三方客户端用）
+- `POST /v1/images/generations` · `POST /v1/audio/transcriptions`
+- `POST /v1/audio/speech` · `POST /v1/chat/completions`（SSE 流式）· `GET /v1/models`
 
 ### 变量语法
 

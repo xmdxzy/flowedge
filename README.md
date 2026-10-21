@@ -49,12 +49,43 @@ Multi-segment video drifts — shot 3 quietly becomes a different room while dur
 
 Plus: H3 dual-worktree isolation (torch 2.14 vs 2.6 coexisting on one machine via exclusive port arbitration) — the kind of knowledge that only comes from debugging, never from reading source.
 
+## Interop: four ways in, none of them a connector catalogue
+
+FlowEdge does not chase n8n's 400 connectors. It borrows other ecosystems through protocols instead:
+
+| Direction | What it gives you |
+|---|---|
+| **OpenAI-compatible endpoints** | `POST /v1/images/generations`, `/v1/audio/transcriptions`, `/v1/audio/speech`, `/v1/chat/completions` (SSE streaming), `GET /v1/models`. Point Open WebUI / SillyTavern / Chatbox / LangChain at `http://127.0.0.1:8080/v1` and your local GPU becomes their backend — zero client changes. |
+| **MCP server** | `FlowEdge.exe --mcp` speaks stdio JSON-RPC. Claude Desktop / Cursor get `flowedge_run_workflow`, `run_status`, `estimate`, `generate_image` as tools. One integration point instead of a hundred connectors — MCP clients are the side that is growing. |
+| **ComfyUI workflow import** | The `comfy_workflow` node runs any ComfyUI **Export (API)** JSON as-is. The community has tens of thousands of workflow files; this eats them without writing a node per feature. UI format (nodes/links) is rejected with the exact menu item to use instead — guessing a conversion would produce a graph that looks runnable and is wired wrong. |
+| **Runtime plugins** | `data/plugins/<name>/plugin.json` — an `http` plugin (written in any language) or a `script` plugin (interpreted in-process by yaegi, sandboxed to a stdlib allowlist). Adding a node no longer means recompiling a 32 MB exe. |
+
+## Prediction before execution
+
+Every heavy node is sampled for VRAM peak (`nvidia-smi`, 1 s interval, only during the node's own execution window — no idle polling). Those measurements accumulate into `data/vram_profiles.json`, keyed by model × resolution × frames × steps.
+
+`POST /api/estimate` then answers, *before* you commit:
+
+> peak 21.8 GB (range 18.5–25.1), wall 26–41 min, confidence: medium (5 samples)
+
+Three rules keep it honest: no extrapolation across parameter ranges (it says "extrapolated" and only gives an upper bound), confidence drops when samples < 3, and peaks that came from a model-size estimate rather than a sample are marked `peak_underestimated`. `fits` is judged on the upper bound, not the expected value.
+
+## Configuration, not code
+
+| File | Controls |
+|---|---|
+| `data/models.json` | Logical role → weight files + default params (steps/cfg/size/frames) + precision ladder |
+| `data/instances.json` | Model → ComfyUI instance routing; `exclusive_group` serialises instances that cannot coexist on one card |
+| `data/plugins/` | Runtime nodes |
+
+Before this, those weight names were hardcoded in 8 places — swapping a checkpoint meant editing Go and rebuilding. It also meant that on any machine without those exact filenames, the first run failed with ComfyUI's `400 prompt_outputs_failed_validation`.
+
 ## Features
 
 **Orchestration**
 - Visual DAG canvas (React Flow v12): drag, snap, connect with validation
 - Layered parallel execution with diamond joins, `join: any`, `continue_on_error`
-- 26 node types: LLM / T2I / img2img / inpaint / upscale / T2V / H3 audio-video / shot list / ASR / TTS / vision / select / RAG / code / HTTP / transform / aggregate / loop / sub-workflow / **quality_gate**
+- 30 node types: LLM / T2I / img2img / inpaint / upscale / T2V / H3 audio-video / shot list / ASR / TTS / vision / select / RAG / code / HTTP / transform / aggregate / loop / sub-workflow / **quality_gate** / **comfy_workflow** (imported ComfyUI graph) / runtime plugins
 - Single-step debugger + breakpoints; resume from any node; branch-aware resume reuses successful outputs
 - Variable system `{{nodeId.path}}` with array indexing
 - Webhook + cron triggers; versioning with rollback; AES-256-GCM credential store
@@ -67,7 +98,7 @@ Plus: H3 dual-worktree isolation (torch 2.14 vs 2.6 coexisting on one machine vi
 - Explicit failure over silent success: unconfigured services fail loudly, never fabricate results
 - Save-time validation: cycles, missing prompts and missing inputs are rejected before they enter the database
 - Run-time preflight: missing dependencies fail at the entry point with *what is missing and how to start it*
-- 120+ tests, structured error codes, persistent job queue with crash recovery
+- 300+ tests, structured error codes, persistent job queue with crash recovery, preflight against `/object_info` so wrong weight names fail before submit instead of after
 
 ## Quick start
 
