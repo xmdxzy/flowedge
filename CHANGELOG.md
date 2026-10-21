@@ -302,6 +302,37 @@ date-based versioning (`vYYYY.MM.DD`).
 - 「运行中拒绝续跑」（409）只有单元测试覆盖，没在真实并发下撞过。
 - 续跑期间取消（`cancelled` → job `interrupted`）沿用原逻辑，未新增验证。
 
+### 组件级测试：前端 28 → 46（2026-10-21 18:00–18:20）
+
+> 上一轮只覆盖纯函数与配置契约，真正会腐坏的是那 3k 行 JSX。这一轮把渲染测试补上。
+
+- **jsdom 垫片**（`src/test-setup.ts`）：手工把 jsdom 的 `window/document` 与一批 DOM 构造器
+  挂到 `globalThis`。跑批器是裸 node + esbuild，没有 vitest 的 environment 概念。
+  漏搬 `HTMLInputElement` 这类构造器会直接 `not defined`——这一条已经踩过。
+- **新用例 18 个**
+  - `ErrorNotice`（7）：错误码 → 人话标题（裸码只做附注）、有 `onAction` 才出按钮且回传正确动作、
+    `compact` 不展开长文、未知码兜底但原始报错必须显示。
+  - `NodePalette`（7）：搜索按中文名/type 过滤、点击加节点、环境未就绪灰显（仍可先摆好）、
+    就绪不带灰显、常用区按次数排前、折叠状态落 localStorage。
+  - `Toast`（4）：先挂宿主再 `toast()` 能显示、多条共存、未挂载时调用不抛、返回自增 id。
+- **`src/test-utils.ts`**：`fire()`（显式 act）+ `typeInto()`。两个环境事实写进了注释——
+  RTL 的 `fireEvent` 在本环境不自动包 act；DOM 层 `input/change` 事件到不了 React 的 onChange
+  （click 正常），所以输入走 `Simulate.change`。**这是 harness 限制，不是组件缺陷**。
+- **`afterEach(cleanup)` 收进垫片**：某个用例断言失败后跳过自己的 cleanup，下一个用例就会看到
+  两份 DOM，报出与真实缺陷无关的「Found multiple elements」。
+
+**Verified（Measured）**
+
+- `npm test`：**46 passed / 0 failed**；`tsc --noEmit` 干净；`vite build` 通过（553KB，与加测试前一致——
+  测试不进产物）。
+- `go test ./...` 仍 343 全绿。
+- 冒烟：新 exe 起在 8099，`/` 200、bundle 200、`/api/capabilities` 200；验完停服删 `dist/data`。
+
+**未验证 / 未做**
+
+- 仍没测画布本体（React Flow 的节点渲染、连线交互），需要包 `ReactFlowProvider` 的 harness。
+- 属性面板（`App.tsx` 内联 JSX）依旧没有测试覆盖，这是继续拆分它的最后一道障碍。
+
 ### Verified
 
 - `go test ./...` 全绿；测试函数 **306**（改造前 212）；`go vet ./...` 干净；
