@@ -76,7 +76,7 @@ func (e *EngineV2) execStoryboardNode(ctx context.Context, node *model.NodeInsta
 		maxShots = 8
 	}
 
-	release := e.enterSide(sideLanguage)
+	release := e.enterLanguageSide("")
 	defer release()
 
 	if e.llm == nil {
@@ -344,19 +344,18 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	// 按镜明细：界面据此渲染「第 3/6 镜 · 复用 / 新生成 · 耗时」，也是 reroll 的依据
 	jobs := e.shotJobs.ListByNode(runID, node.ID)
 	return map[string]interface{}{
-		"video":         final,
-		"kind":          "video",
-		"text":          plan.Title,
-		"shots":         len(results),
-		"seconds":       total,
-		"shots_reused":  reusedCount,
-		"shot_jobs":     toJSON(jobs),
-		"detail":        planJSON,
-		"check":         toJSON(check),
-		"check_ok":      check.OK,
+		"video":        final,
+		"kind":         "video",
+		"text":         plan.Title,
+		"shots":        len(results),
+		"seconds":      total,
+		"shots_reused": reusedCount,
+		"shot_jobs":    toJSON(jobs),
+		"detail":       planJSON,
+		"check":        toJSON(check),
+		"check_ok":     check.OK,
 	}, nil
 }
-
 
 // toJSON 序列化辅助（失败时给空对象，不让输出字段撑爆）
 func toJSON(v interface{}) string {

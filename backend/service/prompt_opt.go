@@ -884,7 +884,7 @@ func (e *EngineV2) execPromptOptNode(ctx context.Context, node *model.NodeInstan
 		seconds = int(v)
 	}
 
-	release := e.enterSide(sideLanguage)
+	release := e.enterLanguageSide("")
 	defer release()
 
 	// 场景锁：上游「场景九宫格」节点给了就带上，没给就行为不变。

@@ -33,6 +33,19 @@ a fixed 1 when grouped. Reproduce with
 `FLOWEDGE_REAL_BENCH=1 go test ./service/ -run TestReal(SideSwitchBenchmark|ImageLatencySplit) -v`.
 
 ### Added
+- **VRAM coexistence: skip the eviction when the model actually fits** — the arbiter used to
+  evict the diffusion model on *every* switch to the language side. Measured: evicting flux
+  costs **183.3 s** to reload while generating an image takes **3.0 s**, so each unnecessary
+  eviction burns ~180 s. `canCoexistWithLanguage` now checks the real free VRAM
+  (ComfyUI `/system_stats`) against the model's size (Ollama `/api/tags`) and skips the
+  eviction when `free > size × 1.3 + 1 GB`. flux 17 GB + a 6 GB VLM ≈ 23 GB, which does fit
+  in 24 GB — that combination no longer pays the reload.
+  The conservative rule is unchanged: **unknown VRAM, unknown model size, or the kill switch
+  (`SetVRAMCoexist(false)`) all fall back to evicting.** A wrong "it fits" pushes the resident
+  diffusion model out and costs another 183 s — strictly worse than not optimising, so
+  "uncertain" always means "don't coexist".
+- **`CoexistCount()`** — how many evictions were avoided. Each hit is worth ~183 s, so this
+  is the number to watch when judging whether the optimisation is doing anything.
 - **Reproducible real-hardware benchmarks** — `realbench_test.go` measures (a) grouped vs
   ungrouped scheduling on the same fan-out graph and (b) the cold-load/generation split.
   Both skip unless `FLOWEDGE_REAL_BENCH=1`, so CI stays hermetic.

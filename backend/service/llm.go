@@ -340,6 +340,40 @@ func PickVisionModel(ollamaBase string) string {
 	return ""
 }
 
+// ModelSizeMB 模型在磁盘上的体积（MB）；查不到返回 0。
+//
+// 只当作显存占用的**下界**：真正加载还要加 KV cache（随上下文长度增长）。
+// 所以任何"装不装得下"的判断都必须在这个数字上留余量，不能直接比。
+func (s *LLMService) ModelSizeMB(model string) int {
+	if s == nil || s.BaseURL == "" || strings.TrimSpace(model) == "" {
+		return 0
+	}
+	body, err := httpGetBody(s.BaseURL + "/api/tags")
+	if err != nil {
+		return 0
+	}
+	var tags struct {
+		Models []struct {
+			Name string `json:"name"`
+			Size int64  `json:"size"`
+		} `json:"models"`
+	}
+	if json.Unmarshal(body, &tags) != nil {
+		return 0
+	}
+	base := strings.SplitN(model, ":", 2)[0]
+	for _, m := range tags.Models {
+		// 精确匹配优先；退一步按「不带 tag 的名字」匹配（qwen2.5 → qwen2.5:latest）
+		if m.Name == model || strings.SplitN(m.Name, ":", 2)[0] == base {
+			if m.Size <= 0 {
+				return 0
+			}
+			return int(m.Size / (1024 * 1024))
+		}
+	}
+	return 0
+}
+
 // LoadedModels 列出当前驻留在显存/内存里的模型（Ollama /api/ps）
 func (s *LLMService) LoadedModels() []string {
 	body, err := httpGetBody(s.BaseURL + "/api/ps")

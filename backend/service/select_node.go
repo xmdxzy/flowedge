@@ -240,7 +240,7 @@ func (e *EngineV2) execSelectNode(ctx context.Context, node *model.NodeInstance,
 	scores := make([]int, 0, len(cands))
 
 	// 打分是语言侧：先把扩散侧让出去，否则 flux 17GB + VLM 6GB 会贴着 24GB 打转
-	release := e.enterSide(sideLanguage)
+	release := e.enterLanguageSide("")
 	defer release()
 
 	for _, p := range cands {

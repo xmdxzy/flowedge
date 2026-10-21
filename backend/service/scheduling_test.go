@@ -216,7 +216,10 @@ func TestNodeSideMappingRegression(t *testing.T) {
 		t.Fatalf("找不到源码文件：%v", err)
 	}
 	fnRe := regexp.MustCompile(`func \(e \*EngineV2\) (exec\w*Node)\(`)
+	// 两种进入方式都要认：enterSide(sideX) 与 enterLanguageSide(...)
+	// （后者是带「装得下就不卸载」判断的语言侧入口，本质仍属语言侧）
 	sideRe := regexp.MustCompile(`enterSide\((side\w+)\)`)
+	langRe := regexp.MustCompile(`enterLanguageSide\(`)
 
 	checked := 0
 	for _, f := range files {
@@ -235,14 +238,21 @@ func TestNodeSideMappingRegression(t *testing.T) {
 				cur = m[1]
 				continue
 			}
-			if m := sideRe.FindStringSubmatch(ln); m != nil && cur != "" {
+			// enterLanguageSide 等价于进入语言侧，统一成 sideLanguage 常量名再比对
+			sideIdent := ""
+			if m := sideRe.FindStringSubmatch(ln); m != nil {
+				sideIdent = m[1]
+			} else if langRe.MatchString(ln) {
+				sideIdent = "sideLanguage"
+			}
+			if sideIdent != "" && cur != "" {
 				// exec<Name>Node → 节点类型（lower / snake 两种命名都在用）
 				base := strings.TrimSuffix(strings.TrimPrefix(cur, "exec"), "Node")
 				for _, cand := range []string{strings.ToLower(base), toSnake(base)} {
 					if want := nodeSide(cand); want != "" {
 						if first[cur] == "" {
-							// 只认函数体里第一个 enterSide（决定起飞时是否换侧）
-							first[cur] = m[1]
+							// 只认函数体里第一个入口（决定起飞时是否换侧）
+							first[cur] = sideIdent
 						}
 						if want != sideConstValue(first[cur]) {
 							t.Fatalf("%s：执行器第一个进的是 %s，但 nodeSide(%q)=%s，映射表没同步",

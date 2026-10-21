@@ -185,7 +185,14 @@ offset 越过上一段终点 → 整段画面被丢掉，而成片**时长仍然
 
 ## 2. 显存（24GB 卡 + UE5 同时开着）
 
-- **同一时刻只让一侧驻留**：扩散（flux 17GB）/ 语言（14B 9GB 或 VLM 6GB）/ 语音（whisper 3GB）。
+- **默认同一时刻只让一侧驻留**：扩散（flux 17GB）/ 语言（14B 9GB 或 VLM 6GB）/ 语音（whisper 3GB）。
+  - **小模型例外（2026-10-21 实测后放宽）**：卸载后重载 flux 要 **183.3s**，生成只要 **3.0s**
+    （61 倍）。所以「装得下就别卸载」比任何采样参数优化都值钱。
+    `canCoexistWithLanguage` 在**真实空闲显存 > 模型体积×1.3 + 1GB** 时跳过卸载
+    （flux 17GB + VLM 6GB ≈ 23GB，24G 卡放得开）。
+  - **保守底线不变**：查不到显存、查不到模型体积、或开关关闭（`SetVRAMCoexist(false)`）
+    一律退回卸载。判断偏乐观会把已驻留的扩散模型挤出去，代价是又一次 183s，
+    比不优化更糟——**「不确定」永远等于「不共存」**。
 - 换侧：先卸载 → 轮询 `vram_free` ≥ 16GB → 再继续。卸载返回不等于显存归还。
 - ComfyUI `/free` 必须带 `{"unload_models":true,"free_memory":true}`。
 - 语音服务默认 CPU（`ASR_DEVICE=cpu` / `TTS_DEVICE=cpu`），把显存留给图像与 LLM。

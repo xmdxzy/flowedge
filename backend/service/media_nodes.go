@@ -267,7 +267,7 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	useRef2VA := backend == "h3" && (len(refImgHint) > 0 || len(refAudHint) > 0)
 	var promptWarnings []string
 	if optimize {
-		releaseLang := e.enterSide(sideLanguage)
+		releaseLang := e.enterLanguageSide("")
 		var opt string
 		var oerr error
 		if useRef2VA {

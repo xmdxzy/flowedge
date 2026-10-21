@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,6 +31,9 @@ type vramArbiter struct {
 	// 扩散侧本来就没驻留时，换侧是空操作、不掏冷加载的钱。
 	// 只有 unloads 才对得上那 180 秒（实测冷加载 183s / 热生成 3s）。
 	unloads int
+	// coexists 因为「显存装得下」而免除的驱逐次数。
+	// 每命中一次 ≈ 省下一次 183s 冷加载。这是共存优化的直接收益计数。
+	coexists int
 }
 
 // 侧别常量
@@ -84,6 +88,69 @@ func nodeSide(nodeType string) string {
 // sideOrder 重任务组的执行顺序：扩散（最重、冷启动最贵）→ 语言 → 语音。
 // 固定顺序而非按数量排序：避免每次运行顺序漂移，行为可预期才敢无人值守。
 var sideOrder = []string{sideDiffusion, sideLanguage, sideAudio}
+
+const (
+	// vramCoexistMargin 共存判断的安全余量。
+	// 模型磁盘体积只是显存占用的下界（KV cache 随上下文长度增长），
+	// 判断错的代价是把已经驻留的扩散模型挤出去 → 下次出图重新加载 183 秒，
+	// 比多加载一次更糟。所以宁可多留，不可少留。
+	vramCoexistMargin = 1.30
+	// vramCoexistFloorMB 硬性留白：CUDA 上下文、显存碎片、桌面/其他进程占用
+	vramCoexistFloorMB = 1024
+)
+
+// canCoexistWithLanguage 判断「能否不卸载扩散模型就让语言模型进来」。
+//
+// 由来（2026-10-21 实测）：卸载后重新加载 flux 要 183.3s，而生成只要 3.0s。
+// 也就是说每次不必要的驱逐白烧约 180 秒。但 AGENTS §2「同一时刻只让一侧驻留」
+// 是为 17GB 的 flux + 9GB 的 14B 准备的——**小模型其实装得下**
+// （flux 17GB + VLM 6GB ≈ 23GB，24G 卡放得开），这类组合不该白白卸载。
+//
+// 判定纪律：任何一项信息拿不到就返回 false（保守卸载）。
+// 「不确定」绝不等于「应该可以」——这条踩过太多次。
+func (e *EngineV2) canCoexistWithLanguage(model string) bool {
+	if e.vramCoexistOff || e.llm == nil || e.t2i == nil {
+		return false
+	}
+	if strings.TrimSpace(model) == "" {
+		model = e.llm.Model
+	}
+	sizeMB := e.llm.ModelSizeMB(model)
+	if sizeMB <= 0 {
+		return false // 查不到模型体积：不动
+	}
+	freeMB, err := e.t2i.FreeVRAMMB()
+	if err != nil || freeMB <= 0 {
+		return false // 查不到真实空闲显存：不动
+	}
+	need := int(float64(sizeMB)*vramCoexistMargin) + vramCoexistFloorMB
+	return freeMB > need
+}
+
+// enterLanguageSide 进入语言侧；装得下就与扩散模型共存，不卸载。
+//
+// 与 enterSide(sideLanguage) 的唯一区别就是这一次判断：
+//   - 装得下 → 不卸载（省一次 183s 冷加载），计 coexists
+//   - 装不下 → 卸载（原行为），计 unloads
+//   - 拿不到信息 → 按装不下处理（保守）
+//
+// model 为空时用服务默认模型。
+func (e *EngineV2) enterLanguageSide(model string) func() {
+	a := e.arbiter()
+	a.heavyMu.Lock()
+	if a.lastSide != "" && a.lastSide != sideLanguage {
+		a.switches++
+	}
+	if a.lastSide != sideLanguage {
+		if e.canCoexistWithLanguage(model) {
+			a.coexists++ // 省下的一次驱逐，对应约 183s
+		} else if e.releaseDiffusionAndWait() {
+			a.unloads++
+		}
+		a.lastSide = sideLanguage
+	}
+	return a.heavyMu.Unlock
+}
 
 // enterSide 进入某一侧重任务：串行化 + 换侧时卸载另一侧
 func (e *EngineV2) enterSide(side string) func() {

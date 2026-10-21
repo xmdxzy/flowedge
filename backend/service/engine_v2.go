@@ -171,6 +171,9 @@ type EngineV2 struct {
 	nodeSides map[string]string // 自定义节点声明的显存侧别（插件入口）
 	memo      *llmMemo          // 确定性 LLM 调用备忘（翻译 / 优化 / 拆解）
 	memoMu    sync.Mutex
+	// 显存共存优化开关：true = 关闭（退回「换侧必卸载」的保守行为）。
+	// 零值 false 表示开启——只有「显存确实装得下」时才会真的省掉卸载。
+	vramCoexistOff bool
 	// 侧别感知调度的逃生阀门：false（零值）= 开启分组调度。
 	// 置 true 时退回「所有重任务一次性起飞」的旧行为，便于对照测量或排障。
 	sideAwareOff bool
@@ -201,6 +204,25 @@ func (e *EngineV2) SetMaxParallel(n int) {
 //  2. 逃生——万一调度分组在某张图上引入问题，能立刻退回原路径。
 func (e *EngineV2) SetSideAwareScheduling(enabled bool) {
 	e.sideAwareOff = !enabled
+}
+
+// SetVRAMCoexist 开关「显存装得下就让两侧共存」。
+//
+// 默认开启：只有实测空闲显存足够（模型体积 ×1.3 + 1GB 留白）才会跳过卸载，
+// 否则照旧卸载。万一某台机器上判断偏乐观导致 OOM，把它关掉即回到
+// 「换侧必卸载」的旧行为，不需要回滚代码。
+func (e *EngineV2) SetVRAMCoexist(enabled bool) {
+	e.vramCoexistOff = !enabled
+}
+
+// CoexistCount 因显存装得下而免除的驱逐次数（每命中一次约等于省 183s）。
+func (e *EngineV2) CoexistCount() int {
+	e.vramMu.Lock()
+	defer e.vramMu.Unlock()
+	if e.vram == nil {
+		return 0
+	}
+	return e.vram.coexists
 }
 
 // SideSwitchCount 本引擎实例累计的逻辑换侧次数（诊断/对照测量用）。
@@ -1208,8 +1230,10 @@ func (e *EngineV2) execStartNode(node *model.NodeInstance, upstream map[string]i
 }
 
 func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	// LLM 与扩散模型共用 24GB：换侧时让扩散侧先释放
-	release := e.enterSide(sideLanguage)
+	// LLM 与扩散模型共用 24GB：显存真装得下就共存（省一次约 183s 冷加载），
+	// 装不下才让扩散侧释放。判定见 canCoexistWithLanguage。
+	llmModel, _ := node.Data["model"].(string)
+	release := e.enterLanguageSide(llmModel)
 	defer release()
 
 	// 节点级提示词 = 指令前缀；上游文本 = 输入主体。两者拼接，缺一不可丢

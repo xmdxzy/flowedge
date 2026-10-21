@@ -452,7 +452,7 @@ func (e *EngineV2) execSceneGridNode(ctx context.Context, node *model.NodeInstan
 		if e.llm == nil {
 			return nil, fmt.Errorf("LLM 服务不可用，无法从想法拆九宫格；请直接填 cells")
 		}
-		release := e.enterSide(sideLanguage)
+		release := e.enterLanguageSide("")
 		// 确定性调用（temperature=0）：同一句想法每次拆出同一套九宫格，
 		// 否则锁句会漂移，跨镜头一致性就失去基准。
 		out, err := e.deterministicChat(e.llm.Model, fmt.Sprintf("%s\n\n场景：%s", sceneGridInstruction, idea))
