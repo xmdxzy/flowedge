@@ -11,7 +11,17 @@ function Text2ImageNode({ data, selected }: NodeProps) {
     failed: 'bg-error',
   }[status] || 'bg-gray-500'
 
-  const image = data.image as string
+  // 产物在 data.output 里（运行结束后由 App 写回），旧代码读的是 data.image，
+  // 导致"跑完了节点上不显示缩略"。两种位置都认，兼容历史数据。
+  const out = data.output as Record<string, any> | undefined
+  const image = (out?.image as string) || (data.image as string)
+
+  // 头部右侧原来硬编码 "SDXL"：引擎默认权重是 flux-schnell，这个标签是错的
+  // （与之前"涡轮 LoRA 8 步"同类的 UI 落后于实现）。改成显示真实生效的尺寸与张数。
+  const w = Number(data.width ?? 1024)
+  const h = Number(data.height ?? 1024)
+  const batch = Number(data.batch ?? 1)
+  const spec = `${w}×${h}${batch > 1 ? ` · ${batch}张` : ''}`
 
   return (
     <div
@@ -25,7 +35,7 @@ function Text2ImageNode({ data, selected }: NodeProps) {
         <div className={`w-2 h-2 rounded-full ${statusColor}`} />
         <span className="fe-node-icon">◈</span>
         <span className="text-xs font-semibold text-white">文生图</span>
-        <span className="ml-auto text-[10px] text-gray-500 font-mono">SDXL</span>
+        <span className="ml-auto text-[10px] text-gray-500 font-mono">{spec}</span>
       </div>
 
       {/* 内容 */}
