@@ -9,10 +9,10 @@ import (
 // CJK 检测：中文/日文假名/韩文算，纯英文不算
 func TestHasCJK(t *testing.T) {
 	cases := map[string]bool{
-		"雪山顶的白鹿":            true,
+		"雪山顶的白鹿":                 true,
 		"a deer on a snowy peak": false,
-		"猫と犬":                  true, // 日文假名
-		"한국어":                   true, // 韩文
+		"猫と犬":                    true, // 日文假名
+		"한국어":                    true, // 韩文
 		"":                       false,
 		"1080p, cinematic, 4k":   false,
 		"混合 mixed 中english":      true,

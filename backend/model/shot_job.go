@@ -14,13 +14,13 @@ import "time"
 //   - 复用判据是 PromptHash：改了某镜提示词，只有那一镜会重生成
 //   - 节点字段 reroll 可强制指定镜号重拍
 type ShotJob struct {
-	ID        uint `gorm:"primaryKey"`
-	RunID     uint `gorm:"index:idx_shot_lookup,priority:1"`
-	NodeID    string `gorm:"index:idx_shot_lookup,priority:2;size:64"`
-	ShotIndex int    `gorm:"index:idx_shot_lookup,priority:3"`
+	ID         uint   `gorm:"primaryKey"`
+	RunID      uint   `gorm:"index:idx_shot_lookup,priority:1"`
+	NodeID     string `gorm:"index:idx_shot_lookup,priority:2;size:64"`
+	ShotIndex  int    `gorm:"index:idx_shot_lookup,priority:3"`
 	PromptHash string `gorm:"index:idx_shot_lookup,priority:4;size:64"`
 
-	ShotID     int `json:"shot_id"`
+	ShotID     int    `json:"shot_id"`
 	Prompt     string `gorm:"type:text"`
 	File       string
 	Frames     int
@@ -28,9 +28,9 @@ type ShotJob struct {
 	Transition string `gorm:"size:24"`
 	Seed       int
 	// Status: running / success / failed
-	Status  string `gorm:"size:16;index"`
-	Error   string `gorm:"type:text"`
-	Note    string `gorm:"type:text"`
+	Status    string `gorm:"size:16;index"`
+	Error     string `gorm:"type:text"`
+	Note      string `gorm:"type:text"`
 	ElapsedMS int64
 	// VramPeakMB 留给后续显存采样接入（AGENTS §2：显存改动必须实测峰值）
 	VramPeakMB int64

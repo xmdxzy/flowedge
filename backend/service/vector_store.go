@@ -15,10 +15,10 @@ import (
 
 // VectorRecord 向量记录
 type VectorRecord struct {
-	ID        string    `json:"id"`
-	Content   string    `json:"content"`
-	Source    string    `json:"source"`
-	Embedding []float64 `json:"embedding"`
+	ID        string                 `json:"id"`
+	Content   string                 `json:"content"`
+	Source    string                 `json:"source"`
+	Embedding []float64              `json:"embedding"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -51,9 +51,9 @@ func (s *VectorStore) AddBatch(records []VectorRecord) ([]string, error) {
 
 // VectorStore 内存向量存储
 type VectorStore struct {
-	records  []VectorRecord
-	dataDir  string
-	mu       sync.RWMutex
+	records []VectorRecord
+	dataDir string
+	mu      sync.RWMutex
 }
 
 func NewVectorStore(dataDir string) *VectorStore {

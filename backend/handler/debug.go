@@ -17,8 +17,9 @@ import (
 // DebugHandler 单步调试与断点续跑
 //
 // 协议：
-//   POST /api/runs/:runId/step      执行「下一个节点」后停在它之后
-//   POST /api/runs/:runId/continue  一直跑到结束，或撞上下一个断点
+//
+//	POST /api/runs/:runId/step      执行「下一个节点」后停在它之后
+//	POST /api/runs/:runId/continue  一直跑到结束，或撞上下一个断点
 //
 // 两者都是异步的（节点可能跑几分钟，不能被 HTTP 超时打断），
 // 前端靠轮询 GET /api/runs/:runId 拿到 paused_at / status=paused。

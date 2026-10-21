@@ -21,8 +21,8 @@ import (
 // incompatibleCheckpoint 已知与当前 ComfyUI 版本不兼容的 checkpoint 规则。
 // Match 为小写子串匹配；Reason 说根因；Remedy 说怎么办。
 type incompatibleCheckpoint struct {
-	Match   string
-	Reason  string
+	Match  string
+	Reason string
 	Remedy string
 }
 

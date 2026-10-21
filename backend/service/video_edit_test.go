@@ -1,20 +1,20 @@
 package service
 
 import (
-	"regexp"
-	"strconv"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 )
 
 // 装配是整条长片流水线的最后一环，出错会白烧十几分钟显卡。
 // 这里直接用 ffmpeg 造三段极短素材，跑真实的 assembleShots，锁住：
-//   1. 滤镜图能解析（历史上踩过 "[afin]" 多给输入、空滤镜两处错）
-//   2. 输出时长 ≈ 各段之和 − 重叠
-//   3. 音轨存在
+//  1. 滤镜图能解析（历史上踩过 "[afin]" 多给输入、空滤镜两处错）
+//  2. 输出时长 ≈ 各段之和 − 重叠
+//  3. 音轨存在
 func countVideoFrames(t *testing.T, path string) int {
 	t.Helper()
 	cmd := exec.Command("ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
@@ -127,8 +127,8 @@ func TestInspectMediaDetectsShortVideo(t *testing.T) {
 
 // 中置相消是「人声乱语」的第三道防线：把居中人声从信号里减掉，而不是调小音量。
 // 这里造一条「居中正弦 + 左右不同的宽声场」音频，验证：
-//   1. 居中成分确实被抵消（响度显著下降）
-//   2. 视频帧不受影响（-c:v copy，不能二次编码丢帧）
+//  1. 居中成分确实被抵消（响度显著下降）
+//  2. 视频帧不受影响（-c:v copy，不能二次编码丢帧）
 func TestStripSpeechCenter(t *testing.T) {
 	if _, err := exec.LookPath(ffmpegBin()); err != nil {
 		t.Skip("没有 ffmpeg")

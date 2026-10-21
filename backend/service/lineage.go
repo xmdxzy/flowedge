@@ -75,8 +75,8 @@ func lineageKind(field string) string {
 // 原样透传：如果按「输出里有 image 字段」判定，一件图会被记成 3-4 个节点产出的
 // 同一份文件，血缘直接变成自环（父=自己）。
 var mediaProducerTypes = map[string]bool{
-	"text2image":   true,
-	"tts":          true,
+	"text2image":    true,
+	"tts":           true,
 	"video_compose": true,
 }
 

@@ -112,8 +112,8 @@ func TestUsageOfEvents_Accumulates(t *testing.T) {
 	events := []model.RunEvent{
 		{Type: "node_finished", Data: []byte(`{"output":{"text":"a","_usage":{"prompt_tokens":10,"completion_tokens":20}}}`)},
 		{Type: "node_finished", Data: []byte(`{"output":{"text":"b","_usage":{"prompt_tokens":5,"completion_tokens":7}}}`)},
-		{Type: "node_started"},              // 不计入
-		{Type: "node_finished", Data: nil},  // 无 usage
+		{Type: "node_started"},                            // 不计入
+		{Type: "node_finished", Data: nil},                // 无 usage
 		{Type: "node_finished", Data: []byte(`not-json`)}, // 坏数据不得 panic
 	}
 

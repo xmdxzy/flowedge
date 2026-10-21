@@ -15,17 +15,19 @@ import (
 // 想把两路文本拼起来、把三张图的路径收成数组，此前只能写 code 节点手搓。
 //
 // 节点配置（全部可选）：
-//   mode        object（默认）| list | text | first | last
-//   field       取值字段，默认 text；设为 * 表示整个输出对象
-//   inputs      显式指定参与聚合的节点 ID，逗号分隔；不填则取全部上游
-//   separator   text 模式的连接符，默认空行
-//   include_empty 是否保留空值，默认 false
+//
+//	mode        object（默认）| list | text | first | last
+//	field       取值字段，默认 text；设为 * 表示整个输出对象
+//	inputs      显式指定参与聚合的节点 ID，逗号分隔；不填则取全部上游
+//	separator   text 模式的连接符，默认空行
+//	include_empty 是否保留空值，默认 false
 //
 // 输出：
-//   text        各路上游的文本按顺序连接
-//   count       实际聚合到几路
-//   values      各路取值组成的数组（mode=list 时最有用）
-//   nodes       {节点ID: 取值} 的映射（mode=object 时最有用）
+//
+//	text        各路上游的文本按顺序连接
+//	count       实际聚合到几路
+//	values      各路取值组成的数组（mode=list 时最有用）
+//	nodes       {节点ID: 取值} 的映射（mode=object 时最有用）
 func (e *EngineV2) execAggregateNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
 	mode, _ := node.Data["mode"].(string)
 	if mode == "" {

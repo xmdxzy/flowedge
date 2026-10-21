@@ -53,10 +53,10 @@ func TestVariables_ArrayIndexOutOfRange(t *testing.T) {
 func TestVariables_DotPathStillWorks(t *testing.T) {
 	ctx := map[string]interface{}{
 		"a": map[string]interface{}{
-			"text": "hello",
+			"text":   "hello",
 			"nested": map[string]interface{}{"deep": 42.0},
-			"code": 200.0,
-			"ok":   true,
+			"code":   200.0,
+			"ok":     true,
 		},
 	}
 	cases := []struct{ in, want string }{
@@ -64,7 +64,7 @@ func TestVariables_DotPathStillWorks(t *testing.T) {
 		{"{{a.nested.deep}}", "42"},
 		{"{{a.code}}", "200"},
 		{"{{a.ok}}", "true"},
-		{"{{input}}", "{{input}}"},     // 无点号占位符原样保留
+		{"{{input}}", "{{input}}"},         // 无点号占位符原样保留
 		{"{{a.missing}}", "{{a.missing}}"}, // 未知字段保留原文
 	}
 	for _, c := range cases {
@@ -91,9 +91,9 @@ func TestJsonPathTokens(t *testing.T) {
 // TestVariables_ResolveDataDeepCopy 深拷贝不得污染原定义，数组结构也要遍历
 func TestVariables_ResolveDataDeepCopy(t *testing.T) {
 	data := map[string]interface{}{
-		"url":     "http://x/{{p.sources[0]}}",
-		"list":    []interface{}{"{{p.text}}", "static"},
-		"nested":  map[string]interface{}{"k": "{{p.text}}"},
+		"url":    "http://x/{{p.sources[0]}}",
+		"list":   []interface{}{"{{p.text}}", "static"},
+		"nested": map[string]interface{}{"k": "{{p.text}}"},
 	}
 	ctx := map[string]interface{}{
 		"p": map[string]interface{}{

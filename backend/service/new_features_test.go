@@ -46,10 +46,10 @@ func TestAggregateNodeModes(t *testing.T) {
 func TestAggregateNodeExplicitInputsAndField(t *testing.T) {
 	e := &EngineV2{}
 	n := &model.NodeInstance{ID: "agg", Type: "aggregate", Data: map[string]interface{}{
-		"mode":       "list",
-		"inputs":     "b, a",
-		"field":      "image",
-		"separator":  "|",
+		"mode":          "list",
+		"inputs":        "b, a",
+		"field":         "image",
+		"separator":     "|",
 		"include_empty": true,
 	}}
 	upstream := map[string]interface{}{

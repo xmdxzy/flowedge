@@ -15,11 +15,11 @@ import (
 // 单机单 GPU 场景下并发上限默认 2 —— 两个 flux 并行只会互相抢显存。
 // 若需要水平扩容，应换外部 broker（Redis/NATS），本实现不做分布式承诺。
 type JobQueue struct {
-	db      *gorm.DB
-	sem     chan struct{}
-	wg      sync.WaitGroup
-	mu      sync.Mutex
-	closed  bool
+	db     *gorm.DB
+	sem    chan struct{}
+	wg     sync.WaitGroup
+	mu     sync.Mutex
+	closed bool
 }
 
 func NewJobQueue(db *gorm.DB, maxConcurrent int) *JobQueue {
