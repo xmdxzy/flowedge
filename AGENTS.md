@@ -711,6 +711,27 @@ curl -s -X POST http://127.0.0.1:30000/api/flowedge/run \
 它们各自只有一处，不构成"改 N 个文件"的问题；`handler/estimate.go` 的类型分支同理（3 处）。
 若这三处将来各自长出第二份副本，再收进 `NodeSpec`。
 
+## 5.14 后期链三个会静默出错的坑（2026-10-21 实测）
+
+涉及 `post_production` / `subtitles` / `video_edit.go` 的所有 ffmpeg 拼接。
+
+1. **`amix` 默认 `normalize=1` 会把你混进去的音轨压到听不见。**
+   它是按输入路数做归一化，两路各 -6dB；再叠侧链压缩，BGM 只剩 -34dB，
+   而时长、流列表、音量检测「有音频」全部正常。
+   **混音一律 `normalize=0`**，音量自己用 `volume=` 控制。
+2. **`duck=false` 时不能保留 `asplit`。** 旁路输出没人消费 → ffmpeg 直接失败：
+   `Filter asplit has an unconnected output`（退出码 -22）。
+   开关型滤镜必须让图上**每个标签都有人消费**，分支要真的分支。
+3. **路径不许进滤镜字符串。** `subtitles=C://...`、`fontfile=D:/...` 这类写法会被
+   盘符冒号与中文路径打爆。做法固定为：**临时目录 + `cmd.Dir` + 裸文件名**。
+
+判定纪律补一条：**「有音轨」不等于「听得见」**。
+验收混音要看**目标频段能量**（如 BGM 是 660Hz 就测 `bandpass=f=660:w=30` 的 mean_volume），
+宽带 `volumedetect` 会被 AAC 底噪和主音轨泄漏污染，做出「没变化」的假结论。
+
+同理「侧链开了」不等于「侧链起作用」：必须 **duck on/off 各渲一次** 比目标频段，
+差值 <3dB 就等于没做。参数（threshold/ratio）要扫，不要拍。
+
 ## 6. 已知不可用（别重复投入）
 
 | 项 | 状态 | 原因 |

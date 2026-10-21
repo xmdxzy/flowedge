@@ -44,6 +44,8 @@ export const PALETTE: PaletteSection[] = [
       { type: 'video_compose', label: '视频合成', icon: '▤', tone: 'tone-purple' },
       // 字幕是短视频交付的准入门槛：成片 + 台词 → 硬字幕（另存 .srt 便于复查）
       { type: 'subtitles', label: '字幕烧录', icon: '⌶', tone: 'tone-multimodal' },
+      // 竖屏重构 / BGM 闪避 / 字幕三件一起做只重编码一次（分三个节点会掉三轮画质）
+      { type: 'post_production', label: '后期包装', icon: '⛭', tone: 'tone-purple' },
     ],
   },
   {
@@ -122,6 +124,7 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   ],
   quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
   subtitles: ['video', 'srt', 'lines', 'source'],
+  post_production: ['video', 'aspect', 'width', 'height', 'bgm', 'duck', 'srt', 'lines', 'source'],
   comfy_workflow: ['files', 'count', 'image', 'images', 'video', 'videos', 'bindings_used'],
 }
 
@@ -151,6 +154,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   shotlist: 'comfy', // 分镜执行：H3 或 Wan 任一实例
   quality_gate: 'video', // 质检需要 ffmpeg/ffprobe
   subtitles: 'video', // 烧字幕只需要 ffmpeg（带 libass）
+  post_production: 'video', // 竖屏/BGM/字幕都走 ffmpeg
 }
 
 // 能力键 → 人话（标灰时的提示文案，避免把 'image' / 'comfy' 这种键名直接甩给用户）

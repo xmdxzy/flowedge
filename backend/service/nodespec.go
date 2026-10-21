@@ -89,8 +89,10 @@ var NodeSpecs = map[string]NodeSpec{
 	// ---- 后期 ----
 	"video_compose": {Type: "video_compose", Media: true},
 	// 字幕烧录吃 CPU（ffmpeg + libass），不占显存，产物是新的 mp4
-	"subtitles":    {Type: "subtitles", Media: true},
-	"quality_gate": {Type: "quality_gate"},
+	"subtitles": {Type: "subtitles", Media: true},
+	// 后期包装同样吃 CPU；竖屏(模糊垫底)+BGM+字幕一次重编码，可能跑几十秒
+	"post_production": {Type: "post_production", Media: true},
+	"quality_gate":    {Type: "quality_gate"},
 }
 
 // NodeSpecOf 查节点元数据。未登记的类型返回零值 + false，

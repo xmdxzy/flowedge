@@ -100,6 +100,7 @@ const nodeTypes: NodeTypes = {
   upscale: EditNode,
   text2video: EditNode,
   subtitles: EditNode,
+  post_production: EditNode,
   note: NoteNode,
   group: GroupNode,
 }
@@ -2241,6 +2242,97 @@ function FlowEditor() {
               </div>
             )}
 
+            {selectedNode.type === 'post_production' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">视频路径（留空取上游 video）</label>
+                  <input
+                    value={(selectedNode.data.video_path as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('video_path', e.target.value)}
+                    placeholder="留空则用上游连线的成片"
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">构图</label>
+                    <select
+                      value={(selectedNode.data.aspect as string) || '9:16'}
+                      onChange={(e) => updateSelectedNodeData('aspect', e.target.value)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    >
+                      <option value="9:16">9:16 竖屏</option>
+                      <option value="1:1">1:1 方形</option>
+                      <option value="16:9">16:9 横屏</option>
+                      <option value="keep">保持原构图</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">填充方式</label>
+                    <select
+                      value={(selectedNode.data.fit as string) || 'blur'}
+                      onChange={(e) => updateSelectedNodeData('fit', e.target.value)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    >
+                      <option value="blur">模糊垫底</option>
+                      <option value="crop">中心裁切</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">背景音乐（留空不混）</label>
+                  <input
+                    value={(selectedNode.data.bgm as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('bgm', e.target.value)}
+                    placeholder="data/bgm/xxx.mp3（短于成片会自动循环）"
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2 items-end">
+                  <div>
+                    <label className="text-[10px] text-gray-500 block mb-1">BGM 增益 dB</label>
+                    <input
+                      type="number"
+                      value={Number(selectedNode.data.bgm_gain ?? -12)}
+                      onChange={(e) => updateSelectedNodeData('bgm_gain', Number(e.target.value) || 0)}
+                      className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                    />
+                  </div>
+                  <label className="flex items-center gap-2 text-[11px] text-gray-400 pb-1">
+                    <input
+                      type="checkbox"
+                      checked={selectedNode.data.duck !== false}
+                      onChange={(e) => updateSelectedNodeData('duck', e.target.checked)}
+                    />
+                    人声出现时压低 BGM
+                  </label>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">字幕（可选：.srt 路径）</label>
+                  <input
+                    value={(selectedNode.data.srt_path as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('srt_path', e.target.value)}
+                    placeholder="留空可从分镜表/逐行台词生成"
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">逐行台词（可选，一行一句）</label>
+                  <textarea
+                    rows={3}
+                    value={(selectedNode.data.dialogues as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('dialogues', e.target.value)}
+                    placeholder="没有分镜表时按成片总时长均分"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] resize-y"
+                  />
+                </div>
+                <p className="text-[11px] text-gray-500 leading-relaxed">
+                  竖屏 / BGM / 字幕在同一次重编码里完成——分三个节点做会掉三轮画质。
+                  只想烧字幕用「字幕烧录」节点更轻。
+                </p>
+              </div>
+            )}
+
             {selectedNode.type === 'subtitles' && (
               <div className="flex flex-col gap-3">
                 <div>
@@ -3117,6 +3209,13 @@ function getDefaultNodeData(type: string): Record<string, any> {
     case 'subtitles':
       // 三个来源按优先级：现成 srt → 分镜表 → 逐行台词（均分）
       return { video_path: '', srt_path: '', plan: '', dialogues: '', font_size: 20, margin_v: 28 }
+    case 'post_production':
+      // 竖屏默认 9:16 + 模糊垫底（横屏改竖屏不丢内容）；BGM 留空则不混
+      return {
+        aspect: '9:16', fit: 'blur', video_path: '',
+        bgm: '', bgm_gain: -12, duck: true,
+        srt_path: '', plan: '', dialogues: '', font_size: 20, margin_v: 28,
+      }
     case 'comfy_workflow':
       // workflow 存字符串（后端同时接受字符串与对象）；bindings 在面板里用
       // 「path=value」逐行编辑，避免用户正在敲 JSON 时被中间态打断。
