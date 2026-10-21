@@ -2,29 +2,32 @@ package service
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 
 	"flowedge/backend/model"
 )
 
-// TestNodeRegistry_HasAllBuiltins 注册表必须包含全部内置类型
+// TestNodeRegistry_HasAllBuiltins 注册表必须包含全部内置类型。
+//
+// 断言改为与 NodeSpecs（元数据单一来源）对账，不再手抄一份类型清单：
+// 以前每加一个节点都要来这里补一行，忘补就红——这个测试本该守漂移，
+// 结果自己成了另一处需要维护的清单。
 func TestNodeRegistry_HasAllBuiltins(t *testing.T) {
 	eng := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	types := eng.NodeTypes()
-	want := []string{
-		"aggregate", "asr", "code", "comfy_workflow", "data_transform", "end",
-		"http_request", "if_else", "image2image", "inpaint", "llm", "loop", "prompt_opt",
-		"quality_gate", "rag_query", "scene_grid", "select", "shotlist", "start",
-		"storyboard", "sub_workflow", "text2image", "text2video", "tts", "upscale",
-		"video_compose", "vision",
+	specs := NodeSpecTypes()
+	sort.Strings(specs)
+	if len(specs) < 28 {
+		t.Fatalf("NodeSpecs 只有 %d 类，疑似被误删", len(specs))
 	}
-	if len(types) != len(want) {
-		t.Fatalf("registered %d types, want %d: %v", len(types), len(want), types)
+	if len(types) != len(specs) {
+		t.Fatalf("注册表 %d 类，NodeSpecs %d 类，两者必须一致：%v vs %v", len(types), len(specs), types, specs)
 	}
-	for i, w := range want {
-		if types[i] != w {
-			t.Fatalf("index %d got %q want %q (list=%v)", i, types[i], w, types)
+	for i := range specs {
+		if types[i] != specs[i] {
+			t.Fatalf("index %d 注册表 %q，NodeSpecs %q", i, types[i], specs[i])
 		}
 	}
 }

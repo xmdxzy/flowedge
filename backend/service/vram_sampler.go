@@ -106,12 +106,8 @@ func profileKindForNode(nodeType string) string {
 
 // isHeavyNode 需要局部采样的节点（显存密集，且执行时长通常 > 1s）
 func isHeavyNode(nodeType string) bool {
-	switch nodeType {
-	case "text2image", "image2image", "inpaint", "upscale", "text2video",
-		"comfy_workflow", "shotlist":
-		return true
-	}
-	return false
+	s, ok := NodeSpecs[nodeType]
+	return ok && s.Heavy
 }
 
 // recordProfile 把一次实测写进档案。

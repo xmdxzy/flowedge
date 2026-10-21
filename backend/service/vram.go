@@ -71,17 +71,11 @@ func (e *EngineV2) arbiter() *vramArbiter {
 // 否则调度器会把重任务误判成轻任务、按无限并发起飞（24GB 上直接 OOM）。
 // TestNodeSideMappingRegression 会用源码扫描盯住这个对应关系。
 func nodeSide(nodeType string) string {
-	switch nodeType {
-	// 扩散侧：ComfyUI（flux / qwen-image / wan / H3）
-	case "text2image", "image2image", "inpaint", "upscale", "shotlist":
-		return sideDiffusion
-	// 语言侧：Ollama。text2video 归此（先优化再生成，见上）
-	case "llm", "vision", "prompt_opt", "scene_grid", "select", "storyboard", "text2video":
-		return sideLanguage
-	// 语音侧：faster-whisper / Kokoro（CPU 为主，但与扩散权重抢内存带宽）
-	case "asr", "tts":
-		return sideAudio
+	if s, ok := NodeSpecs[nodeType]; ok {
+		return s.Side
 	}
+	// 未登记的类型按"不吃显存"处理，与旧行为一致。
+	// 会加载大模型的自定义节点必须用 RegisterNodeTypeWithSide 声明，不能指望这里猜。
 	return ""
 }
 

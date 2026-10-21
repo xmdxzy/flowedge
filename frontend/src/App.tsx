@@ -99,6 +99,7 @@ const nodeTypes: NodeTypes = {
   inpaint: EditNode,
   upscale: EditNode,
   text2video: EditNode,
+  subtitles: EditNode,
   note: NoteNode,
   group: GroupNode,
 }
@@ -2240,6 +2241,66 @@ function FlowEditor() {
               </div>
             )}
 
+            {selectedNode.type === 'subtitles' && (
+              <div className="flex flex-col gap-3">
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">视频路径（留空取上游 video）</label>
+                  <input
+                    value={(selectedNode.data.video_path as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('video_path', e.target.value)}
+                    placeholder="留空则用上游连线的成片"
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">现成字幕（.srt，填了优先用它）</label>
+                  <input
+                    value={(selectedNode.data.srt_path as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('srt_path', e.target.value)}
+                    placeholder="data/generated/xxx.srt"
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">分镜表 JSON（可选，留空取上游 plan）</label>
+                  <textarea
+                    rows={4}
+                    value={(selectedNode.data.plan as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('plan', e.target.value)}
+                    placeholder='{"shots":[{"seconds":5,"dialogue":"少女：原话"}]}'
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] font-mono resize-y"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">逐行台词（可选，没有分镜表时按总时长均分）</label>
+                  <textarea
+                    rows={4}
+                    value={(selectedNode.data.dialogues as string) || ''}
+                    onChange={(e) => updateSelectedNodeData('dialogues', e.target.value)}
+                    placeholder="一行一句"
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[10px] resize-y"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {([['font_size', '字号'], ['margin_v', '距底边']] as const).map(([k, label]) => (
+                    <div key={k}>
+                      <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                      <input
+                        type="number"
+                        value={Number(selectedNode.data[k] ?? 0)}
+                        onChange={(e) => updateSelectedNodeData(k, Number(e.target.value) || 0)}
+                        className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-gray-500 leading-relaxed">
+                  优先级：.srt 文件 → 分镜表 → 逐行台词。分镜台词按「身份：原话」写，字幕只显示原话；
+                  每镜时长取自 seconds（无则按帧数/24fps）。产物旁边会留一份 .srt 便于复查。
+                </p>
+              </div>
+            )}
+
             {selectedNode.type === 'shotlist' && (
               <div className="flex flex-col gap-3">
                 <div>
@@ -3053,6 +3114,9 @@ function getDefaultNodeData(type: string): Record<string, any> {
       return { text: '' }
     case 'group':
       return { label: '分组' }
+    case 'subtitles':
+      // 三个来源按优先级：现成 srt → 分镜表 → 逐行台词（均分）
+      return { video_path: '', srt_path: '', plan: '', dialogues: '', font_size: 20, margin_v: 28 }
     case 'comfy_workflow':
       // workflow 存字符串（后端同时接受字符串与对象）；bindings 在面板里用
       // 「path=value」逐行编辑，避免用户正在敲 JSON 时被中间态打断。

@@ -69,15 +69,28 @@ func lineageKind(field string) string {
 	}
 }
 
-// mediaProducerTypes 真正「产出」媒体文件的节点类型。
-//
-// 只认这几类，是因为 end / start / sub_workflow / aggregate 等节点会把上游输出
-// 原样透传：如果按「输出里有 image 字段」判定，一件图会被记成 3-4 个节点产出的
-// 同一份文件，血缘直接变成自环（父=自己）。
-var mediaProducerTypes = map[string]bool{
-	"text2image":    true,
-	"tts":           true,
-	"video_compose": true,
+// passthroughOfUpstream：白名单也可能写错（新节点把上游文件原样返回）。
+// 这里加一道结构判断——如果本节点产出的媒体文件名全部已出现在上游生产者的产出里，
+// 说明它没造新文件，只是搬运，不该覆盖真正的生产者记录。
+func passthroughOfUpstream(media map[string]string, preds []string, outputs map[string]interface{}, types map[string]string) bool {
+	upstream := map[string]bool{}
+	for _, pid := range preds {
+		if !mediaProducerTypes[types[pid]] {
+			continue
+		}
+		for _, p := range mediaOutputs(outputs[pid]) {
+			upstream[filepath.Base(p)] = true
+		}
+	}
+	if len(upstream) == 0 {
+		return false
+	}
+	for _, p := range media {
+		if !upstream[filepath.Base(p)] {
+			return false
+		}
+	}
+	return true
 }
 
 // RecordRun 在一次运行结束后落库血缘（幂等：同名产物覆盖更新）
@@ -105,6 +118,9 @@ func (s *LineageStore) RecordRun(workflowID, runID uint, nodes []model.NodeInsta
 		}
 		media := mediaOutputs(n.Output)
 		if len(media) == 0 {
+			continue
+		}
+		if passthroughOfUpstream(media, preds[n.ID], outputs, types) {
 			continue
 		}
 		// 直接上游里「真正产出媒体」的节点才算父节点（跳过透传节点）

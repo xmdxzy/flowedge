@@ -677,6 +677,40 @@ curl -s -X POST http://127.0.0.1:30000/api/flowedge/run \
 **本机 go 可用**（`%LOCALAPPDATA%\Programs\Go\bin\go.exe`，1.22.10，不在 PATH）：
 改后端后 `python scripts/build-windows.py --skip-ui` → 停旧 compute → 覆盖 `运行\FlowEdge.exe` → `node scripts/start-flowedge.cjs`。
 
+## 5.13 加节点只改两处（2026-10-21 结构收口后生效）
+
+背景：`docs/系统评估-2026-10-21.md` 实测「同一节点类型字符串出现在 7–13 个文件」，
+加一个节点要逐处改 switch，编译器全程不报错。现在判定类元数据已收进
+`backend/service/nodespec.go` 的 `NodeSpecs`。
+
+**要做的两件事**
+
+1. 在 `registerBuiltinNodes`（`engine_v2.go`）注册执行体；
+2. 在 `NodeSpecs`（`nodespec.go`）登记 `Side / Heavy / Media / Timeout / MaxTimeout`。
+
+前端再补 4 处配置（`config/graph.ts` 的 `PALETTE`、`NODE_OUTPUT_FIELDS`、`NODE_REQUIRES`，
+`App.tsx` 的 `nodeTypes` 与 `defaultNodeData`），属性面板按需加一个区块。
+
+**为什么必须两处都改**
+
+- 漏 `NodeSpecs` → `TestNodeSpecsCoverRegisteredTypes` 直接红。
+  运行期后果是调度器把它当"不吃显存"，和重任务一起并发起飞 → 24GB 卡 OOM。
+- `Media` 决定有没有血缘，`Heavy` 决定采不采显存峰值，`Side` 决定侧别感知调度。
+  这三项漏一个都不会报错，只会在真机上偶发——所以宁可让测试红。
+
+**不许再新增第三份名单**
+
+- 侧别、重节点、血缘、超时**不许**再写 switch/map；要加维度就加到 `NodeSpec` 里。
+- `TestNodeRegistry_HasAllBuiltins` 现在与 `NodeSpecTypes()` 对账，不再手抄类型清单——
+  手抄清单本身就是一处会忘的维护点。
+
+**故意没进 NodeSpecs 的两类**
+
+- 参数校验（`nodeparams.go`）：每条校验带人话修复建议，是逻辑不是数据；
+- 依赖预检（`preflight.go`）：要区分 h3 / 主实例 / CPU 服务，且要产出「一键修」动作。
+它们各自只有一处，不构成"改 N 个文件"的问题；`handler/estimate.go` 的类型分支同理（3 处）。
+若这三处将来各自长出第二份副本，再收进 `NodeSpec`。
+
 ## 6. 已知不可用（别重复投入）
 
 | 项 | 状态 | 原因 |

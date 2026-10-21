@@ -42,6 +42,8 @@ export const PALETTE: PaletteSection[] = [
       { type: 'storyboard', label: '分镜规划', icon: '⊞', tone: 'tone-ai' },
       { type: 'shotlist', label: '分镜执行', icon: '⊙', tone: 'tone-purple' },
       { type: 'video_compose', label: '视频合成', icon: '▤', tone: 'tone-purple' },
+      // 字幕是短视频交付的准入门槛：成片 + 台词 → 硬字幕（另存 .srt 便于复查）
+      { type: 'subtitles', label: '字幕烧录', icon: '⌶', tone: 'tone-multimodal' },
     ],
   },
   {
@@ -119,6 +121,7 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
     'degraded', 'degrade_level', 'degrade_note', // P3 显存降级留痕
   ],
   quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
+  subtitles: ['video', 'srt', 'lines', 'source'],
   comfy_workflow: ['files', 'count', 'image', 'images', 'video', 'videos', 'bindings_used'],
 }
 
@@ -147,6 +150,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   text2video: 'comfy',
   shotlist: 'comfy', // 分镜执行：H3 或 Wan 任一实例
   quality_gate: 'video', // 质检需要 ffmpeg/ffprobe
+  subtitles: 'video', // 烧字幕只需要 ffmpeg（带 libass）
 }
 
 // 能力键 → 人话（标灰时的提示文案，避免把 'image' / 'comfy' 这种键名直接甩给用户）
