@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from './Toast'
 import { hintFor } from '../lib/errorHints'
+import ShotReroll from './ShotReroll'
 
 interface RunRecord {
   id: number
@@ -233,8 +234,23 @@ export default function ExecutionPanel({ workflowId }: { workflowId?: number }) 
             )}
           </div>
 
-          {/* 右侧：节点耗时 + 事件流 */}
+          {/* 右侧：镜头 / 节点耗时 / 事件流 */}
           <div className="flex-1 flex flex-col overflow-hidden">
+            {/* 镜头级重跑：8 镜出片时「第 3 镜废了」是最痛的点，
+                后端早就支持只重拍一镜，以前界面上没有任何入口 */}
+            {selectedRun && (
+              <div className="px-3 pt-2">
+                <ShotReroll
+                  runId={selectedRun.id}
+                  runStatus={selectedRun.status}
+                  onRerolled={() => {
+                    loadRuns()
+                    openRun(selectedRun)
+                  }}
+                />
+              </div>
+            )}
+
             {/* 节点耗时瀑布图 */}
             <div className="flex-1 overflow-y-auto px-3 py-2 min-h-0">
               {!selectedRun ? (

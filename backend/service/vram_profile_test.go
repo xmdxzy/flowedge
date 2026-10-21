@@ -130,6 +130,28 @@ func TestProfileStore_SaveRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPredict_BasisOmitsZeroParams 出图节点没有帧数/步数，依据里不该出现「0 帧 / 0 步」——
+// 那看起来像数据缺失，而不是「该节点没有这个参数」。
+func TestPredict_BasisOmitsZeroParams(t *testing.T) {
+	s := LoadProfileStore("", 24576)
+	s.Record(VRAMProfile{Kind: "image", Width: 512, Height: 512, PeakMB: 18050, WallMS: 46000, Samples: 3})
+	p := s.Predict("image", "", 512, 512, 0, 0)
+	if strings.Contains(p.Basis, "0 帧") || strings.Contains(p.Basis, "0 步") {
+		t.Errorf("zero params must be omitted: %s", p.Basis)
+	}
+	if !strings.Contains(p.Basis, "512x512") {
+		t.Errorf("dims must be present: %s", p.Basis)
+	}
+	// 有帧数/步数时要显示
+	p2 := s.Predict("h3", "", 608, 352, 124, 20)
+	_ = p2
+	s.Record(VRAMProfile{Kind: "h3", Width: 608, Height: 352, Frames: 124, Steps: 20, PeakMB: 21800, WallMS: 120000, Samples: 3})
+	p3 := s.Predict("h3", "", 608, 352, 124, 20)
+	if !strings.Contains(p3.Basis, "124 帧") || !strings.Contains(p3.Basis, "20 步") {
+		t.Errorf("real params must be shown: %s", p3.Basis)
+	}
+}
+
 // TestWithin_Tolerance 容差判定的边界
 func TestWithin_Tolerance(t *testing.T) {
 	if !within(1000, 1055, 0.10) {

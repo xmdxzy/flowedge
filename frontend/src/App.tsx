@@ -36,7 +36,7 @@ import GroupNode from './nodes/GroupNode'
 import VisionNode from './nodes/VisionNode'
 import EditNode from './nodes/EditNode'
 import { type WorkflowTemplate } from './templates/workflowTemplates'
-import ToastHost, { toast } from './components/Toast'
+import ToastHost, { toast, confirmDialog } from './components/Toast'
 import ErrorNotice from './components/ErrorNotice'
 import {
   buildEntries,
@@ -59,6 +59,8 @@ import CapabilityPanel from './components/CapabilityPanel'
 import TriggerPanel from './components/TriggerPanel'
 import GalleryPanel from './components/GalleryPanel'
 import CredentialPanel from './components/CredentialPanel'
+import ConfigPanel from './components/ConfigPanel'
+import RunEstimate from './components/RunEstimate'
 import CommandPalette, { type CommandItem } from './components/CommandPalette'
 import KBPanel from './components/KBPanel'
 import {
@@ -141,6 +143,10 @@ function FlowEditor() {
   const [debugBusy, setDebugBusy] = useState(false)
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme())
   const [credOpen, setCredOpen] = useState(false)
+  const [configOpen, setConfigOpen] = useState(false)
+  // 估算结果里的「会不会撞墙」：由 RunEstimate 上报，运行前据此二次确认。
+  // 存 ref 而不是 state——runWorkflow 是闭包，读 state 会读到旧值。
+  const riskRef = useRef<{ risky: boolean; detail: string }>({ risky: false, detail: '' })
   const [lastRunId, setLastRunId] = useState<number | null>(null)
   const [canResume, setCanResume] = useState(false)
   const [kbOpen, setKbOpen] = useState(false)
@@ -685,6 +691,15 @@ function FlowEditor() {
   }, [])
 
   const runWorkflow = async () => {
+    // 估算显示会撞墙时先问一句：OOM 重跑的代价是几十秒到几分钟，
+    // 而用户往往只是忘了把分辨率从上次的大档改回来。
+    if (riskRef.current.risky) {
+      const go = await confirmDialog(
+        riskRef.current.detail || '预计峰值超过可用显存，大概率 OOM。仍要运行吗？',
+        { title: '显存可能不够', okText: '仍要运行', danger: true },
+      )
+      if (!go) return
+    }
     setIsRunning(true)
     setRunResult('')
     setPausedAt('')
@@ -1347,6 +1362,14 @@ function FlowEditor() {
                     >
                       凭据管理
                     </button>
+                    <button
+                      onClick={() => {
+                        setConfigOpen(true)
+                        setMoreOpen(false)
+                      }}
+                    >
+                      配置 · 模型 / 实例 / 接入
+                    </button>
                     <div className="mi-sep" />
                     <button
                       onClick={() => {
@@ -1436,6 +1459,13 @@ function FlowEditor() {
                 {liveProgress.etaMs > 0 ? ` · 预计 ${fmtDuration(liveProgress.etaMs)}` : ''}
               </span>
             )}
+
+            <RunEstimate
+              nodes={nodes}
+              onRiskChange={(risky, detail) => {
+                riskRef.current = { risky, detail }
+              }}
+            />
 
             <button
               onClick={runWorkflow}
@@ -1553,6 +1583,7 @@ function FlowEditor() {
 
       {/* 凭据管理 */}
       {credOpen && <CredentialPanel onClose={() => setCredOpen(false)} />}
+      {configOpen && <ConfigPanel onClose={() => setConfigOpen(false)} />}
 
       {/* 命令面板 */}
       {cmdOpen && <CommandPalette items={buildCommands()} onClose={() => setCmdOpen(false)} />}

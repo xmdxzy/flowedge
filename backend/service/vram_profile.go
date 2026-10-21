@@ -262,8 +262,7 @@ func (s *ProfileStore) Predict(kind, model string, width, height, frames, steps 
 			p.PeakUnderestimated = true
 			p.Confidence = "low"
 		}
-		p.Basis = fmt.Sprintf("同档位实测 %d 次（%dx%d / %d 帧 / %d 步）",
-			exact.Samples, exact.Width, exact.Height, exact.Frames, exact.Steps)
+		p.Basis = fmt.Sprintf("同档位实测 %d 次%s", exact.Samples, dimsText(exact.Width, exact.Height, exact.Frames, exact.Steps))
 		if exact.Source == "model_size" {
 			p.Basis += "；峰值由模型体积估算，非采样值"
 		}
@@ -278,8 +277,8 @@ func (s *ProfileStore) Predict(kind, model string, width, height, frames, steps 
 		p.Samples = nearest.Samples
 		p.Confidence = "low"
 		p.Extrapolated = true
-		p.Basis = fmt.Sprintf("无同档位样本；最近档位 %dx%d / %d 帧 / %d 步（%d 次实测）。**这是外推值，仅供量级参考**",
-			nearest.Width, nearest.Height, nearest.Frames, nearest.Steps, nearest.Samples)
+		p.Basis = fmt.Sprintf("无同档位样本；最近档位%s（%d 次实测）。**这是外推值，仅供量级参考**",
+			dimsText(nearest.Width, nearest.Height, nearest.Frames, nearest.Steps), nearest.Samples)
 	default:
 		return p
 	}
@@ -295,6 +294,27 @@ func (s *ProfileStore) Predict(kind, model string, width, height, frames, steps 
 		}
 	}
 	return p
+}
+
+// dimsText 拼「512x512 / 124 帧 / 20 步」。
+//
+// 为 0 的参数不显示——出图节点没有帧数和步数，全部照抄会得到
+// 「512x512 / 0 帧 / 0 步」，看着像数据缺失而不是「该节点没有这个参数」。
+func dimsText(w, h, frames, steps int) string {
+	var b strings.Builder
+	if w > 0 && h > 0 {
+		fmt.Fprintf(&b, "（%dx%d", w, h)
+	} else {
+		b.WriteString("（")
+	}
+	if frames > 0 {
+		fmt.Fprintf(&b, " / %d 帧", frames)
+	}
+	if steps > 0 {
+		fmt.Fprintf(&b, " / %d 步", steps)
+	}
+	b.WriteString("）")
+	return b.String()
 }
 
 // relDiff 相对差（任一方 <=0 时给一个较大的惩罚，避免把"未指定"当成最佳匹配）

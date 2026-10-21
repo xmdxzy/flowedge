@@ -581,6 +581,11 @@ func main() {
 		api.POST("/estimate", estHandler.Estimate)
 		api.GET("/vram/profiles", estHandler.ListProfiles)
 
+		// 对外接入配置生成（MCP 客户端配置 / OpenAI Base URL）：
+		// exe 绝对路径与端口只有引擎自己知道，让用户手拼必然填错
+		integHandler := handler.NewIntegrationHandler(baseDir, cfg.Port)
+		api.GET("/mcp/config", integHandler.MCPConfig)
+
 		// 触发器：Webhook（外部调用）+ Cron（定时）
 		api.GET("/workflows/:id/trigger", triggerHandler.Get)
 		api.PUT("/workflows/:id/trigger", triggerHandler.Update)
