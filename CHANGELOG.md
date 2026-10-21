@@ -270,6 +270,38 @@ date-based versioning (`vYYYY.MM.DD`).
 - 属性面板仍然只能人眼确认；本机截图通道不可用（见本文件 16:20 的记录）。
 - S3（`handler/workflow.go` 的 123 行编排逻辑）未动。
 
+### 续跑编排下沉出 handler（2026-10-21 17:46–17:55，S3）
+
+- **`service/run_service.go`**：`RunService.Resume(runID, fromNode, nodesOverride)`。
+  原 `handler/workflow.go` 里 123 行的续跑编排（校验运行状态 → 挑节点图 → 落 job → 回写状态）
+  整体搬过来，handler 只剩「解析参数 → 调服务 → error 映射成状态码」。
+  `handler/workflow.go` **612 → 531 行**。
+- **为什么非搬不可**：那段逻辑有三个入口复用（整体续跑 / 从某节点续跑 / 单镜重跑 reroll），
+  放在 handler 里意味着每次复用都要传一个 `gin.Context` 进去，且只能靠 httptest 间接测。
+  现在状态机有了直接的单元测试。
+- **错误语义显式化**：`ErrRunNotFound` / `ErrWorkflowNotFound` / `ErrRunStillRunning` /
+  `NodeNotFoundError{NodeID}`。handler 按类型映射 404 / 409 / 400 / 500——
+  以前是散在函数体里的 `c.JSON` + `return`，加一个分支就可能漏。
+- **测试可同步执行**：`RunService.runAsync` 是可替换字段，`SetSynchronous()` 让测试不必 sleep
+  等 goroutine（否则只能靠 `time.Sleep` 猜时长，既慢又不稳）。
+- **顺手去掉一条噪音日志**：「续跑一个已删除的运行」是正常路径（用户在历史面板点旧记录），
+  `First` 会打 `record not found`；改用 `Limit(1).Find`。
+
+**Verified（Measured）**
+
+- 测试 **338 → 343**（新增 5 条续跑状态机用例），`go vet` 干净，`go test ./...` 全绿。
+- 真机 e2e（exe @8099）：
+  - `POST /api/runs/:id/rerun-from {node_id:"s"}` → **202** `{prev_nodes:2, resumed:true}`，
+    2 秒后状态 `success`、`ended_at` 已写；
+  - 拼错节点 → **400** `{node_id:"no-such"}`；
+  - 不存在的运行 → **404**；非法 runId → **400**。
+- 验证后停服删 `dist/data`，8080 复查 200；`运行/FlowEdge.exe` 已替换。
+
+**未验证**
+
+- 「运行中拒绝续跑」（409）只有单元测试覆盖，没在真实并发下撞过。
+- 续跑期间取消（`cancelled` → job `interrupted`）沿用原逻辑，未新增验证。
+
 ### Verified
 
 - `go test ./...` 全绿；测试函数 **306**（改造前 212）；`go vet ./...` 干净；

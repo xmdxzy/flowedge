@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -21,6 +22,8 @@ type WorkflowHandler struct {
 	queue   *service.JobQueue     // nil 时退化为直接 goroutine 起跑（保持向后兼容）
 	lineage *service.LineageStore // nil 时跳过血缘记录
 	// 预检依赖（SetPreflight 注入；nil 时跳过运行前依赖预检）
+	runs *service.RunService // 续跑编排（含单镜重跑），与 HTTP 无关
+
 	sup         *service.Supervisor
 	ollamaBase  string
 	comfyBase   string
@@ -30,7 +33,12 @@ type WorkflowHandler struct {
 }
 
 func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue) *WorkflowHandler {
-	return &WorkflowHandler{db: db, engine: engine, queue: queue}
+	return &WorkflowHandler{
+		db:     db,
+		engine: engine,
+		queue:  queue,
+		runs:   service.NewRunService(db, engine, queue),
+	}
 }
 
 // SetLineage 注入血缘仓库（运行结束后记录产物来源）
@@ -455,128 +463,39 @@ func (h *WorkflowHandler) resumeFrom(c *gin.Context, fromNode string) {
 
 // resumeFromWithOverride 同 resumeFrom，但允许传入改过的节点图。
 //
-// 为什么需要：单镜重跑只改内存里的 `reroll` 字段，**不能**写回数据库——
-// 否则用户保存的工作流会被一次临时操作永久改掉（下次正常运行还是会重拍那一镜）。
-// nodesOverride 为 nil 时行为与原实现完全一致。
+// 编排逻辑已下沉到 service.RunService（见 service/run_service.go 顶部注释：
+// 校验运行状态 / 挑节点图 / 落 job / 回写状态本来就和 HTTP 无关）。
+// 这里只做三件事：解析参数、调服务、把 error 映射成状态码。
 func (h *WorkflowHandler) resumeFromWithOverride(c *gin.Context, fromNode string, nodesOverride []byte) {
-	runID := c.Param("runId")
-	var run model.WorkflowRun
-	if err := h.db.First(&run, runID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
-		return
-	}
-	if run.Status == "running" {
-		c.JSON(http.StatusConflict, gin.H{"error": "run is still running"})
+	runID, err := strconv.ParseUint(c.Param("runId"), 10, 64)
+	if err != nil || runID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid runId"})
 		return
 	}
 
-	var wf model.Workflow
-	if err := h.db.First(&wf, run.WorkflowID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
+	out, err := h.runs.Resume(uint(runID), fromNode, nodesOverride)
+	if err != nil {
+		var nf *service.NodeNotFoundError
+		switch {
+		case errors.As(err, &nf):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "node not found in this run", "node_id": nf.NodeID})
+		case errors.Is(err, service.ErrRunNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+		case errors.Is(err, service.ErrWorkflowNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
+		case errors.Is(err, service.ErrRunStillRunning):
+			c.JSON(http.StatusConflict, gin.H{"error": "run is still running"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
 		return
-	}
-
-	prev := []model.NodeInstance{}
-	if len(run.NodeStates) > 0 {
-		if err := json.Unmarshal(run.NodeStates, &prev); err != nil {
-			prev = []model.NodeInstance{}
-		}
-	}
-
-	// fromNode 必须存在于本次运行的节点里，否则 400（避免拼写错误的节点 id 被静默忽略）
-	if fromNode != "" {
-		found := false
-		for _, n := range prev {
-			if n.ID == fromNode {
-				found = true
-				break
-			}
-		}
-		if !found {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "node not found in this run", "node_id": fromNode})
-			return
-		}
-	}
-
-	now := time.Now()
-	run.Status = "running"
-	run.Error = ""
-	run.EndedAt = nil
-	run.StartedAt = &now
-	h.db.Save(&run)
-
-	persist := func(states []model.NodeInstance) {
-		statesJSON, err := json.Marshal(states)
-		if err != nil {
-			return
-		}
-		h.db.Model(&model.WorkflowRun{}).Where("id = ?", run.ID).
-			Update("node_states", json.RawMessage(statesJSON))
-	}
-
-	job := model.Job{
-		RunID:      run.ID,
-		WorkflowID: run.WorkflowID,
-		Status:     "running",
-		Trigger:    "resume",
-		CreatedAt:  time.Now(),
-		StartedAt:  run.StartedAt,
-	}
-	h.db.Create(&job)
-
-	exec := func() {
-		// 走带 runID 的可取消入口：续跑的事件也要归属性，否则执行面板看不到重跑过程
-		nodesJSON := []byte(wf.Nodes)
-		if len(nodesOverride) > 0 {
-			nodesJSON = nodesOverride
-		}
-		nodeStates, err := h.engine.ResumeFromWithRunID(nodesJSON, []byte(wf.Edges), prev, fromNode, run.ID, persist)
-
-		endNow := time.Now()
-		run.EndedAt = &endNow
-
-		if err != nil {
-			if service.ErrorCodeOf(err) == model.ErrorCodeCancelled {
-				run.Status = "cancelled"
-			} else {
-				run.Status = "failed"
-			}
-			run.Error = err.Error()
-		} else {
-			run.Status = "success"
-		}
-
-		statesJSON, _ := json.Marshal(nodeStates)
-		run.NodeStates = json.RawMessage(statesJSON)
-		h.db.Save(&run)
-
-		job := model.Job{
-			RunID: run.ID, WorkflowID: run.WorkflowID,
-			Status: "done", Trigger: "resume", CreatedAt: *run.StartedAt,
-			StartedAt: run.StartedAt, EndedAt: &endNow,
-		}
-		if err != nil {
-			if service.ErrorCodeOf(err) == model.ErrorCodeCancelled {
-				job.Status = "interrupted"
-			} else {
-				job.Status = "failed"
-			}
-			job.Error = err.Error()
-		}
-		h.db.Save(&job)
-	}
-
-	if h.queue != nil {
-		h.queue.Enqueue(job, exec)
-	} else {
-		go exec()
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
-		"run_id":     run.ID,
+		"run_id":     out.RunID,
 		"status":     "running",
 		"resumed":    true,
-		"prev_nodes": len(prev),
+		"prev_nodes": out.PrevNodes,
 	})
 }
 
