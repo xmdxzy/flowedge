@@ -241,7 +241,7 @@ date-based versioning (`vYYYY.MM.DD`).
 - **零新增运行时依赖的测试通道**：`frontend/scripts/run-tests.mjs` 用 vite 自带的 esbuild
   把 `src/**/*.test.ts` 打成单个 ESM 包，交给 `node:test` 跑。只加了 `@types/node`（devDependency，
   不进 exe）。`npm test` 一条命令，已接进 CI 的 frontend job。
-- **27 个用例分三组**
+- **28 个用例分四组**
   - `graphUtils.test.ts`（9 个）：批注/分组剔除、连线过滤、分层布局（含"取最长路径"、
     环内节点不丢不堆原点）、包围盒（含缺测量值不产生 NaN）、ID 生成。
   - `graph.test.ts`（9 个）：**前后端契约测试**——从 `backend/service/nodespec.go` 解析节点类型，
