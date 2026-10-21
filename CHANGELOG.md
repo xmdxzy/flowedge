@@ -333,6 +333,33 @@ date-based versioning (`vYYYY.MM.DD`).
 - 仍没测画布本体（React Flow 的节点渲染、连线交互），需要包 `ReactFlowProvider` 的 harness。
 - 属性面板（`App.tsx` 内联 JSX）依旧没有测试覆盖，这是继续拆分它的最后一道障碍。
 
+### 画布节点测试（46 → 54）+ 两处 UI 落后于实现（2026-10-21 18:22–18:35）
+
+- **`src/test-canvas.tsx`**：画布 harness。节点组件里有 `<Handle>`，它需要 React Flow 的
+  store 与节点上下文，**不能**裸渲染（会报 "you have not used the ReactFlow component"）。
+  所以包一层 `ReactFlowProvider` + 真 `<ReactFlow>`，断言落在渲染出来的文字上。
+- **`src/nodes/nodes.test.tsx`（8 条）**：开始节点空态/填值、LLM 显示模型与提示词、
+  文生图显示尺寸与张数、图生图显示强度、批注与分组各自的文本、多节点同时渲染。
+
+**测试当场抓出的两个真 bug（都是"UI 落后于实现"这一类）**
+
+1. **文生图节点跑完不显示缩略**：读的是 `data.image`，但运行结果落在 `data.output.image`
+   （`App.tsx:401/667` 写回 `output`）。改成两者都认，兼容历史数据。
+2. **文生图节点硬编码 `SDXL`**：引擎默认权重是 **flux-schnell**，这个标签从头就是错的。
+   改成显示真实生效的 `1024×768 · 2张`。这与之前记过的「涡轮 LoRA（8 步）而实际 12 步」
+   是同一类问题：**UI 文案没有跟着实现走**。
+
+**Verified（Measured）**
+
+- `npm test`：**46 → 54 passed / 0 failed**；`tsc --noEmit` 干净；`vite build` 通过。
+- 产物侧证：内嵌 bundle 里已搜不到 `SDXL`，`×` 规格文案出现 6 处。
+- exe 重建 32.3MB 并部署到 `运行/`；@8099 冒烟 `/` 200、bundle 200，验完停服删 `dist/data`。
+
+**未验证 / 未做**
+
+- 仍没测属性面板（`App.tsx` 内联 JSX，约 1,300 行）与连线交互——这是继续拆 `App.tsx` 的前置条件。
+- 本轮重建的 exe 尚未在用户实机跑过（8080 当时处于停止状态，需用户手动启动）。
+
 ### Verified
 
 - `go test ./...` 全绿；测试函数 **306**（改造前 212）；`go vet ./...` 干净；
