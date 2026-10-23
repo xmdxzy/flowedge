@@ -4,6 +4,29 @@ All notable changes to FlowEdge are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 date-based versioning (`vYYYY.MM.DD`).
 
+## [v2026.10.23-evo-real-pairs]
+
+> 主题：真渲配对评测收口——全项目第一次「GPU 真实渲染产物」走完配对判定；
+> 静态注入压回红线内（AGENTS 12.7k→10.3k、MEMORY 7.6k→6.0k，红线带 5% 容差）。
+
+### 评：第一个真渲级配对判定（keep_baseline，10 对全平）
+- 隔离实例 :18086（生产 DB 副本）跑 wf 56「still-a」：8 个不同 prompt 的 case
+  （4 nature + 4 object），baseline/candidate 两侧各 8 次 MOSS 真渲（共 16 张 768×1024）。
+- 判定 `keep_baseline`：10 对全 tie、gateScoreDelta=0、latencyDeltaPct=+2.45%（实测）、
+  criticalRegressions=0。同配置对照全平是数学必然——证的是「真实渲染下尺寸门 100% 稳定，
+  系统不把噪声当进化」。
+- 燃料门首次 `ready=true`：unscoredRate 4.5%（<20% 信任线）、pairableCases 10（≥8）、
+  categories 3（≥2）；`promotions` 台账自动落 archive 两条（inconclusive + keep_baseline）。
+- 交付：`outputs/evo-pairs-2026-10-23/`（16 次运行清单 + n2 candidate 样张 + README）。
+- 顺带验证 21:27 的 dist 二进制确含静图门修复（16+2 次真渲全部 passed）。
+
+### 优：静态注入压回红线
+- `AGENTS.md` 12,657→10,319 字符：§0.10 压成结论版（两层机制/7 种逃逸明细移正文
+  `docs/沙箱与常驻进程.md`）、§1–4 各条去冗、§7 删与 §0.5 重复的验收代码块；
+  新增硬事实（deps.json 教训、换 exe 坑、静默降级禁令）全部保留。
+- `.workbuddy/memory/MEMORY.md` 7,584→6,000 字符：状态快照外移 INDEX §C、
+  代码可推导细节（MCP 工具名、bbox 归一化定义）改指针，踩坑教训一条不删。
+
 ## [v2026.10.23-evo-gate-stillimage]
 
 > 主题：真渲闭环（用户授权的最便宜路径）闭合——全项目第一份「真实 GPU 渲染过门」
