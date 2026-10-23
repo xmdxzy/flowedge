@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -69,6 +70,81 @@ func TestQualityGate_NoArtifactFails(t *testing.T) {
 	if err == nil || !containsFold(err.Error(), "缺少输入产物") {
 		t.Fatalf("缺产物应显式失败，got %v", err)
 	}
+}
+
+// 静图没有时长是正常的：配了 min_width/min_height 的静图门必须放行，
+// 且每项检查都带实测值。2026-10-23 真渲闭环（wf 56 still-a，MOSS 真实出图）
+// 第一次抓到：probeGateMedia 曾无条件要求秒数>0，一张完好的 PNG 被判
+// 「文件可能损坏」——尺寸检查在崩溃后面永远执行不到，门配了等于没配。
+func TestQualityGate_StillImagePassesWithMeasuredChecks(t *testing.T) {
+	path := makeStillPng(t)
+	// 探测层：完好静图不得被当成坏文件
+	info, err := probeGateMedia(path)
+	if err != nil {
+		t.Fatalf("完好静图不应被探测层拒绝：%v", err)
+	}
+	if info.width != 320 || info.height != 240 {
+		t.Fatalf("尺寸应读到 320x240，got %dx%d", info.width, info.height)
+	}
+	e := &EngineV2{}
+	node := &model.NodeInstance{ID: "g", Type: "quality_gate",
+		Data: map[string]interface{}{"min_width": float64(300), "min_height": float64(200)}}
+	upstream := map[string]interface{}{
+		"v1": map[string]interface{}{"image": path},
+	}
+	out, err := e.execQualityGateNode(context.Background(), node, upstream)
+	if err != nil {
+		t.Fatalf("320x240 静图过 300x200 门应放行，got %v", err)
+	}
+	m, ok := out.(map[string]interface{})
+	if !ok || m["gate"] != "pass" {
+		t.Fatalf("输出应带 gate=pass，got %+v", out)
+	}
+	checks, _ := m["checks"].([]gateCheck)
+	seen := map[string]bool{}
+	for _, c := range checks {
+		seen[c.Name] = true
+		if !c.OK {
+			t.Fatalf("所有检查应通过，got %+v", c)
+		}
+		if c.Detail == "" {
+			t.Fatalf("每项检查必须带实测值（信封要能自解释），got %+v", c)
+		}
+	}
+	if !seen["min_width"] || !seen["min_height"] {
+		t.Fatalf("应产出 min_width/min_height 两项，got %v", seen)
+	}
+}
+
+// 坏文件仍然必须硬错：修静图不能顺手把「假通过」的门打开
+// （空规则 + 坏文件 → 零检查放行，比崩溃更糟）。
+func TestProbeGateMedia_CorruptFileStillErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "broken.mp4")
+	if err := os.WriteFile(path, []byte("this is not a media file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := probeGateMedia(path); err == nil {
+		t.Fatal("读不到任何媒体事实的坏文件必须报错，不许放行")
+	}
+}
+
+// makeStillPng 造一张 320x240 测试静图（与视频用例同一模式：ffmpeg 不可用则跳过）
+func makeStillPng(t *testing.T) string {
+	t.Helper()
+	bin, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg 不可用，跳过")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "still.png")
+	cmd := exec.Command(bin, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=1",
+		"-frames:v", "1", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("造测试静图失败：%v %s", err, out)
+	}
+	return path
 }
 
 // makeSilentVideo 造一条 2 秒无音轨测试视频

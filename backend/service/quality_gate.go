@@ -249,7 +249,13 @@ func probeGateMedia(path string) (*gateMediaInfo, error) {
 			}
 		}
 	}
-	if info.seconds == 0 {
+	// 静图（PNG/JPEG 等单帧产物）天生没有时长：ffprobe 报 0s 是正常，不是损坏。
+	// 2026-10-23 真渲闭环第一次抓到这个：wf 56/57/58 三个静图流的门配的是
+	// min_width/min_height（静图本来就量尺寸），却在探测阶段被这句「探测不到
+	// 时长」硬错弹回——尺寸检查在崩溃后面永远执行不到，门配了等于没配。
+	// 现在只有「什么都读不到」才判损坏：无尺寸、无音轨、无时长。那种情况若放行
+	// 就是假通过（空规则 + 坏文件 → 零检查过门），比崩溃更糟。
+	if info.seconds == 0 && info.width == 0 && info.height == 0 && !info.hasAudio {
 		return nil, fmt.Errorf("探测不到时长（文件可能损坏或格式不支持）")
 	}
 	return info, nil
