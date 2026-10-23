@@ -108,25 +108,31 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 
 	for i := range nodes {
 		n := &nodes[i]
-		switch n.Type {
-		case "llm", "storyboard":
-			add(n, "ollama", "LLM（Ollama）", caps.Ollama)
-		case "vision":
-			add(n, "vision", "视觉模型", caps.Vision)
-		case "tts":
-			add(n, "tts", "TTS（Kokoro）", caps.TTS)
-		case "asr":
-			add(n, "asr", "ASR（faster-whisper）", caps.ASR)
-		case "text2image", "image2image", "inpaint", "upscale":
-			addComfy(n, "", "ComfyUI（图像）", caps.ComfyUI)
-		case "text2video":
-			if backend, _ := n.Data["backend"].(string); backend == "h3" {
-				addComfy(n, "h3", "ComfyUI-H3（音视频联合生成）", caps.ComfyH3)
-			} else {
-				addComfy(n, "", "ComfyUI（视频）", caps.ComfyUI)
+		// 依赖从模块契约读取，**不再按节点类型 switch**。
+		// 加一个模态（新的图像/视频/语音/3D 模块）只要在契约里写 Requires，
+		// 预检、一键修复、任务书同时生效——引擎不需要认识这个模态。
+		c, ok := ModuleContractOf(n.Type)
+		if !ok {
+			continue // 未声明契约的类型：预检不拦，执行期会给出它自己的错误
+		}
+		reqs := c.Requires
+		if c.RequiresFor != nil {
+			reqs = c.RequiresFor(n)
+		}
+		for _, req := range reqs {
+			capability, known := CapabilityFor(req.Dep, caps)
+			if !known {
+				continue // 契约写了一个引擎不认识的依赖名：留给测试去抓
 			}
-		case "shotlist":
-			addComfy(n, "h3", "ComfyUI-H3（音视频联合生成）", caps.ComfyH3)
+			if req.Dep == "comfyui" || req.Dep == "comfy_h3" {
+				profile := ""
+				if req.Dep == "comfy_h3" {
+					profile = "h3"
+				}
+				addComfy(n, profile, req.Label, capability)
+				continue
+			}
+			add(n, req.Dep, req.Label, capability)
 		}
 	}
 	return missing

@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,7 +70,7 @@ func main() {
 	// 连接数据库（默认本地 SQLite，零外部依赖；DB_DRIVER=postgres 时使用 PostgreSQL）
 	db := initDB(cfg)
 	if db != nil {
-		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}, &model.ShotJob{}, &service.ArtifactLineage{}); err != nil {
+		if err := db.AutoMigrate(&model.Workflow{}, &model.WorkflowRun{}, &model.WorkflowVersion{}, &model.RunEvent{}, &model.Job{}, &model.ShotJob{}, &model.Promotion{}, &service.ArtifactLineage{}); err != nil {
 			log.Printf("Warning: auto migrate failed: %v", err)
 		} else {
 			log.Println("Database migrated")
@@ -177,6 +178,42 @@ func main() {
 		engine.SetCredentials(credStore)
 	}
 
+	// 自定义模型端点（data/llm-profiles.json）：节点 llm_profile 引用。
+	// 与 models.json（扩散权重 bundle）是两张表：一个管"跑什么权重"，一个管"调哪个端点"。
+	llmProfileStore := service.LoadLLMProfiles(filepath.Join(baseDir, "data", "llm-profiles.json"))
+	engine.SetLLMProfiles(llmProfileStore)
+
+	// 外部智能体名册（data/agents.json）：agent_task 节点引用。
+	// 与 llm-profiles 是两张表：那张管"调哪个模型"，这张管"把活儿交给哪个智能体"。
+	agentStore := service.LoadAgents(filepath.Join(baseDir, "data", "agents.json"))
+	engine.SetAgents(agentStore)
+	// 技能包扫描根：agent_task 的 skill_refs 靠它把包名换成真实路径。
+	// 两类根分开传：本机技能生态（用户级/冷存储/DSH/agents/项目级/额外根文件）与
+	// 专家插件市场（plugins/<插件>/skills/<技能>）——布局与来源语义都不同。
+	engine.SetSkillRoots(service.SkillRoots(baseDir))
+	engine.SetPluginRoots(service.PluginSkillRoots(baseDir))
+
+	// 工具链：skill / MCP / 插件 / 智能体的统一发现层（/api/toolchain）。
+	// 四类工具共用一张表、一套启停语义，前端才能用一套面板管理；
+	// 也是 mcp_call 节点按名字找服务器的入口。
+	toolchain := service.NewToolchain(baseDir, engine, agentStore)
+	engine.SetToolchain(toolchain)
+
+	// 能力卡片（data/cards.json）：内置一份，用户可覆盖/追加。
+	// agent/skill 只改提示词；workflow 卡会改执行结构，见 executeNode 的拦截。
+	cardStore := service.LoadCards(filepath.Join(baseDir, "data", "cards.json"))
+	engine.SetCards(cardStore)
+	// 任务书编译不持有 Engine，靠它反查卡片名字
+	service.SetDefaultCards(cardStore)
+	// 任务书里的工作流卡要显示流水线名，而不是 "#12"
+	service.SetWorkflowNameResolver(func(id uint) string {
+		var w model.Workflow
+		if err := db.Select("name").First(&w, id).Error; err != nil {
+			return ""
+		}
+		return w.Name
+	})
+
 	// 产物血缘
 	lineageStore := service.NewLineageStore(db)
 
@@ -213,51 +250,48 @@ func main() {
 	pluginRegistry := service.NewPluginRegistry()
 	service.RegisterBuiltinPlugins(pluginRegistry)
 
-	// 运行期插件：data/plugins/<name>/plugin.json（script 或 http 型）。
-	// 这是「不重编译 exe 就能加节点」的入口——社区不必为 20 行节点装 Go 工具链。
-	// 加载失败只记日志：一个手写坏的插件不该让引擎起不来。
-	if runtimePlugins, pluginErrs := service.LoadRuntimePlugins("data/plugins"); len(runtimePlugins) > 0 || len(pluginErrs) > 0 {
-		for _, perr := range pluginErrs {
-			log.Printf("Warning: 运行期插件加载失败 %s", perr)
-		}
-		for _, rp := range runtimePlugins {
-			if err := pluginRegistry.Register(rp); err != nil {
-				log.Printf("Warning: 运行期插件注册失败 %s：%v", rp.Type(), err)
-				continue
-			}
-			log.Printf("已加载运行期插件：%s（%s）", rp.Type(), rp.Name())
-		}
-	}
-
+	// 运行期插件（data/plugins/<name>/plugin.json，script 或 http 型）走**工具链热注册表**，
+	// 与「工具台 → 重新扫描」完全同一条路径（见 service.Toolchain.Reload）。
+	//
+	// 为什么不在这里再写一遍加载逻辑：两套实现必然漂移——启动时能加载的插件，
+	// 热重载后不认，或者反过来；且停用的插件在启动路径里被漏掉就会诈尸。
+	// 一个入口，两种时机。
 	pluginCount := 0
 	for _, plugin := range pluginRegistry.All() {
 		p := plugin // 闭包捕获
-		register := func(side string) {
-			exec := func(_ context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-				out, err := p.Execute(upstream, node.Data)
-				if err != nil {
-					return nil, err
-				}
-				if out == nil {
-					return map[string]interface{}{}, nil
-				}
-				return out, nil
+		exec := func(_ context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
+			out, err := p.Execute(upstream, node.Data)
+			if err != nil {
+				return nil, err
 			}
-			if side != "" {
-				engine.RegisterNodeTypeWithSide(p.Type(), side, exec)
-			} else {
-				engine.RegisterNodeType(p.Type(), exec)
+			if out == nil {
+				return map[string]interface{}{}, nil
 			}
+			return out, nil
 		}
 		side := ""
 		if rp, ok := plugin.(*service.RuntimePlugin); ok {
 			side = rp.Side()
 		}
-		register(side)
+		if side != "" {
+			engine.RegisterNodeTypeWithSide(p.Type(), side, exec)
+		} else {
+			engine.RegisterNodeType(p.Type(), exec)
+		}
 		pluginCount++
 	}
+	if tcRes := toolchain.Reload(); tcRes.Plugins > 0 || len(tcRes.Problems) > 0 {
+		if len(tcRes.Problems) > 0 {
+			for _, perr := range tcRes.Problems {
+				log.Printf("Warning: 运行期插件加载失败 %s", perr)
+			}
+		}
+		if tcRes.Plugins > 0 {
+			log.Printf("已热注册 %d 个运行期插件：%v", tcRes.Plugins, tcRes.NodeTypes)
+		}
+	}
 	if pluginCount > 0 {
-		log.Printf("已注册 %d 个插件节点类型", pluginCount)
+		log.Printf("已注册 %d 个内置插件节点类型", pluginCount)
 	}
 
 	// 流式 LLM（token 经 WS 推送前端打字机效果）
@@ -360,6 +394,15 @@ func main() {
 	// 运行前依赖预检：Ollama/ASR/TTS/视觉模型没就绪时在入口显式失败，
 	// 而不是让节点跑进去报一句连接错误（ComfyUI 两实例由 ensureComfy 自动拉起，不拦）
 	wfHandler.SetPreflight(depSupervisor, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
+	// 资源准入闸：执行前问一句序策治理器「现在能不能跑」（fail-open，问不到就放行）。
+	// FLOWEDGE_GOVERNOR=off 可关；GOVERNOR_BASE_URL 默认 127.0.0.1:30002。
+	govGate := service.NewGovernorGate()
+	wfHandler.SetGovernor(govGate)
+	if govGate.Enabled() {
+		log.Printf("[Governor] 资源准入已启用（kind=%s）", getEnv("GOVERNOR_KIND", "flowedge"))
+	} else {
+		log.Printf("[Governor] 资源准入已关闭（FLOWEDGE_GOVERNOR=off）")
+	}
 	triggerHandler := handler.NewTriggerHandler(db, wfHandler)
 	debugHandler := handler.NewDebugHandler(db, engine, lineageStore)
 
@@ -385,6 +428,103 @@ func main() {
 		api.POST("/workflows", wfHandler.Create)
 		api.PUT("/workflows/:id", wfHandler.Update)
 		api.DELETE("/workflows/:id", wfHandler.Delete)
+
+		// 任务书：把画布编译成可执行规格（md 给人/智能体读，json 给程序读）
+		api.GET("/workflows/:id/spec", wfHandler.Spec)
+		// 任务书回写（Compose 的另一半）：编辑 → 校验 → 快照 → 落图
+		api.POST("/workflows/:id/spec/apply", wfHandler.SpecApply)
+		// 模块目录：逻辑与模态同构的积木清单（端口 + 参数标签 + 门层 + 执行元数据）
+		moduleHandler := handler.NewModuleHandler()
+		api.GET("/modules", moduleHandler.List)
+
+		// 自定义模型端点：LLM 节点的「我的模型」下拉读这里
+		lpHandler := handler.NewLLMProfileHandler(llmProfileStore)
+		api.GET("/llm/profiles", lpHandler.List)
+		api.PUT("/llm/profiles", lpHandler.Replace)
+
+		// 能力卡片目录：智能体卡 / 技能卡 / 工作流封装卡
+		cardHandler := handler.NewCardHandler(db, cardStore)
+		api.GET("/cards", cardHandler.List)
+		api.PUT("/cards", cardHandler.Save)
+
+		// 技能包索引：把机器上的 SKILL.md 全部盘一遍，给归属判定 + 可核验证据。
+		// 只读，不产生可执行能力——能贴到节点上的东西一律走 /api/cards。
+		skillPackHandler := handler.NewSkillPackHandler(baseDir)
+		api.GET("/skills", skillPackHandler.List)
+		api.GET("/skills/:name", skillPackHandler.ReadDoc)
+
+		// 工具链：skill / MCP / 插件 / 智能体四类工具的统一清单与治理。
+		//
+		// 与 /api/skills 的关系：/api/skills 是「技能包的归属审计」（只读判定），
+		// /api/toolchain 是「这台机器上有什么工具、怎么用、能不能用」（可操作）。
+		// 两者数据源重叠但目的不同，不做合并——合并会让审计口径被"启停"污染。
+		toolchainHandler := handler.NewToolchainHandler(toolchain)
+		api.GET("/toolchain", toolchainHandler.List)
+		api.POST("/toolchain/reload", toolchainHandler.Reload)
+		api.GET("/toolchain/doc", toolchainHandler.Doc)
+		api.POST("/toolchain/adopt", toolchainHandler.AdoptAgent)
+		api.POST("/toolchain/agents/:id/enabled", toolchainHandler.SetAgentEnabled)
+
+		// MCP 服务器：增删改启停 + 探活 + 工具清单 + 试跑。
+		// 试跑与 mcp_call 节点共用 service.Toolchain.CallMCP，不存在两套行为。
+		api.GET("/mcp/servers/:name/tools", toolchainHandler.Tools)
+		api.POST("/mcp/servers/:name/probe", toolchainHandler.ProbeMCP)
+		api.POST("/mcp/servers/:name/call", toolchainHandler.CallMCP)
+		api.POST("/mcp/servers/:name/enabled", toolchainHandler.SetMCPEnabled)
+		api.PUT("/mcp/servers", toolchainHandler.UpsertMCP)
+		api.DELETE("/mcp/servers/:name", toolchainHandler.DeleteMCP)
+
+		// 引擎自有插件启停（改 plugin.json 后立刻热重载，节点类型同步出现/消失）
+		api.POST("/plugins/:name/enabled", toolchainHandler.SetPluginEnabled)
+
+		// 外部智能体名册：agent_task 节点的「智能体」下拉读这里。
+		// 列表默认带体检结果（配置了 ≠ 装好了），probe=0 可跳过探测。
+		agentHandler := handler.NewAgentHandler(engine)
+		api.GET("/agents", agentHandler.List)
+		api.PUT("/agents", agentHandler.Upsert)
+		api.DELETE("/agents/:id", agentHandler.Delete)
+		api.POST("/agents/:id/probe", agentHandler.Probe)
+
+		// 图结构评分：不执行就能判「这张图能不能跑」，compose 的准入指标（docs §5.9.4）
+		graphHandler := handler.NewGraphHandler(db)
+		api.POST("/graph/score", graphHandler.Score)
+
+		// 构图：一句话目标 → 可执行的图 + 任务书（docs §3.6.5，唯一缺的半条腿）
+		// 挂在 /api/compose 而不是 /api/workflows/compose：后者会和 :id 路由混在一起，
+		// 读代码时要多想想"compose 是不是一个工作流 id"。
+		composeHandler := handler.NewComposeHandler(engine, db)
+		api.POST("/compose", composeHandler.Compose)
+
+		// 证据聚合与登记：把散落的 evidence 变成「哪里在漏」+ 可登记的候选（docs §8.4 P0-1）
+		evHandler := handler.NewEvidenceHandler(db, govGate)
+		evHandler.SetWorkflowHandler(wfHandler)
+		api.GET("/evidence/summary", evHandler.Summary)
+		api.POST("/evidence/register", evHandler.Register)
+		// 候选生成 → 试验：把诊断翻成"能试的改动"，试用后自动快照可回滚
+		api.POST("/evidence/candidates", evHandler.Candidates)
+		api.POST("/evidence/trial", evHandler.Trial)
+
+		// 自进化闭环：漏在哪 → 改哪 → 是不是作弊 → 该不该留（docs 自进化方案 v1）
+		//
+		// 与 /evidence/* 的分工：evidence 那组回答"这批 run 成不成"（聚合视角），
+		// 这组回答"下一版引擎该动哪个参数、动了算不算进化"（变化视角）。
+		// 真跑仍复用 /evidence/trial，不新增第二条写图路径。
+		evoHandler := handler.NewEvolutionHandler(db, engine)
+		evoHandler.SetWorkflowHandler(wfHandler)
+		api.GET("/evolution/status", evoHandler.Status)
+		api.POST("/evolution/propose", evoHandler.Propose)
+		api.POST("/evolution/audit", evoHandler.Audit)
+		api.POST("/evolution/decide", evoHandler.Decide)
+		// 闭环补全：接尺子 → 跑配对 → 提变体 → 盯回归 → 回滚
+		api.POST("/evolution/instrument", evoHandler.Instrument)
+		api.POST("/evolution/evaluate", evoHandler.Evaluate)
+		api.GET("/evolution/batch", evoHandler.Batch)
+		api.POST("/evolution/variants", evoHandler.Variants)
+		api.GET("/evolution/monitor", evoHandler.Monitor)
+		api.POST("/evolution/rollback", evoHandler.Rollback)
+		// 晋升台账：人按下晋升/保留 + 台账查询
+		api.POST("/evolution/promote", evoHandler.Promote)
+		api.GET("/evolution/promotions", evoHandler.Promotions)
 
 		api.POST("/workflows/:id/run", wfHandler.Run)
 		api.GET("/workflows/:id/runs", wfHandler.ListRuns)
@@ -455,6 +595,8 @@ func main() {
 		api.GET("/models", func(c *gin.Context) {
 			inv := service.ScanModels(service.ModelsRoot(baseDir))
 			ollamaModels := []string{}
+			// 模型体积：下拉里要能看出"这个模型多大"，否则用户只能靠名字猜
+			ollamaSizes := map[string]float64{}
 			if body, err := http.Get(cfg.OllamaBaseURL + "/api/tags"); err == nil {
 				var tags struct {
 					Models []struct {
@@ -465,6 +607,9 @@ func main() {
 				if json.NewDecoder(body.Body).Decode(&tags) == nil {
 					for _, m := range tags.Models {
 						ollamaModels = append(ollamaModels, m.Name)
+						if m.Size > 0 {
+							ollamaSizes[m.Name] = float64(m.Size) / (1 << 30)
+						}
 					}
 				}
 				body.Body.Close()
@@ -476,7 +621,17 @@ func main() {
 				"models_dir":    modelsRoot,
 				"resident_side": engine.ResidentSide(),
 				"llm_backend":   llmService.BackendLabel(),
-				"bundles_path":  bundleStore.Path(),
+				// 具体名字要能看见：面板里不能只说"自动探测"
+				"default_llm":     llmService.Model,
+				"ollama_sizes_gb": ollamaSizes,
+				"t2i_checkpoint":  t2iService.Checkpoint,
+				// 出图后端列表（flux / moss / auto）。放在接口里而不是让前端硬编码，
+				// 将来加第三个后端时前端下拉不会静默漏项。
+				"t2i_backends": service.T2IBackends,
+				// 可选的出图权重清单（来自 models.json 的各 bundle），
+				// 节点里可以逐个覆盖，不必改全局配置
+				"checkpoints":  checkpointsFromBundles(bundleStore),
+				"bundles_path": bundleStore.Path(),
 			})
 		})
 
@@ -887,4 +1042,29 @@ func parseLimit(s string, def int) int {
 		return v
 	}
 	return def
+}
+
+// checkpointsFromBundles 把 models.json 里各 bundle 的 ckpt 去重成一份可选清单。
+// 节点级覆盖只允许在这份清单里选——乱填一个不存在的文件名，
+// 报错会发生在 ComfyUI 构图时，用户根本看不懂。
+func checkpointsFromBundles(store *service.BundleStore) []string {
+	if store == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, role := range store.Roles() {
+		b := store.Resolve(role)
+		if b == nil {
+			continue
+		}
+		ckpt := b.Files["ckpt"]
+		if ckpt == "" || seen[ckpt] {
+			continue
+		}
+		seen[ckpt] = true
+		out = append(out, ckpt)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -171,6 +171,7 @@ var defaultOutputFields = map[string][]string{
 	"llm":            {"text"},
 	"rag_query":      {"text"},
 	"http_request":   {"text", "status_code"},
+	"command":        {"text", "status_code", "stderr", "elapsed_ms", "truncated"},
 	"data_transform": {"text"},
 	"if_else":        {"text", "branch"},
 	"text2image":     {"image", "images", "count", "prompts", "text"},

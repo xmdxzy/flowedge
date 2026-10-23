@@ -24,6 +24,14 @@ type RunControl struct {
 	pausedAt   string
 	reason     string // step / breakpoint
 	executed   int
+
+	// agentConcurrency 本次运行的智能体并发上限；0 = 用引擎默认（AGENT_MAX_CONCURRENCY / 2）。
+	//
+	// 为什么配额是**运行级**而不是引擎级：同一张图在不同机器、不同 agent 上能扛的并发数
+	// 完全不同（实测 dsh headless 一个约 300MB，Claude Code 是几百 MB 到几 GB）。
+	// 引擎级硬编码会让「三路并行」的图第三路白等到前一路跑完——
+	// 2026-10-23 基准里第三路白等 58s，整图 135.6s，而理论值只要 ~85s。
+	agentConcurrency int
 }
 
 // NewStepControl 单步控制：本次最多执行 budget 个节点后停下
@@ -32,6 +40,12 @@ func NewStepControl(budget int) *RunControl {
 		budget = -1
 	}
 	return &RunControl{budget: budget, hit: map[string]bool{}}
+}
+
+// NewFullControl 全速执行（不单步、不断点）。
+// 用于「只想带运行级参数（如 agent 并发），不想接管节点推进」的场景。
+func NewFullControl() *RunControl {
+	return &RunControl{budget: -1, hit: map[string]bool{}}
 }
 
 // NewBreakpointControl 断点控制：执行到断点节点前停下；stop 为空且 budget<0 即全速
@@ -119,6 +133,30 @@ func (rc *RunControl) Reset() {
 	rc.pausedAt = ""
 	rc.reason = ""
 	rc.mu.Unlock()
+}
+
+// AgentConcurrency 本次运行声明的 agent 并发上限；0 表示沿用引擎默认
+func (rc *RunControl) AgentConcurrency() int {
+	if rc == nil {
+		return 0
+	}
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.agentConcurrency
+}
+
+// SetAgentConcurrency 设置本次运行的 agent 并发上限（1..16，越界按 0 处理 = 用默认）
+func (rc *RunControl) SetAgentConcurrency(n int) *RunControl {
+	if rc == nil {
+		return nil
+	}
+	if n < 1 || n > 16 {
+		n = 0
+	}
+	rc.mu.Lock()
+	rc.agentConcurrency = n
+	rc.mu.Unlock()
+	return rc
 }
 
 type ctxKeyRunControl struct{}

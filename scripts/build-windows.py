@@ -164,9 +164,17 @@ def main():
         log("目标平台：%s/%s 原生单文件（CGO_ENABLED=0，无运行时依赖）" % (GOOS, GOARCH))
 
     if args.skip_ui:
-        if not os.path.exists(os.path.join(STATIC_DIR, "index.html")):
-            fail("backend/web/static 里没有前端产物，先跑一次不带 --skip-ui 的构建")
-        log("跳过前端构建")
+        # --skip-ui 的语义是「不重新构建前端」，不是「不内嵌前端」。
+        # 只要 frontend/dist 有产物就照常复制进 go:embed 目录 —— 否则会出现
+        # 「前端改了、也 npm run build 了、但 exe 里还是旧界面」这种最难查的情况
+        # （2026-10-22 实际踩到：首页仍引用旧 hash）。
+        if os.path.isdir(FRONTEND_DIST) and os.path.exists(os.path.join(FRONTEND_DIST, "index.html")):
+            log("跳过前端构建（沿用 frontend/dist 现有产物）")
+            embed_frontend()
+        elif os.path.exists(os.path.join(STATIC_DIR, "index.html")):
+            log("跳过前端构建（frontend/dist 不存在，沿用 backend/web/static）")
+        else:
+            fail("既没有 frontend/dist 也没有 backend/web/static 的前端产物，先跑一次不带 --skip-ui 的构建")
     else:
         build_frontend()
         embed_frontend()

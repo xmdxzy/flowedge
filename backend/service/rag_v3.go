@@ -327,7 +327,11 @@ func chunkByParagraph(text string, chunkSize, overlap int) []string {
 // projectManual FlowEdge 项目手册（专属知识库种子内容）
 const projectManual = `FlowEdge 是一个面向消费级单 GPU（RTX 3090 24GB）的私有化多模态 AI 工作流引擎，对标 Dify、n8n、ComfyUI、vLLM、Temporal。全部推理在本地完成：LLM 走 Ollama，文生图走 ComfyUI，语音走 SAPI 与 faster-whisper，视频走 FFmpeg，不依赖任何云端 API。
 
-FlowEdge 支持 13 种节点类型：开始、结束、大语言模型（LLM）、文生图、语音转写（ASR）、语音合成（TTS）、视频合成、条件分支（if_else）、循环（loop）、子工作流、HTTP 请求、数据转换、知识库检索（RAG）。节点从左侧节点库拖拽到画布，连线即数据流，同一层无依赖的节点会并行执行。
+FlowEdge 内置 35 种节点类型：开始（start）、结束（end）、大语言模型（llm）、文生图（text2image）、图生图（image2image）、局部重绘（inpaint）、超分（upscale）、文生视频（text2video）、ComfyUI 工作流（comfy_workflow）、语音转写（asr）、语音合成（tts）、视频合成（video_compose）、字幕（subtitles）、竖屏与 BGM 后期（post_production）、视觉理解（vision）、条件分支（if_else）、循环（loop）、子工作流（sub_workflow）、聚合（aggregate）、筛选（select）、HTTP 请求（http_request）、数据转换（data_transform）、代码执行（code）、本地命令（command）、知识库检索（rag_query）、提示词优化（prompt_opt）、九宫格场景锁（scene_grid）、分镜（storyboard）、分镜表（shotlist）、质检门（quality_gate）、一致性门（consistency_gate）、外部智能体（agent_task）、MCP 工具（mcp_call）、文件源（input_source）、文本拆分（text_split）。另有运行期插件节点（data/plugins/<name>/plugin.json）与 MCP 服务器工具（mcp_call 节点按名字调用，服务器清单见「工具台」）不计入内置。节点从左侧节点库拖拽到画布，连线即数据流，同一层无依赖的节点会并行执行。
+
+本地命令（command）：在本机跑一条外部命令，把 stdout、stderr、退出码交给下游。它是外部智能体（agent_task）的确定性对偶——智能体负责「改」，本地命令负责「验」：跑测试、跑构建、调校验脚本用它，因为同一命令同一输入必然同一结论。参数是 argv 逐个传的，不经 shell，因此不存在注入面；需要 shell 语义就显式写 command=cmd /c 或 bash -c。默认非零退出即判失败（fail_on_nonzero 关闭后仍往下传，但 exit_code 如实记录）。与代码执行（code）的区别：code 节点是内置解释器、只能做纯计算，跑不了外部程序。
+
+外部智能体（agent_task）：把需要判断的活儿交给本机或远程的智能体（Claude Code、Codex、任意 CLI，或 OpenAI 兼容端点），名册在 data/agents.json。**它不承诺可复现**——同一输入两次结果可能不同，所以任务书会标出"非确定性"，评测时必须与确定性图分开统计。出图、转写、合成、验收不要用它：那些有确定性模块，更便宜也更稳。节点只引用 agent_id，真实命令行只存在本机配置文件里，不进工作流。
 
 断点续跑：每次执行会逐层增量保存节点状态。当某次运行失败后，修复工作流定义，再点击顶栏的「断点续跑」按钮（或调用 POST /runs/<runId>/resume），引擎会复用已成功节点的输出，只重新执行失败或未执行的节点。已成功的节点时间戳保持不变，证明其输出被直接复用。
 

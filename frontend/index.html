@@ -1,9 +1,29 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlowEdge - 私有化多模态AI工作流引擎</title>
+    <script>
+      // 首帧前定主题，避免「先白一帧再变深」的闪屏。
+      // 与 src/lib/theme.ts 共用同一个 key：flowedge.theme = light | dark | system
+      // 调试/截图可用 ?theme=light|dark|system 直接改偏好（会写进 localStorage）。
+      (function () {
+        try {
+          var forced = new URLSearchParams(location.search).get('theme');
+          if (forced === 'light' || forced === 'dark' || forced === 'system') {
+            localStorage.setItem('flowedge.theme', forced);
+          }
+          var pref = localStorage.getItem('flowedge.theme') || 'dark';
+          if (pref !== 'light' && pref !== 'dark') {
+            pref = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+          }
+          document.documentElement.setAttribute('data-theme', pref);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
   </head>
   <body class="bg-canvas text-white">
     <div id="root"></div>

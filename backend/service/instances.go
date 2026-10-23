@@ -67,7 +67,25 @@ func defaultInstances(h3URL string) []Instance {
 			ExclusiveGroup: "gpu-exclusive", ReserveVRAM: 4, Enabled: true,
 			Note: "H3 独立工作树：torch 2.14 + 量化后端；与主实例互斥（不能同时驻留）",
 		},
+		{
+			// MOSS-Image：必须走 0.41+ 的 ComfyUI（MOSS 节点在 v0.41.0 之后才合入），
+			// 主实例停在 0.31（comfy-kitchen 0.2.27 + torch 2.6 的血泪组合，动不得）。
+			// 与 H3 同组的原因和 H3 一样：5B DiT + 9B 编码器约 11GB，加上主实例
+			// 驻留的 flux 17GB 是 28GB > 24GB，同卡必 OOM。
+			Name: "moss", BaseURL: mossInstanceURL(),
+			Models:         []string{"moss_image*", "qwen3.5_9b*", "flux2-vae*"},
+			ExclusiveGroup: "gpu-exclusive", ReserveVRAM: 2, Enabled: true,
+			Note: "MOSS-Image 专用工作树（ComfyUI 0.41，复用 H3 的 torch 2.14 venv）；文字渲染与布局控制",
+		},
 	}
+}
+
+// mossInstanceURL MOSS 实例地址（MOSS_BASE_URL 可覆盖，默认 8190）
+func mossInstanceURL() string {
+	if v := strings.TrimSpace(os.Getenv("MOSS_BASE_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://127.0.0.1:8190"
 }
 
 // LoadInstanceRegistry 读配置；文件不存在则落一份默认（用户需要看到在哪加实例）
@@ -99,7 +117,99 @@ func LoadInstanceRegistry(p, h3URL string) *InstanceRegistry {
 	if strings.TrimSpace(f.Default) != "" {
 		r.def = f.Default
 	}
+	// 迁移：引擎新增了实例（例如 MOSS），但老配置文件里没有 → 补进去并落盘。
+	//
+	// 为什么必须在代码里做而不是让用户手改：实例表是数据驱动的，而"数据文件优先于内置默认"
+	// 意味着**新版本加了实例，老用户的机器上永远不会生效**。表现是
+	// 「后端选了 moss，图却发给了主实例」→ ComfyUI 400，报错完全不指向实例。
+	// 2026-10-23 真机复现：`运行/data/instances.json` 只有 main + h3，
+	// moss 权重被路由到 8188，而 8188 上根本没有 MOSS 节点。
+	if r.mergeBuiltinInstances(defaultInstances(h3URL)) {
+		if err := r.Save(); err != nil {
+			r.loadNote = "已补齐内置实例但写回失败（本次运行有效）：" + err.Error()
+		}
+	}
 	return r
+}
+
+// mergeBuiltinInstances 把内置里「配置还没有、也没被别人覆盖」的实例补进来。
+//
+// 两条保守规则（宁可少补也不乱补）：
+//  1. 同名实例已存在 → 保留用户那份，不动
+//  2. 任何已有实例的模型通配与内置实例前缀重叠 → 视为用户已经自己配过，不补
+//     （避免把用户故意删掉的实例又复活成两份）
+func (r *InstanceRegistry) mergeBuiltinInstances(builtin []Instance) bool {
+	// 前提：这份配置是「引擎维护的」。判据是它里面还留着至少一个内置实例名。
+	// 用户要是完全自己重写了实例表（一个内置名都不剩），说明他就是要这份清单，
+	// 补内置等于回填他删掉的东西——既有测试 TestInstanceRegistry_SaveLoad 盯的就是这条。
+	managed := false
+	builtinNames := map[string]bool{}
+	for _, b := range builtin {
+		builtinNames[b.Name] = true
+	}
+	for _, it := range r.items {
+		if builtinNames[it.Name] {
+			managed = true
+			break
+		}
+	}
+	if !managed {
+		return false
+	}
+	changed := false
+	for _, b := range builtin {
+		if strings.TrimSpace(b.Name) == "" {
+			continue
+		}
+		exists, covered := false, false
+		for _, it := range r.items {
+			if it.Name == b.Name {
+				exists = true
+				break
+			}
+			for _, have := range it.Models {
+				for _, want := range b.Models {
+					if modelsOverlap(have, want) {
+						covered = true
+					}
+				}
+			}
+		}
+		if exists || covered {
+			continue
+		}
+		r.items = append(r.items, b)
+		changed = true
+	}
+	return changed
+}
+
+// modelsOverlap 两个通配 pattern 是否指向同一族模型。
+//
+// 必须按**分隔符边界**判断，不能只看字符串前缀：`flux*` 与 `flux2-vae*`
+// 在字符上前缀重叠，但一个是 flux checkpoint、一个是 FLUX.2 的 VAE，
+// 混为一谈会让「用户已经配过 moss」被误判成立，于是 moss 实例永远补不进来
+// （2026-10-23 实测踩到：moss 权重被路由回主实例）。
+func modelsOverlap(a, b string) bool {
+	a = strings.ToLower(strings.TrimRight(strings.TrimSpace(a), "*"))
+	b = strings.ToLower(strings.TrimRight(strings.TrimSpace(b), "*"))
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if !strings.HasPrefix(b, a) {
+		return false
+	}
+	switch b[len(a)] {
+	case '_', '-', '.', '/':
+		return true
+	}
+	return false
 }
 
 // Path 配置文件位置（空 = 纯内存）
@@ -277,6 +387,25 @@ func (r *InstanceRegistry) Replace(items []Instance) error {
 	r.items = items
 	r.mu.Unlock()
 	return nil
+}
+
+// baseForModelName 按权重文件名路由实例（供文生图后端使用）。
+//
+// 与 baseForKind 的区别：kind 是「节点要什么」，模型名是「这次实际加载哪个文件」。
+// MOSS 必须用模型名路由——同一个 text2image 节点换后端就要换实例，
+// 按 kind 永远只会落到主实例，然后报 400（主实例没有 UNETLoader 的 moss 权重）。
+func (s *Text2ImageService) baseForModelName(model string) string {
+	if s == nil {
+		return ""
+	}
+	if s.Instances == nil {
+		return s.BaseURL
+	}
+	inst := s.Instances.ResolveForModel(model)
+	if inst.BaseURL != "" {
+		return inst.BaseURL
+	}
+	return s.BaseURL
 }
 
 // baseForKind 按媒体类型取实例地址（供 comfy_media 使用）。

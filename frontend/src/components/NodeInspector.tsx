@@ -1,8 +1,15 @@
 import type { Edge, Node } from '@xyflow/react'
 
-import { LLM_TOOL_OPTIONS, NODE_OUTPUT_FIELDS } from '../config/graph'
+import { LLM_TASK_PRESETS, NODE_OUTPUT_FIELDS, PALETTE } from '../config/graph'
+import NodePipeline, { type PeerRef } from './NodePipeline'
+import { type Binding, type CardCatalog, type LLMProfile } from '../lib/cards'
+import { SOURCE_CONSUMERS, SOURCE_PORT, effectiveSourceKind, extOf, inferSourceKind, isPlaceholderPath } from '../lib/inputSource'
+import { agentStateClass, agentStateLabel, type AgentStatus } from '../lib/agents'
 import ErrorNotice from './ErrorNotice'
+import MCPCallFields from './MCPCallFields'
+import GenericNodeFields from './GenericNodeFields'
 import type { ErrorAction } from '../lib/errorHints'
+import { typeLabel } from '../lib/modules'
 
 // 右侧属性面板（从 App.tsx 抽出，约 1,500 行 JSX）。
 //
@@ -12,6 +19,37 @@ import type { ErrorAction } from '../lib/errorHints'
 //
 // 它不持有任何状态：tab 由上层给、数据改动一律 onUpdate 回调出去。
 // 这样 App 仍然是唯一的状态源，拆分不会引入两份真相。
+
+/** 吃文本输入的节点：输入处理段对它们有意义。 */
+const TEXT_IN = new Set([
+  'llm', 'prompt_opt', 'storyboard', 'scene_grid', 'vision', 'select',
+  'text2image', 'text2video', 'tts', 'asr', 'sub_workflow', 'code',
+  'data_transform', 'http_request', 'rag_query', 'if_else', 'loop',
+  'end', 'comfy_workflow', 'shotlist', 'subtitles', 'post_production',
+])
+
+/** 产出图片/视频的节点：输出段只对「看图」类卡有意义。 */
+const MEDIA_OUT = new Set([
+  'text2image', 'image2image', 'inpaint', 'upscale', 'text2video',
+  'video_compose', 'comfy_workflow', 'shotlist',
+])
+
+/** 产出文本的节点：输出处理段对它们有意义（出图的节点产 image，整形文本没落点）。 */
+const TEXT_OUT = new Set([
+  'start', 'llm', 'prompt_opt', 'storyboard', 'scene_grid', 'vision', 'select',
+  'asr', 'data_transform', 'http_request', 'rag_query', 'if_else', 'loop',
+  'aggregate', 'code',
+])
+
+/** 不显示「可用变量」的节点：它们没有手写文本参数，列引用只会干扰。 */
+const NO_VAR_PICKER = new Set(['text2image', 'end', 'start'])
+
+/** 中文翻译三态。旧数据只有 auto_translate 布尔，这里做一次兼容映射。 */
+export function translateModeOf(data: Record<string, unknown>): 'off' | 'auto' | 'force' {
+  const m = data?.translate_mode
+  if (m === 'off' || m === 'auto' || m === 'force') return m
+  return data?.auto_translate === true ? 'force' : 'off'
+}
 
 export interface NodeInspectorProps {
   node: Node | null
@@ -27,6 +65,30 @@ export interface NodeInspectorProps {
   /** 子工作流节点要选一个已保存的工作流 */
   savedWorkflows?: any[]
   currentWorkflowId?: number
+  /** 能力卡片目录（App 拉一次，向下透传） */
+  cards?: CardCatalog | null
+  /** 本机 Ollama 已装模型（模型下拉用） */
+  availableModels?: string[]
+  /** 自定义模型端点 */
+  llmProfiles?: LLMProfile[]
+  /** 外部智能体名册（agent_task 的「智能体」下拉）。含探活结果，不只是配置 */
+  agents?: AgentStatus[]
+  /** 名册重新体检（面板上「重新探测」按钮） */
+  onReloadAgents?: () => void
+  /** 模型元信息：默认模型名 / 各模型体积 / 出图权重 */
+  modelMeta?: {
+    def: string
+    sizes: Record<string, number>
+    ckpt: string
+    checkpoints?: string[]
+    vision?: string
+  }
+  /** 点上游/下游直接选中那个节点 */
+  onSelectNode?: (id: string) => void
+  /** 卡片库被编辑后重新拉目录 */
+  onReloadCards?: () => void
+  /** 这条工作流的外部接入方式（开始节点显示"谁在调我"） */
+  entry?: { saved: boolean; webhook: boolean; cron: string }
 }
 
 export default function NodeInspector({
@@ -40,7 +102,40 @@ export default function NodeInspector({
   onErrorAction,
   savedWorkflows = [],
   currentWorkflowId,
+  cards = null,
+  availableModels = [],
+  llmProfiles = [],
+  agents = [],
+  onReloadAgents,
+  modelMeta = { def: '', sizes: {}, ckpt: '', checkpoints: [], vision: '' },
+  onSelectNode,
+  entry = { saved: false, webhook: false, cron: '' },
+  onReloadCards,
 }: NodeInspectorProps) {
+  // LLM 的工具配置（搬进处理链后，这里只负责把数据取出来）
+  const llmTools = (node?.data?.tools as string[]) || []
+  const llmTrace = ((node?.data?.output as Record<string, unknown> | undefined)?.tool_calls as
+    | { tool?: string; status?: string; arguments?: string }[]
+    | undefined) || []
+
+  // 接线：谁喂我、我喂谁。索引按节点 id 建，边里只有 id。
+  const peers = (() => {
+    const byId = new Map<string, string>()
+    nodes.forEach((n) => byId.set(n.id, (n.type as string) || '?'))
+    const of = (id: string) => byId.get(id) || '?'
+    const isCanvas = (id: string) => {
+      const t = byId.get(id)
+      return t === 'note' || t === 'group'
+    }
+    const ins: PeerRef[] = edges
+      .filter((e) => e.target === node?.id && !isCanvas(e.source))
+      .map((e) => ({ id: e.source, type: of(e.source), port: (e.targetHandle as string) || undefined }))
+    const outs: PeerRef[] = edges
+      .filter((e) => e.source === node?.id && !isCanvas(e.target))
+      .map((e) => ({ id: e.target, type: of(e.target), port: (e.targetHandle as string) || undefined }))
+    return { in: ins, out: outs }
+  })()
+
   return (
     <div className="w-72 border-l border-border bg-surface p-4 overflow-y-auto">
     {/* Tab 切换：此前三个按钮都没有 onClick，「输出」「日志」实际是死按钮 */}
@@ -95,12 +190,54 @@ export default function NodeInspector({
     ) : node ? (
       <div className="flex flex-col gap-4">
         <div>
-          <label className="text-xs text-gray-400 block mb-1">节点类型</label>
-          <p className="text-sm text-white">{node.type}</p>
+          <label className="text-xs fe-dim block mb-1">节点类型</label>
+          {/* 人话名为主、原始 type 为辅：接口没拿到标签时两者相同，不会出现空白 */}
+          <p className="text-sm fe-t1 flex items-baseline gap-2">
+            {typeLabel(node.type)}
+            <span className="text-[10px] fe-dim3 font-mono">{node.type}</span>
+          </p>
         </div>
 
-        {/* 可用变量：列出上游节点输出，点击复制引用写法 */}
-        {(() => {
+        {/* 处理链：接线 + 输入/本体/输出三段。三类卡可以同时挂。
+            开始节点例外——它只有一个提示词，挂卡没有落点。 */}
+        {node.type !== 'start' && (
+        <div className="mb-2">
+          <NodePipeline
+            data={node.data as Record<string, unknown>}
+            cards={cards}
+            upstream={peers.in}
+            downstream={peers.out}
+            textIn={TEXT_IN.has(node.type || '')}
+            textOut={TEXT_OUT.has(node.type || '')}
+            mediaOut={MEDIA_OUT.has(node.type || '')}
+            bodyCapable={node.type === 'llm'}
+            nodeType={node.type}
+            onChange={(list: Binding[]) => onUpdate('bindings', list)}
+            onJump={(id) => onSelectNode?.(id)}
+            onNotify={onNotify}
+            onReloadCards={onReloadCards}
+            tools={
+              node.type === 'llm'
+                ? {
+                    list: llmTools,
+                    maxRounds: Number(node.data.max_tool_rounds ?? 4),
+                    strict: node.data.tool_strict === true,
+                    trace: llmTrace,
+                    onChange: (patch) => {
+                      if (patch.tools) onUpdate('tools', patch.tools)
+                      if (patch.maxRounds !== undefined) onUpdate('max_tool_rounds', patch.maxRounds)
+                      if (patch.strict !== undefined) onUpdate('tool_strict', patch.strict)
+                    },
+                  }
+                : undefined
+            }
+          />
+        </div>
+        )}
+
+        {/* 可用变量：只有"要手写引用"的节点才显示。
+            text2image / end 这类不吃手写文本的节点列一堆 {{...}} 只是噪音。 */}
+        {!NO_VAR_PICKER.has(node.type || '') && (() => {
           const ups = nodes.filter((n) =>
             edges.some((e) => e.target === node.id && e.source === n.id),
           )
@@ -140,16 +277,198 @@ export default function NodeInspector({
         })()}
 
         {node.type === 'start' && (
-          <div>
-            <label className="text-xs text-gray-400 block mb-1">输入提示词</label>
-            <textarea
-              value={(node.data.prompt as string) || ''}
-              onChange={(e) => onUpdate('prompt', e.target.value)}
-              className="w-full h-24 px-3 py-2 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
-              placeholder="输入要传递给下游的文本..."
+          <div className="flex flex-col gap-3">
+            {/* 前置上游"源"：不是画布节点，而是工作流级事实——谁把任务交进来。 */}
+            <NodePipeline
+              data={node.data as Record<string, unknown>}
+              cards={cards}
+              upstream={peers.in}
+              downstream={peers.out}
+              textIn={false}
+              textOut={false}
+              bodyCapable={false}
+              lineageOnly
+              entrySource={(node.data.entry_agent as string) || 'manual'}
+              onEntrySourceChange={(v) => onUpdate('entry_agent', v)}
+              entryExtra={entry}
+              onChange={() => {}}
+              onJump={(id) => onSelectNode?.(id)}
+              onNotify={onNotify}
             />
+
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">输入提示词</label>
+              <textarea
+                value={(node.data.prompt as string) || ''}
+                onChange={(e) => onUpdate('prompt', e.target.value)}
+                className="w-full h-24 px-3 py-2 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
+                placeholder="输入要传递给下游的文本..."
+              />
+            </div>
+
           </div>
         )}
+
+        {/* 文件源：把已存在的本地文件接进图里。
+            没有它，「转写这段录音」在图上就表达不出来 —— start 只输出 text。 */}
+        {node.type === 'input_source' && (() => {
+          const rawKind = String(node.data.kind || '')
+          const path = String(node.data.path || '')
+          const inferred = inferSourceKind(path)
+          const effKind = effectiveSourceKind(node.data as Record<string, unknown>)
+          // 显式类型与扩展名不符：面板上直接说，不等运行时
+          const mismatch = !!rawKind && !!inferred && rawKind !== inferred
+          const placeholder = isPlaceholderPath(path)
+          const kindForText = effKind === 'text'
+
+          return (
+            <div className="flex flex-col gap-3">
+              <p className="text-[10px] text-gray-500 leading-relaxed">
+                把<strong className="text-gray-400">已经存在的本地文件</strong>接进图里。
+                四个输出端口互斥——实际只输出所选类型的那一个，
+                下游要接对应类型的端口。
+              </p>
+
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">文件类型</label>
+                <select
+                  value={rawKind}
+                  onChange={(e) => onUpdate('kind', e.target.value)}
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
+                >
+                  <option value="">自动（按扩展名）</option>
+                  <option value="image">图片</option>
+                  <option value="audio">音频</option>
+                  <option value="video">视频</option>
+                  <option value="text">文本</option>
+                </select>
+                <p className="text-[10px] text-gray-600 mt-1 leading-relaxed">
+                  将输出端口：<code className="text-data">{SOURCE_PORT[effKind]}</code>
+                  {!rawKind && inferred ? `（按扩展名 ${extOf(path)} 推断）` : ''}
+                  {' · '}可接 {SOURCE_CONSUMERS[effKind]}
+                </p>
+              </div>
+
+              {!kindForText && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">文件路径</label>
+                  <input
+                    value={path}
+                    onChange={(e) => onUpdate('path', e.target.value)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[11px] font-mono focus:border-primary outline-none"
+                    placeholder="D://素材//录音.wav"
+                  />
+                  {placeholder ? (
+                    <p className="text-[10px] text-amber-400/90 mt-1 leading-relaxed">
+                      还是占位值——图可以先搭起来，运行时它会明确报「还没给文件」，不会静默失败。
+                    </p>
+                  ) : mismatch ? (
+                    <p className="text-[10px] text-red-400 mt-1 leading-relaxed">
+                      扩展名 <code>{extOf(path)}</code> 看起来是「{inferred}」，与所选「{rawKind}」不符。
+                      运行时会拒绝，请改类型或换文件。
+                    </p>
+                  ) : (
+                    <p className="text-[10px] text-gray-600 mt-1 leading-relaxed">
+                      本地绝对路径。运行时校验：文件必须存在、非空、不是目录。
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {kindForText && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">文本内容</label>
+                  <textarea
+                    value={String(node.data.text || '')}
+                    onChange={(e) => onUpdate('text', e.target.value)}
+                    className="w-full h-20 px-2 py-1.5 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
+                    placeholder="留空则取上游文本，或把 path 直接当一段文字用"
+                  />
+                </div>
+              )}
+            </div>
+          )
+        })()}
+
+        {/* 文本拆分：长文案切成多段。切点永远在句末，不会从句中间断开。 */}
+        {node.type === 'text_split' && (() => {
+          const mode = String(node.data.mode || 'by_sentence')
+          const text = String(node.data.text || '')
+          const chars = Array.from(text).length
+          const modeHelp: Record<string, string> = {
+            by_sentence: '每句一段。TTS 逐句配音、字幕逐句上屏都用这个。',
+            by_paragraph: '按空行分段；没有空行时按行分（剧本常见的「一句一行」）。',
+            by_count: '先按句切开，再合并成 N 段，切点仍在句末。',
+            by_length: '每段不超过 N 字，超了就在句末断开。',
+          }
+          return (
+            <div className="flex flex-col gap-3">
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">拆分方式</label>
+                <select
+                  value={mode}
+                  onChange={(e) => onUpdate('mode', e.target.value)}
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
+                >
+                  <option value="by_sentence">按句子</option>
+                  <option value="by_paragraph">按段落</option>
+                  <option value="by_count">合并成 N 段</option>
+                  <option value="by_length">每段不超过 N 字</option>
+                </select>
+                <p className="text-[10px] text-gray-600 mt-1 leading-relaxed">{modeHelp[mode]}</p>
+              </div>
+
+              {mode === 'by_count' && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">段数</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={(node.data.count as number) ?? 3}
+                    onChange={(e) => onUpdate('count', Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
+                  />
+                  <p className="text-[10px] text-gray-600 mt-1">
+                    句子数少于段数时按句子数给，不会硬造空段。
+                  </p>
+                </div>
+              )}
+
+              {mode === 'by_length' && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">每段字数上限</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={(node.data.max_chars as number) ?? 80}
+                    onChange={(e) => onUpdate('max_chars', Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
+                  />
+                </div>
+              )}
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-gray-400">文本内容</label>
+                  <span className="text-[10px] text-gray-600 tabular-nums">{chars} 字</span>
+                </div>
+                <textarea
+                  value={text}
+                  onChange={(e) => onUpdate('text', e.target.value)}
+                  className="w-full h-24 px-2 py-1.5 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
+                  placeholder="留空则取上游节点的文本"
+                />
+              </div>
+
+              <p className="text-[10px] text-gray-600 leading-relaxed">
+                输出 <code className="text-data">text</code>（拼回全文，可直接接 TTS）、
+                <code className="text-data">parts</code>（分段数组，可给 loop 的 items 逐段处理）、
+                <code className="text-data">count</code>（段数）。
+                拆分是确定性的——同一段文本两次切出同样的结果。
+              </p>
+            </div>
+          )
+        })()}
 
         {/* 代码执行节点：Go 子集沙箱（yaegi 解释执行，stdlib 白名单） */}
         {node.type === 'code' && (
@@ -217,133 +536,243 @@ export default function NodeInspector({
           </>
         )}
 
-        {node.type === 'llm' && (
-          <>
-            <div>
-              <label className="text-xs text-gray-400 block mb-1">模型</label>
-              <input
-                value={(node.data.model as string) || ''}
-                onChange={(e) => onUpdate('model', e.target.value)}
-                className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
-                placeholder="留空则用自动探测到的模型"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-gray-400 block mb-1">自定义提示词（可选）</label>
-              <textarea
-                value={(node.data.prompt as string) || ''}
-                onChange={(e) => onUpdate('prompt', e.target.value)}
-                className="w-full h-24 px-3 py-2 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
-                placeholder="留空则使用上游输入..."
-              />
-            </div>
+        {node.type === 'llm' && (() => {
+          const curModel = (node.data.llm_profile as string)
+            ? `profile:${node.data.llm_profile}`
+            : ((node.data.model as string) || '')
+          const presetId = (() => {
+            const explicit = node.data.task_preset as string
+            if (explicit) return explicit
+            const p = (node.data.prompt as string) || ''
+            const hit = LLM_TASK_PRESETS.find((x) => x.prompt && x.prompt === p)
+            return hit ? hit.id : 'custom'
+          })()
+          const preset = LLM_TASK_PRESETS.find((x) => x.id === presetId) || LLM_TASK_PRESETS[4]
 
-            <div>
-              <label className="text-xs text-gray-400 block mb-1">工具调用（可选）</label>
-              <div className="flex flex-wrap gap-1.5">
-                {LLM_TOOL_OPTIONS.map((tool) => {
-                  const cur = ((node.data.tools as string[]) || [])
-                  const on = cur.includes(tool.id)
-                  return (
-                    <button
-                      key={tool.id}
-                      onClick={() =>
-                        onUpdate(
-                          'tools',
-                          on ? cur.filter((x) => x !== tool.id) : [...cur, tool.id],
-                        )
-                      }
-                      className={`px-2 py-1 rounded-md text-[11px] border transition-all ${
-                        on
-                          ? 'bg-ai/20 border-ai/60 text-white'
-                          : 'bg-canvas border-border text-gray-400 hover:border-ai/40'
-                      }`}
-                    >
-                      {tool.label}
-                    </button>
-                  )
-                })}
+          return (
+            <div className="flex flex-col gap-3">
+              {/* 模型：本地已装 + 自定义端点，二选一。
+                  以前是自由文本框，写错一个字符要跑到运行期才报"模型不存在"。 */}
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">模型</label>
+                <select
+                  value={curModel}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    if (v.startsWith('profile:')) {
+                      onUpdate('llm_profile', v.slice(8))
+                      onUpdate('model', '')
+                    } else {
+                      onUpdate('llm_profile', '')
+                      onUpdate('model', v)
+                    }
+                  }}
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs outline-none focus:border-primary"
+                >
+                  <option value="">
+                    {modelMeta.def ? `跟随引擎默认（${modelMeta.def}）` : '跟随引擎默认（未探测到模型）'}
+                  </option>
+                  {/* 工作流里存着的模型可能已经不在这台机器上（换了机器 / 删了模型）。
+                      仍然要能回显，并明确标出"不在清单中"——静默回落会让用户以为还在用它。 */}
+                  {(() => {
+                    const m = (node.data.model as string) || ''
+                    if (!m || availableModels.includes(m)) return null
+                    return (
+                      <option value={m}>{m}（不在清单中）</option>
+                    )
+                  })()}
+                  {availableModels.length > 0 && (
+                    <optgroup label="本机 Ollama">
+                      {availableModels.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                          {modelMeta.sizes[m] ? ` · ${modelMeta.sizes[m].toFixed(1)}GB` : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {llmProfiles.length > 0 && (
+                    <optgroup label="我的模型（自定义端点）">
+                      {llmProfiles.map((p) => (
+                        <option key={p.name} value={`profile:${p.name}`}>
+                          {p.name} · {p.model}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+                {curModel.startsWith('profile:') && (
+                  <p className="text-[10px] text-gray-500 mt-1">
+                    {(() => {
+                      const p = llmProfiles.find((x) => x.name === (node.data.llm_profile as string))
+                      if (!p) return '该模型已从清单里删除，运行时会被拦下'
+                      return `${p.base_url} · 非流式（自定义端点不做打字机效果）`
+                    })()}
+                  </p>
+                )}
               </div>
-              <p className="text-[10px] text-gray-500 mt-1">
-                勾选后模型可自行决定调用（最多 4 轮），全部在本地执行
+
+              {/* 任务：预设替代空提示词框。空框里模型只会把输入当聊天问题回答。 */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-gray-400">任务</label>
+                  {(node.data.bindings as unknown[] | undefined)?.some(
+                    (b) => (b as { stage?: string }).stage === 'body',
+                  ) && <span className="text-[9px] text-amber-500/90">本体角色卡已接管提示词，预设不生效</span>}
+                </div>
+                <select
+                  value={preset.id}
+                  onChange={(e) => {
+                    const p = LLM_TASK_PRESETS.find((x) => x.id === e.target.value)
+                    if (!p) return
+                    onUpdate('task_preset', p.id)
+                    if (p.id !== 'custom') onUpdate('prompt', p.prompt)
+                  }}
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs outline-none focus:border-primary"
+                >
+                  {LLM_TASK_PRESETS.map((x) => (
+                    <option key={x.id} value={x.id}>{x.label}</option>
+                  ))}
+                </select>
+                <p className="text-[10px] text-gray-500 mt-1 leading-relaxed">{preset.hint}</p>
+                {preset.id === 'custom' && (
+                  <textarea
+                    value={(node.data.prompt as string) || ''}
+                    onChange={(e) => onUpdate('prompt', e.target.value)}
+                    placeholder="写系统提示词：角色 + 输出格式 + 禁止项"
+                    className="w-full h-20 mt-1.5 px-3 py-2 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
+                  />
+                )}
+              </div>
+
+              <p className="text-[10px] leading-relaxed" style={{ color: '#6B7688' }}>
+                要新增端点：配置 · 模型 → 自定义模型（填 base_url 与凭据名，密钥存凭据面板）。
               </p>
             </div>
-          </>
-        )}
+          )
+        })()}
 
         {node.type === 'text2image' && (
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-3">
+            {/* 后端不是"换权重名"，是换整套 ComfyUI 构图：
+                flux 走 CheckpointLoaderSimple，MOSS 走 UNETLoader + 独立编码器 + 独立 VAE。
+                代价差一个数量级，必须在选的时候就说清楚。 */}
             <div>
-              <label className="text-xs text-gray-400 block mb-1">
-                批量提示词（一行一条，留空用上游/单条）
-              </label>
-              <textarea
-                rows={4}
-                value={(node.data.prompts as string) || ''}
-                onChange={(e) => onUpdate('prompts', e.target.value)}
-                placeholder={'分镜1：雪山顶的白鹿，远景\n分镜2：鹿的特写，逆光\n分镜3：空镜，只留雪与天'}
-                className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y font-mono"
-              />
+              <label className="text-xs text-gray-400 block mb-1">出图后端</label>
+              <select
+                value={(node.data.backend as string) || 'auto'}
+                onChange={(e) => onUpdate('backend', e.target.value)}
+                className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[11px] outline-none focus:border-primary"
+              >
+                <option value="auto">自动：图里有字才用 MOSS，否则 flux</option>
+                <option value="flux">flux：4 步最快，但画不出可读文字</option>
+                <option value="moss">MOSS-Image：渲染图内文字 + bbox 摆位（50 步）</option>
+              </select>
+              <p className="text-[10px] text-gray-500 leading-relaxed mt-1.5">
+                「自动」的判据：填了布局 → MOSS；提示词里出现「写着/标题/字幕/海报/招牌/排版/logo」→ MOSS；
+                其余走 flux。flux 画文字只会画出像字的笔画，MOSS 能真正写出来，代价是从 4 步变 50 步。
+              </p>
             </div>
-            <label className="flex items-center gap-2 text-[11px] text-gray-400">
+
+            {((node.data.backend as string) === 'moss' || !(node.data.backend as string)) && (
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">布局（MOSS 专有，可留空）</label>
+                <textarea
+                  value={(node.data.layout as string) || ''}
+                  onChange={(e) => onUpdate('layout', e.target.value)}
+                  rows={4}
+                  spellCheck={false}
+                  placeholder={'[{"type":"text","text":"山海神兽","bbox":[80,120,220,880]}]'}
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[11px] outline-none focus:border-primary font-mono"
+                />
+                <p className="text-[9px] text-gray-600 leading-relaxed mt-1">
+                  bbox 是 0-1000 的 [y0,x0,y1,x1]，原点左上（改分辨率不用重画框）。
+                  type 填 text（渲染文字）/ object / character。也可由上游 JSON 端口喂进来。
+                </p>
+              </div>
+            )}
+
+            {/* 提示词不再在节点里手写：只有一个来源——上游文本。
+                少一个输入框就少一处"两处真相"（节点参数 vs 上游）。 */}
+            <div className="rounded-lg border border-border bg-canvas/60 px-3 py-2">
+              <p className="text-[11px] text-gray-300">提示词来自上游文本</p>
+              <p className="text-[10px] text-gray-500 mt-1 leading-relaxed">
+                连一条文本线（开始 / AI 推理 / 分镜规划）即可。本节点不再接受手写提示词。
+              </p>
+            </div>
+
+            <label className="flex items-start gap-2 text-[11px] text-gray-400">
               <input
                 type="checkbox"
+                className="mt-0.5"
                 checked={Boolean(node.data.split_lines)}
                 onChange={(e) => onUpdate('split_lines', e.target.checked)}
               />
-              把上游文本按行拆成多条（接 LLM 拆分镜时用）
+              <span>
+                上游文本按行拆成多条
+                <span className="block text-[10px] text-gray-500 mt-0.5">
+                  同一次模型加载跑完，比逐条省掉每条的冷启动
+                </span>
+              </span>
             </label>
-            <p className="text-[10px] text-gray-500 leading-relaxed">
-              多条提示词会在**同一次模型加载**里跑完，比逐条省掉每条的冷启动。
-            </p>
-          </div>
-        )}
 
-        {node.type === 'text2image' && (
-          <>
+            <div className="grid grid-cols-3 gap-2">
+              {([['width', '宽'], ['height', '高'], ['batch', '每条张数']] as const).map(([k, label]) => (
+                <div key={k}>
+                  <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                  <input
+                    type="number"
+                    value={Number(node.data[k] ?? (k === 'batch' ? 1 : 1024))}
+                    onChange={(e) => onUpdate(k, Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+              ))}
+            </div>
+
             <div>
-              <label className="text-xs text-gray-400 block mb-1">提示词</label>
-              <textarea
-                value={(node.data.prompt as string) || ''}
-                onChange={(e) => onUpdate('prompt', e.target.value)}
-                className="w-full h-20 px-3 py-2 rounded-lg bg-canvas border border-border text-sm resize-none focus:border-primary outline-none"
-                placeholder="描述要生成的图片..."
-              />
+              <label className="text-xs text-gray-400 block mb-1">出图权重</label>
+              <select
+                value={(node.data.ckpt as string) || ''}
+                onChange={(e) => onUpdate('ckpt', e.target.value)}
+                className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-[11px] outline-none focus:border-primary"
+              >
+                <option value="">
+                  跟随全局（{modelMeta.ckpt || '未探测'}）
+                </option>
+                {(modelMeta.checkpoints || []).map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[9px] text-gray-600 mt-1">
+                只在这台机器已有的权重里选。改了它这个节点就用自己的权重，不影响别的节点。
+              </p>
             </div>
-            <label className="flex items-center gap-2 text-[11px] text-gray-400">
-              <input
-                type="checkbox"
-                checked={node.data.auto_translate === true}
-                onChange={(e) => onUpdate('auto_translate', e.target.checked)}
-              />
-              检测到中文时自动过本地 LLM 译成英文（flux 对中文弱）
-            </label>
-            <p className="text-[10px] text-gray-500 leading-relaxed">
-              flux 的文本编码器以英文为主：纯中文提示词经常只画出「通用风景」。
-              勾选后由本地 LLM 在进模型前翻译，翻译失败会自动降级用原文并在输出里留痕
-              （<code>translated</code> / <code>translate_error</code>）。
-            </p>
-            <div className="flex gap-2">
-              <div>
-                <label className="text-xs text-gray-400 block mb-1">宽度</label>
-                <input
-                  type="number"
-                  value={(node.data.width as number) || 1024}
-                  onChange={(e) => onUpdate('width', e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
-                />
-              </div>
-              <div>
-                <label className="text-xs text-gray-400 block mb-1">高度</label>
-                <input
-                  type="number"
-                  value={(node.data.height as number) || 1024}
-                  onChange={(e) => onUpdate('height', e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg bg-canvas border border-border text-sm focus:border-primary outline-none"
-                />
-              </div>
+
+            <div>
+              <label className="text-xs text-gray-400 block mb-1">中文 → 英文</label>
+              <select
+                value={translateModeOf(node.data as Record<string, unknown>)}
+                onChange={(e) => {
+                  onUpdate('translate_mode', e.target.value)
+                  // 同步旧字段，老版本引擎/旧工作流仍能读懂
+                  onUpdate('auto_translate', e.target.value !== 'off')
+                }}
+                className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs outline-none focus:border-primary"
+              >
+                <option value="off">不翻译（提示词已是英文）</option>
+                <option value="auto">自动：语言模型已驻留才翻</option>
+                <option value="force">总是先翻译</option>
+              </select>
+              <p className="text-[10px] text-gray-500 leading-relaxed mt-1.5">
+                flux 的文本编码器以英文为主，纯中文常只画出「通用风景」。
+                「自动」只在语言侧权重已在显存时才翻，避免为一次翻译多付约 180 秒换侧；
+                翻译失败会降级用原文，并在输出里留痕（translated / translate_error）。
+              </p>
             </div>
-          </>
+          </div>
         )}
 
         {(node.type === 'sub_workflow' || node.type === 'loop') && (
@@ -563,16 +992,16 @@ export default function NodeInspector({
               />
             </div>
             <div>
-              <label className="text-xs text-gray-400 block mb-1">语音名片段（可选）</label>
+              <label className="text-xs text-gray-400 block mb-1">语音名（可选）</label>
               <input
                 value={(node.data.voice as string) || ''}
                 onChange={(e) => onUpdate('voice', e.target.value)}
-                placeholder="如 Huihui；留空用系统默认"
+                placeholder="Kokoro：zf_xiaobei / af_heart；Audio8：default 或已注册音色名"
                 className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
               />
             </div>
             <div>
-              <label className="text-xs text-gray-400 block mb-1">语速（-10 ~ 10）</label>
+              <label className="text-xs text-gray-400 block mb-1">语速（-10 ~ 10，仅 Kokoro 生效）</label>
               <input
                 type="number"
                 min={-10}
@@ -583,7 +1012,9 @@ export default function NodeInspector({
               />
             </div>
             <p className="text-[10px] text-gray-500">
-              Windows 下走系统内置 SAPI（无需 Python 服务）；配置了 TTS_BASE_URL 时优先走服务。
+              后端由服务端 TTS_BASE_URL 决定：默认 Kokoro-82M（10 种固定音色、可调语速）；
+              切到 Audio8-TTS 0.1B（:8103）后支持零样本音色克隆、44.1kHz，但没有语速参数。
+              Audio8 的音色需先调 <code>POST /voices/register</code> 注册。
             </p>
           </div>
         )}
@@ -691,6 +1122,201 @@ export default function NodeInspector({
               氛围模式（疑似有人声即 FAIL，能量法判读）
             </label>
           </div>
+        )}
+
+        {node.type === 'consistency_gate' && (
+          <div className="flex flex-col gap-3">
+            <p className="text-[10px] text-gray-500 leading-relaxed">
+              像素侧的一致性门，与「场景九宫格」（文本侧）互补：九宫格保证各段收到同一句锁句，
+              这道门保证各段<strong className="font-medium">画出来</strong>是同一个场景。
+              三项独立判，任一项不过即阻断；报错会指名<strong className="font-medium">哪个格位</strong>漂了。
+            </p>
+            <div>
+              <label className="text-[10px] text-gray-500 block mb-1">
+                待检路径（一行一条，按生成顺序；留空则用上游 parts）
+              </label>
+              <textarea
+                value={String(node.data.inputs ?? '')}
+                onChange={(e) => onUpdate('inputs', e.target.value)}
+                rows={3}
+                placeholder={'D:\\film\\seg1.mp4\nD:\\film\\seg2.mp4'}
+                className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] text-gray-500 block mb-1">锚图（可选：定妆图 / 首段关键帧）</label>
+              <input
+                value={String(node.data.anchor ?? '')}
+                onChange={(e) => onUpdate('anchor', e.target.value)}
+                placeholder="留空则只比段与段"
+                className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+              />
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {([['layout_min', '布局下限'], ['palette_min', '配色下限'], ['luma_max', '亮度差上限']] as const).map(([k, label]) => (
+                <div key={k}>
+                  <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={Number(node.data[k] ?? 0)}
+                    onChange={(e) => onUpdate(k, Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {([['drift_layout_min', '累计漂移·布局'], ['drift_palette_min', '累计漂移·配色']] as const).map(([k, label]) => (
+                <div key={k}>
+                  <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={Number(node.data[k] ?? 0)}
+                    onChange={(e) => onUpdate(k, Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+              ))}
+            </div>
+            <label className="flex items-center gap-2 text-[11px] text-gray-400">
+              <input
+                type="checkbox"
+                checked={node.data.check_drift !== false}
+                onChange={(e) => onUpdate('check_drift', e.target.checked)}
+              />
+              查累积漂移（每段都比上一段差一点、整条跑偏）
+            </label>
+            <label className="flex items-center gap-2 text-[11px] text-gray-400">
+              <input
+                type="checkbox"
+                checked={node.data.warn_only === true}
+                onChange={(e) => onUpdate('warn_only', e.target.checked)}
+              />
+              只报不拦（调参阶段用：先跑一遍看实际数值分布，再定阈值）
+            </label>
+            <p className="text-[10px] text-gray-500 leading-relaxed">
+              默认阈值是拿本机真实成片标定过的：同场景 布局≥0.99 / 配色≥0.985 / 亮度差≤0.043，
+              换景样本落在 0.39 / 0.57 / 0.08。拿不准就先勾「只报不拦」跑一遍。
+            </p>
+          </div>
+        )}
+
+        {node.type === 'agent_task' && (() => {
+          // 选中的那个（可能已停用/不可用，仍要显示真实状态）
+          const picked = agents.find((a) => a.id === (node.data.agent_id as string))
+          const usable = agents.filter((a) => a.enabled === undefined || a.enabled === true)
+          return (
+            <div className="flex flex-col gap-3">
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1.5">
+                <p className="text-[10px] text-amber-300 leading-relaxed">
+                  ⚠ 这一步<strong className="font-medium">不承诺可复现</strong>：同一输入两次结果可能不同。
+                  任务书会标出「非确定性」，评测时本图要与确定性图分开统计。
+                </p>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[10px] text-gray-500">智能体</label>
+                  {onReloadAgents && (
+                    <button
+                      type="button"
+                      onClick={onReloadAgents}
+                      className="text-[10px] text-data hover:underline"
+                    >
+                      重新探测
+                    </button>
+                  )}
+                </div>
+                {usable.length === 0 ? (
+                  <p className="text-[10px] text-amber-400 leading-relaxed">
+                    没有可用的智能体。请在 <code className="text-data">data/agents.json</code> 里配置
+                    （或 <code className="text-data">PUT /api/agents</code>），内置示例默认是停用的。
+                  </p>
+                ) : (
+                  <select
+                    value={(node.data.agent_id as string) || ''}
+                    onChange={(e) => onUpdate('agent_id', e.target.value)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  >
+                    <option value="">— 选一个 —</option>
+                    {/* 不可用的仍然可选：允许先编排后补环境，但要在下面标出真实状态 */}
+                    {usable.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.label}（{a.kind}）· {agentStateLabel(a)}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {picked && (
+                  <p className={`text-[10px] mt-1 ${agentStateClass(picked)}`}>
+                    {picked.detail || agentStateLabel(picked)}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="text-[10px] text-gray-500 block mb-1">
+                  任务描述（留空则用上游文本）
+                </label>
+                <textarea
+                  value={(node.data.prompt as string) || ''}
+                  onChange={(e) => onUpdate('prompt', e.target.value)}
+                  rows={4}
+                  placeholder="例如：把这段分镜改写成 80 字以内的旁白，保留雨夜氛围"
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-[10px] text-gray-500 block mb-1">超时</label>
+                  <select
+                    value={String((node.data.timeout_ms as number) || '')}
+                    onChange={(e) => onUpdate('timeout_ms', e.target.value ? Number(e.target.value) : undefined)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  >
+                    <option value="">默认（5 分钟）</option>
+                    <option value="60000">1 分钟</option>
+                    <option value="300000">5 分钟</option>
+                    <option value="900000">15 分钟</option>
+                    <option value="1800000">30 分钟</option>
+                    <option value="3600000">1 小时</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[10px] text-gray-500 block mb-1">失败策略</label>
+                  <label className="flex items-center gap-2 text-[11px] text-gray-400 h-[26px]">
+                    <input
+                      type="checkbox"
+                      checked={node.data.allow_failure === true}
+                      onChange={(e) => onUpdate('allow_failure', e.target.checked)}
+                    />
+                    失败也往下传
+                  </label>
+                </div>
+              </div>
+
+              <p className="text-[10px] text-gray-600 leading-relaxed">
+                节点里只存 agent_id；真正的命令行只存在服务端 <code className="text-data">data/agents.json</code>，
+                图不能当命令执行器。工作目录留空则每次执行用独立临时目录。
+              </p>
+            </div>
+          )
+        })()}
+
+        {node.type === 'mcp_call' && (
+          <MCPCallFields data={node.data as Record<string, unknown>} onUpdate={onUpdate} />
+        )}
+
+        {/* 运行期插件节点：静态调色板里没有的类型一律走通用 JSON 参数编辑 */}
+        {!PALETTE.some((sec) => sec.items.some((it) => it.type === node.type)) && (
+          <GenericNodeFields
+            key={node.id}
+            data={node.data as Record<string, unknown>}
+            onUpdate={onUpdate}
+          />
         )}
 
         {node.type === 'post_production' && (
@@ -891,7 +1517,7 @@ export default function NodeInspector({
                 checked={node.data.turbo !== false}
                 onChange={(e) => onUpdate('turbo', e.target.checked)}
               />
-              涡轮 LoRA（8 步）
+              涡轮 LoRA（20 步 → 12 步；低于 12 音频会乱语）
             </label>
             <label className="flex items-start gap-2 text-[11px] text-gray-400">
               <input
@@ -1391,13 +2017,31 @@ export default function NodeInspector({
                 />
               </div>
               <div>
-                <label className="text-xs text-gray-400 block mb-1">视觉模型（留空自动挑）</label>
-                <input
+                <label className="text-xs text-gray-400 block mb-1">视觉模型</label>
+                {/* 以前是自由文本框，placeholder 写 qwen2.5vl:7b —— 用户只能猜。
+                    现在列本机真实模型；标注清楚只有带视觉能力的才能看图。 */}
+                <select
                   value={(node.data.model as string) || ''}
                   onChange={(e) => onUpdate('model', e.target.value)}
-                  placeholder="qwen2.5vl:7b"
-                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs font-mono"
-                />
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs outline-none focus:border-primary"
+                >
+                  <option value="">
+                    {modelMeta.vision ? `自动挑选（${modelMeta.vision}）` : '自动挑选（未探测到视觉模型）'}
+                  </option>
+                  {availableModels.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                      {modelMeta.sizes[m] ? ` · ${modelMeta.sizes[m].toFixed(1)}GB` : ''}
+                    </option>
+                  ))}
+                  {(node.data.model as string) &&
+                    !availableModels.includes(node.data.model as string) && (
+                      <option value={node.data.model as string}>{node.data.model as string}（不在清单中）</option>
+                    )}
+                </select>
+                <p className="text-[9px] text-gray-600 mt-1">
+                  只有视觉模型（qwen2.5vl / llava / minicpm-v 这类）能看图；纯文本模型会直接报错。
+                </p>
               </div>
             </div>
             <div>
@@ -1542,12 +2186,6 @@ export default function NodeInspector({
               />
             </div>
           </div>
-        )}
-
-        {node.type === 'end' && (
-          <p className="text-xs text-gray-500">
-            结束节点，输出最终结果
-          </p>
         )}
 
         {/* 输出预览 */}

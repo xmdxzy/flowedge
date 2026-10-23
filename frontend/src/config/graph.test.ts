@@ -4,6 +4,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 
 import { CANVAS_ONLY_TYPES, ENV_LABEL, NODE_OUTPUT_FIELDS, NODE_REQUIRES, PALETTE } from './graph'
+import { SOURCE_EXT_KINDS, isPlaceholderPath } from '../lib/inputSource'
 import { workflowTemplates } from '../templates/workflowTemplates'
 
 // 前后端契约测试。
@@ -26,10 +27,16 @@ function findRepoRoot(): string {
 /** 从 Go 的 NodeSpecs 表里抽出节点类型（单一事实源在 backend） */
 function backendNodeTypes(): string[] {
   const src = readFileSync(path.join(findRepoRoot(), 'backend', 'service', 'nodespec.go'), 'utf8')
-  const re = /"([a-z0-9_]+)"\s*:\s*\{Type:\s*"[a-z0-9_]+"/g
   const out = new Set<string>()
+  // 两种写法都要认：
+  //   单行  "llm": {Type: "llm"},
+  //   多行  "agent_task": {\n\t\tType: "agent_task", …   ← 带 Timeout 闭包时必然多行
+  // 只认单行会让"加一个带闭包的节点"直接破测试，而那不是节点的错。
+  const single = /"([a-z0-9_]+)"\s*:\s*\{Type:\s*"[a-z0-9_]+"/g
   let m: RegExpExecArray | null
-  while ((m = re.exec(src)) !== null) out.add(m[1])
+  while ((m = single.exec(src)) !== null) out.add(m[1])
+  const multi = /"([a-z0-9_]+)"\s*:\s*\{\s*\r?\n\s*Type:\s*"([a-z0-9_]+)"/g
+  while ((m = multi.exec(src)) !== null) out.add(m[1])
   return Array.from(out).sort()
 }
 
@@ -111,4 +118,47 @@ test('字幕与后期节点必须在调色板里（2026-10-21 交付门槛的回
   for (const t of ['subtitles', 'post_production']) {
     assert.ok(paletteTypes.includes(t), `${t} 不在调色板里，用户无法用它出片`)
   }
+})
+
+// 文件源的扩展名→类型表在前端也有一份（为了即时反馈：填了 .mp3 却选「图片」时不用等运行）。
+// 两份表会漂，所以这里直接去解析后端源码对账。
+//
+// 为什么不去读契约：契约只有四个端口，没有"哪些扩展名算音频"这层信息 ——
+// 那层信息在后端 `sourceExtKinds` 里，只能解析源码。
+test('文件源扩展名表前后端一致（前端即时反馈不能与后端判定分叉）', () => {
+  const src = readFileSync(path.join(findRepoRoot(), 'backend', 'service', 'input_source.go'), 'utf8')
+  const body = src.slice(src.indexOf('var sourceExtKinds'), src.indexOf('}', src.indexOf('var sourceExtKinds')))
+
+  const backend: Record<string, string> = {}
+  const re = /"(\.\w+)"\s*:\s*sourceKind(Image|Audio|Video|Text)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) backend[m[1]] = m[2].toLowerCase()
+
+  assert.ok(Object.keys(backend).length >= 15, `后端扩展名表只解析出 ${Object.keys(backend).length} 条，解析规则可能过期`)
+
+  const front = SOURCE_EXT_KINDS
+  const onlyBackend = Object.keys(backend).filter((k) => !(k in front))
+  const onlyFront = Object.keys(front).filter((k) => !(k in backend))
+  assert.deepEqual(onlyBackend, [], '这些扩展名后端认、前端不认（前端会误报「不匹配」）')
+  assert.deepEqual(onlyFront, [], '这些扩展名前端认、后端不认（前端会放行、运行时报错）')
+
+  for (const [ext, kind] of Object.entries(backend)) {
+    assert.equal(front[ext], kind, `${ext} 的类型两边不一致`)
+  }
+})
+
+// 占位判定也要一致：前端说"还是占位值"的，后端必须也认为是占位（而不是报"路径不存在"）
+test('文件源占位值判定前后端一致', () => {
+  const src = readFileSync(path.join(findRepoRoot(), 'backend', 'service', 'input_source.go'), 'utf8')
+  const line = src.slice(src.indexOf('var sourcePlaceholders'), src.indexOf('}', src.indexOf('var sourcePlaceholders')))
+  const backendPlaceholders = Array.from(line.matchAll(/"([^"]+)"/g)).map((x) => x[1])
+
+  assert.ok(backendPlaceholders.length >= 5, '占位值表解析失败')
+  for (const ph of backendPlaceholders) {
+    // 「待提供」是我们在提示词与文档里统一用的那个写法，必须被前端认出来
+    assert.equal(isPlaceholderPath(ph), true, `前端没把后端占位值 ${ph} 当占位`)
+  }
+  // 反向：正常路径不能被误判成占位
+  assert.equal(isPlaceholderPath('D:/素材/录音.wav'), false)
+  assert.equal(isPlaceholderPath('/home/u/a.mp4'), false)
 })

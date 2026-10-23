@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { PALETTE, NODE_REQUIRES, ENV_LABEL } from '../config/graph'
+import { PALETTE, NODE_REQUIRES, ENV_LABEL, type PaletteItem } from '../config/graph'
 import {
   readCollapsed,
   topNodeTypes,
@@ -9,6 +9,8 @@ import {
 
 interface Props {
   envReady: Record<string, boolean> | null
+  /** 运行期插件节点（来自 /api/toolchain）：静态 PALETTE 不可能预见用户后装的插件 */
+  plugins?: PaletteItem[]
   /** 使用频次由上层维护：addNode / 拖拽都会计数，避免这里和上层各记一次 */
   usage: NodeUsageMap
   onAdd: (type: string) => void
@@ -17,20 +19,28 @@ interface Props {
 
 // 左栏节点库：搜索 + 常用 + 分组折叠
 // 25 个节点平铺会把左栏推到两屏之外，所以默认只展开前两组，其余折叠并记忆状态。
-export default function NodePalette({ envReady, usage, onAdd, onDragStart }: Props) {
+export default function NodePalette({ envReady, usage, plugins = [], onAdd, onDragStart }: Props) {
   const [query, setQuery] = useState('')
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
     const saved = readCollapsed()
     if (saved) return saved
     // 首屏默认：控制 + AI 推理展开，其余收起
     const init: Record<string, boolean> = {}
+    // 只按内置分组算默认折叠：sections 含动态插件分组，此时还没定义（且不该在这里依赖）
     PALETTE.forEach((sec, i) => {
       if (i > 1) init[sec.label] = true
     })
     return init
   })
 
-  const allItems = useMemo(() => PALETTE.flatMap((s) => s.items), [])
+  // 插件节点与内置节点同等对待：搜索、常用、拖拽走同一条路径。
+  // 「插件」分组只在真的装了插件时出现，不给空分组占位。
+  const sections = useMemo(
+    () => (plugins.length > 0 ? [...PALETTE, { label: '插件', items: plugins }] : PALETTE),
+    [plugins],
+  )
+
+  const allItems = useMemo(() => sections.flatMap((s) => s.items), [sections])
 
   const q = query.trim().toLowerCase()
   const matches = useMemo(() => {
@@ -91,7 +101,7 @@ export default function NodePalette({ envReady, usage, onAdd, onDragStart }: Pro
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索节点…"
-            className="w-full pl-6 pr-2 py-1.5 rounded-md bg-[#0A0E14] border border-border text-[11.5px] outline-none focus:border-primary"
+            className="w-full pl-6 pr-2 py-1.5 rounded-md bg-canvas border border-border text-[11.5px] outline-none focus:border-primary"
           />
           <span className="absolute left-2 top-1/2 -translate-y-1/2 text-[10px] fe-dim3 pointer-events-none">
             ⌕
@@ -132,7 +142,7 @@ export default function NodePalette({ envReady, usage, onAdd, onDragStart }: Pro
           )}
 
           {/* 分组 */}
-          {PALETTE.map((section) => {
+          {sections.map((section) => {
             const isCollapsed = Boolean(collapsed[section.label])
             return (
               <div key={section.label}>

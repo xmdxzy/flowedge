@@ -113,11 +113,11 @@ export default function CapabilityPanel({ onClose }: Props) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
       <div
-        className="w-[480px] h-full bg-[#0D121C]/95 backdrop-blur-xl border-l border-border shadow-2xl flex flex-col"
+        className="w-[480px] h-full fe-drawer fe-scroll-thin"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 头部 */}
-        <div className="flex items-center gap-3 px-5 py-4 border-b border-border">
+        <div className="fe-drawer__hd">
           <div className="fe-logo-mark" style={{ width: 24, height: 24, borderRadius: 7 }}>
             <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
               <path d="M8 1L2 8h4l-1 7 7-9H8l1-5z" fill="white" />
@@ -138,7 +138,7 @@ export default function CapabilityPanel({ onClose }: Props) {
           >
             {loading ? '检测中…' : '重新检测'}
           </button>
-          <button onClick={onClose} className="text-gray-500 hover:text-white text-lg leading-none px-1">
+          <button onClick={onClose} className="fe-drawer__x">
             ×
           </button>
         </div>

@@ -30,6 +30,9 @@ type WorkflowHandler struct {
 	comfyH3Base string
 	asrBase     string
 	ttsBase     string
+
+	// 资源准入闸（nil 时跳过：离线单测、无治理器的环境）
+	governor *service.GovernorGate
 }
 
 func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue) *WorkflowHandler {
@@ -39,6 +42,14 @@ func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.Jo
 		queue:  queue,
 		runs:   service.NewRunService(db, engine, queue),
 	}
+}
+
+// SetGovernor 注入资源准入闸。
+//
+// 传 nil = 不启用（默认行为与接入前完全一致，保证向后兼容）。
+// 注意它的语义是 fail-open：问不到治理器就放行，只有治理器明确说不才拦。
+func (h *WorkflowHandler) SetGovernor(g *service.GovernorGate) {
+	h.governor = g
 }
 
 // SetLineage 注入血缘仓库（运行结束后记录产物来源）
@@ -191,6 +202,61 @@ func validateNodeParams(nodes, edges json.RawMessage) (int, gin.H) {
 	return 0, nil
 }
 
+// validateBindings 保存期校验能力卡：结构合法 + 工作流卡引用的那条流水线真实存在。
+//
+// 为什么必须在保存时拦：工作流卡会**替换整个节点的执行**，
+// 贴错一张（不存在的 id / 贴到自己身上）要到运行时才炸，而且是"运行到一半炸"。
+func (h *WorkflowHandler) validateBindings(nodes json.RawMessage, selfID uint) (int, gin.H) {
+	ns, err := service.ParseNodeInstances(nodes)
+	if err != nil {
+		return http.StatusBadRequest, gin.H{"error": err.Error()}
+	}
+	for _, n := range ns {
+		if issues := service.ValidatePipeline(n.Data); len(issues) > 0 {
+			return http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("节点 %s 的能力卡配置有误：%s", n.ID, issues[0]),
+				"code":  "binding_invalid",
+			}
+		}
+		pipe := service.ParsePipeline(n.Data)
+		if pipe.Replace == nil {
+			continue
+		}
+		// 子工作流 / 循环节点本来就自带 workflow_id：再贴一张工作流卡，
+		// 卡会覆盖节点自身那条，用户以为是"再套一层"，实际是"换掉"。
+		// 这是最容易误解的一种叠加，保存时直接拒。
+		if n.Type == "sub_workflow" || n.Type == "loop" {
+			return http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("节点 %s 是「%s」，已经自带要执行的工作流；不要再贴工作流卡（要换就把节点里的 workflow_id 改掉）", n.ID, n.Type),
+				"code":  "binding_conflict",
+			}
+		}
+		wfID, ok := service.WorkflowIDOfBinding(service.Binding{Kind: pipe.Replace.Kind, ID: pipe.Replace.ID})
+		if !ok {
+			return http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("节点 %s 的工作流卡 id 不合法（%q）", n.ID, pipe.Replace.ID),
+				"code":  "binding_invalid",
+			}
+		}
+		if selfID != 0 && wfID == selfID {
+			return http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("节点 %s 把这条工作流自己贴成了工作流卡：会无限递归", n.ID),
+				"code":  "binding_self_reference",
+			}
+		}
+		if h.db != nil {
+			var cnt int64
+			if err := h.db.Model(&model.Workflow{}).Where("id = ?", wfID).Count(&cnt).Error; err == nil && cnt == 0 {
+				return http.StatusBadRequest, gin.H{
+					"error": fmt.Sprintf("节点 %s 贴的工作流卡 #%d 不存在（可能已被删除）", n.ID, wfID),
+					"code":  "binding_missing_workflow",
+				}
+			}
+		}
+	}
+	return 0, nil
+}
+
 // Create 创建工作流
 func (h *WorkflowHandler) Create(c *gin.Context) {
 	var wf model.Workflow
@@ -203,6 +269,10 @@ func (h *WorkflowHandler) Create(c *gin.Context) {
 		return
 	}
 	if code, body := validateNodeParams(wf.Nodes, wf.Edges); code != 0 {
+		c.JSON(code, body)
+		return
+	}
+	if code, body := h.validateBindings(wf.Nodes, 0); code != 0 {
 		c.JSON(code, body)
 		return
 	}
@@ -246,6 +316,10 @@ func (h *WorkflowHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "nodes 与 edges 必须一起提交"})
 			return
 		}
+		if code, body := h.validateBindings(updates.Nodes, wf.ID); code != 0 {
+			c.JSON(code, body)
+			return
+		}
 		if code, body := validateGraph(updates.Nodes, updates.Edges); code != 0 {
 			c.JSON(code, body)
 			return
@@ -274,41 +348,77 @@ func (h *WorkflowHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
 
-// Run 执行工作流
+// RunOptions 起跑参数。
+//
+// 为什么单开一个结构而不是继续加可选参数：起跑这件事的入参已经超过
+// 「谁触发的」一个维度了（还有评测语义、用哪份图跑）。继续用变参
+// 会让「传了 5 个字符串但顺序记错」变成一种可行的错误。
+type RunOptions struct {
+	InvokedBy          string
+	CaseID             string
+	DatasetFingerprint string
+	Category           string
+	Role               string
+	EvalBatch          string
+	// Nodes/Edges 非空时用这份图跑（评测跑历史版本用），**不写库**。
+	// 评测必须能跑「第 3 版的图」而不动当前图，否则每次对比都要来回回滚。
+	Nodes json.RawMessage
+	Edges json.RawMessage
+	// WorkflowVersion 0 = 起跑时取当前最新版本
+	WorkflowVersion int
+	// AgentConcurrency 本次运行的 agent 并发上限；0 = 用引擎默认。
+	// 同一张图在不同机器上能扛的并发不同，所以它是运行参数而不是工作流参数。
+	AgentConcurrency int
+}
+
 // StartRun 创建执行记录并异步跑完（触发器与手动运行共用同一条路径）。
 // trigger 可选：manual / webhook / cron；留空按 manual 记录。
 func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model.WorkflowRun {
+	invokedBy := "manual"
+	if len(trigger) > 0 && trigger[0] != "" {
+		invokedBy = trigger[0]
+	}
+	return h.StartRunWith(wf, RunOptions{InvokedBy: invokedBy})
+}
+
+// StartRunWith 起跑（可带评测语义与临时图）。
+func (h *WorkflowHandler) StartRunWith(wf *model.Workflow, opts RunOptions) *model.WorkflowRun {
 	nodesJSON := []byte(wf.Nodes)
 	edgesJSON := []byte(wf.Edges)
+	if len(opts.Nodes) > 0 {
+		nodesJSON = []byte(opts.Nodes)
+	}
+	if len(opts.Edges) > 0 {
+		edgesJSON = []byte(opts.Edges)
+	}
 
 	// 运行前依赖预检：服务没起时创建一条 failed 记录留痕，不进入执行。
 	// （手动入口 Run 直接 503 返回；cron/trigger 走这里，留痕才能追溯）
 	if missing := h.preflight(nodesJSON, edgesJSON); len(missing) > 0 {
 		now := time.Now()
-		run := model.WorkflowRun{
-			WorkflowID: wf.ID,
-			Status:     "failed",
-			Error:      preflightErrorText(missing),
-			StartedAt:  &now,
-			EndedAt:    &now,
-		}
-		h.db.Create(&run)
-		return &run
+		run := h.newRun(wf.ID, "failed", opts)
+		run.Error = preflightErrorText(missing)
+		run.StartedAt = &now
+		run.EndedAt = &now
+		h.db.Create(run)
+		return run
 	}
 
-	now := time.Now()
-	run := model.WorkflowRun{
-		WorkflowID: wf.ID,
-		Status:     "running",
-		StartedAt:  &now,
+	invokedBy := "manual"
+	if opts.InvokedBy != "" {
+		invokedBy = opts.InvokedBy
 	}
-	h.db.Create(&run)
+	now := time.Now()
+	run := h.newRun(wf.ID, "running", opts)
+	run.InvokedBy = invokedBy
+	run.StartedAt = &now
+	h.db.Create(run)
 
 	// 任务落库：进程崩溃后 DB 里仍保留「曾受理过」的事实，
 	// 下次启动由 JobQueue.RecoverInterrupted 把残留 running 标记为 interrupted
 	jobTrigger := "manual"
-	if len(trigger) > 0 && trigger[0] != "" {
-		jobTrigger = trigger[0]
+	if opts.InvokedBy != "" {
+		jobTrigger = opts.InvokedBy
 	}
 	job := model.Job{
 		RunID:      run.ID,
@@ -334,6 +444,13 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 	var rc *service.RunControl
 	if len(breakpoints) > 0 {
 		rc = service.NewBreakpointControl(mapFromSlice(breakpoints))
+	} else if opts.AgentConcurrency > 0 {
+		// 没断点但声明了并发：仍需一个控制对象承载运行级参数。
+		// 用全速控制（budget=-1、无断点），推进语义与不传 rc 完全一致。
+		rc = service.NewFullControl()
+	}
+	if rc != nil && opts.AgentConcurrency > 0 {
+		rc.SetAgentConcurrency(opts.AgentConcurrency)
 	}
 
 	exec := func() {
@@ -380,7 +497,7 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 		}
 		statesJSON, _ := json.Marshal(nodeStates)
 		run.NodeStates = json.RawMessage(statesJSON)
-		h.db.Save(&run)
+		h.db.Save(run)
 		h.db.Save(&job)
 
 		// 产物血缘：运行结束（含暂停）都记一次，已产出的图/音/视频都能溯源
@@ -389,6 +506,14 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 			_ = json.Unmarshal(edgesJSON, &edges)
 			h.lineage.RecordRun(wf.ID, run.ID, nodeStates, edges)
 		}
+
+		// 证据信封：外部评测器只读这一份，避免「谁记了耗时 / 失败算 0 分还是没测到」
+		// 各算各的账。旁路写入，失败只记日志，绝不反过来影响本次运行的结论。
+		// 版本号来自 run 自己（起跑时钉住的），不再读「当前最新版本」——
+		// 运行期间有人改图存版本时，后者会把旧图的成绩记到新版本上。
+		ev := service.BuildEvidence(
+			*run, nodeStates, h.engine.SideUnloadCount(), service.CountResumes(h.db, run.ID))
+		service.WriteEvidence(ev)
 	}
 
 	if h.queue != nil {
@@ -400,7 +525,35 @@ func (h *WorkflowHandler) StartRun(wf *model.Workflow, trigger ...string) *model
 		go exec()
 	}
 
-	return &run
+	return run
+}
+
+// newRun 建一条未落库的运行记录，把评测语义与版本在**起跑这一刻**钉住。
+//
+// 版本取「当前最新快照号」：起跑后有人改图并新建版本，不会影响这条记录；
+// 反过来说，如果这条 run 用的是一份显式指定的历史图，调用方要在
+// RunOptions.WorkflowVersion 里写清是哪一版（评测跑 baseline 时正是如此）。
+func (h *WorkflowHandler) newRun(workflowID uint, status string, opts RunOptions) *model.WorkflowRun {
+	run := &model.WorkflowRun{WorkflowID: workflowID, Status: status, InvokedBy: opts.InvokedBy}
+	if opts.CaseID != "" {
+		v := opts.CaseID
+		run.CaseID = &v
+	}
+	if opts.DatasetFingerprint != "" {
+		v := opts.DatasetFingerprint
+		run.DatasetFingerprint = &v
+	}
+	if opts.Category != "" {
+		v := opts.Category
+		run.Category = &v
+	}
+	run.Role = opts.Role
+	run.EvalBatch = opts.EvalBatch
+	run.WorkflowVersion = opts.WorkflowVersion
+	if run.WorkflowVersion == 0 {
+		run.WorkflowVersion = h.latestVersion(workflowID)
+	}
+	return run
 }
 
 // CancelRun 中止进行中的运行（已完成的节点保留，剩余标记为 skipped）
@@ -424,6 +577,50 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
 		return
 	}
+
+	// 谁在调这条工作流。默认 manual（画布点运行），外部智能体走 MCP 时自报。
+	// 只做「记录 + 不一致提示」，不做硬拦：人工调试声明给 WorkBuddy 的流水线是正当需求。
+	invokedBy := "manual"
+	// 评测语义：评测层起跑时显式注入，引擎原样落库（评审时能回答「这条成绩
+	// 是哪个 case、哪一侧」）。不传就是 null —— 引擎不替评测层编。
+	var req struct {
+		InvokedBy          string `json:"invoked_by"`
+		CaseID             string `json:"caseId"`
+		DatasetFingerprint string `json:"datasetFingerprint"`
+		Category           string `json:"category"`
+		Role               string `json:"role"`
+		EvalBatch          string `json:"evalBatch"`
+		// AgentConcurrency 本次运行的 agent 并发上限；不传/0 = 引擎默认。
+		AgentConcurrency int `json:"agent_concurrency"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if req.AgentConcurrency < 0 || req.AgentConcurrency > 16 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("agent_concurrency=%d 超出范围（1..16；不传则用引擎默认）", req.AgentConcurrency),
+			"code":  "bad_agent_concurrency",
+		})
+		return
+	}
+	if v := strings.TrimSpace(req.InvokedBy); v != "" {
+		if !validInvoker(v) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("invoked_by=%q 不认识（可用：manual / workbuddy / dsh / mcp / webhook / cron）", v),
+				"code":  "bad_invoker",
+			})
+			return
+		}
+		invokedBy = v
+	}
+	role := strings.TrimSpace(req.Role)
+	// role 只有三档且**不能猜**：写错一个字母就会让配对判定把两侧混成一组。
+	if role != "" && role != "baseline" && role != "candidate" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("role=%q 不认识（可用：baseline / candidate；不传表示这不是一次评测运行）", role),
+			"code":  "bad_role",
+		})
+		return
+	}
+	warn := invokerMismatch(&wf, invokedBy)
 	// 手动入口：预检不过直接 503 + 缺失清单（缺什么、怎么起），不创建 run 记录
 	if missing := h.preflight([]byte(wf.Nodes), []byte(wf.Edges)); len(missing) > 0 {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -434,8 +631,42 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 		})
 		return
 	}
-	run := h.StartRun(&wf)
-	c.JSON(http.StatusAccepted, gin.H{"run_id": run.ID, "status": "running"})
+	// 资源准入：机器压力高时推迟，而不是硬跑然后 OOM。
+	//
+	// 顺序上放在依赖预检之后 —— 缺服务是"根本跑不了"，不必再问压力。
+	// 语义是 fail-open：治理器问不到（没起 / 超时 / 返回异常）就放行，
+	// 只有它明确说不才拦。FlowEdge 必须能独立工作，不能因为另一个进程
+	// 没起就拒绝出片。
+	if h.governor != nil && h.governor.Enabled() {
+		if v := h.governor.Check(c.Request.Context()); !v.Allowed {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":    "资源紧张，本次运行已推迟",
+				"code":     "governor_declined",
+				"governor": v,
+				"hint":     governorHint(v.Reasons),
+			})
+			return
+		}
+	}
+	run := h.StartRunWith(&wf, RunOptions{
+		InvokedBy:          invokedBy,
+		CaseID:             strings.TrimSpace(req.CaseID),
+		DatasetFingerprint: strings.TrimSpace(req.DatasetFingerprint),
+		Category:           strings.TrimSpace(req.Category),
+		Role:               role,
+		EvalBatch:          strings.TrimSpace(req.EvalBatch),
+		AgentConcurrency:   req.AgentConcurrency,
+	})
+	resp := gin.H{"run_id": run.ID, "status": "running", "invoked_by": invokedBy}
+	if run.CaseID != nil {
+		resp["caseId"] = *run.CaseID
+		resp["role"] = run.Role
+		resp["workflowVersion"] = run.WorkflowVersion
+	}
+	if warn != "" {
+		resp["warning"] = warn
+	}
+	c.JSON(http.StatusAccepted, resp)
 }
 
 // ResumeRun 断点续跑：复用已完成节点输出，只重跑失败 / 未执行节点
@@ -528,4 +759,67 @@ func (h *WorkflowHandler) ListRuns(c *gin.Context) {
 	q.Order("created_at DESC").Limit(limit).Find(&runs)
 
 	c.JSON(http.StatusOK, runs)
+}
+
+// validInvoker 允许的调用方标识。自由字符串会让"谁在调"失去意义。
+func validInvoker(v string) bool {
+	switch v {
+	// evaluate：自进化配对评测（POST /api/evolution/evaluate 起的跑）。
+	// 单独一档而不是借用 manual —— 评测跑与人工调试在统计里必须分得开，
+	// 否则「人类介入次数」和「人工调试耗时」会把评测污染掉。
+	case "manual", "workbuddy", "dsh", "mcp", "webhook", "cron", "evaluate":
+		return true
+	}
+	return false
+}
+
+// invokerMismatch 开始节点声明的入口与实际调用方不一致时，给一句人话提示。
+//
+// 为什么不直接拒绝：声明的是"这条流水线主要为谁准备"，
+// 人工调试、迁移期、临时借用都是正常场景。拒绝会把人逼去改节点，反而失真。
+func invokerMismatch(wf *model.Workflow, invokedBy string) string {
+	var nodes []model.NodeInstance
+	if err := json.Unmarshal(wf.Nodes, &nodes); err != nil {
+		return ""
+	}
+	for i := range nodes {
+		if nodes[i].Type != "start" {
+			continue
+		}
+		declared, _ := nodes[i].Data["entry_agent"].(string)
+		if declared == "" || declared == "manual" {
+			return ""
+		}
+		if declared != invokedBy {
+			return fmt.Sprintf("这条工作流声明由 %s 触发，本次是 %s 调的（已按实际调用方记录，不影响执行）", declared, invokedBy)
+		}
+		return ""
+	}
+	return ""
+}
+
+// governorHint 按拒绝原因给**可操作**的提示。
+//
+// 为什么不能笼统写一句"等一会儿再试"：治理器的拒绝原因差别很大——
+// 游戏保护要退游戏、内存压力要等任务、磁盘要清盘、显存要卸模型。
+// 指错方向会让人去关一堆无关进程然后仍被拦。
+// 真实事故（2026-10-23）：本机 WeGame 启动器常驻触发「游戏保护模式」，
+// 而当时的提示写的是"停掉占满显存的其他进程"——完全指错，查了半小时才发现根因。
+func governorHint(reasons []string) string {
+	for _, r := range reasons {
+		low := strings.ToLower(r)
+		switch {
+		case strings.Contains(r, "游戏"):
+			return "检测到游戏相关进程，引擎按保护策略避让（这是配置项，不是故障）。" +
+				"确认没在对局时：退出 WeGame 等启动器，或把 WeGame.exe 从序策治理器 " +
+				"gameGuard.processes 名单里去掉（只留 League of Legends.exe / LeagueClient.exe）"
+		case strings.Contains(r, "显存") || strings.Contains(low, "gpu") || strings.Contains(low, "vram"):
+			return "显存不足：先在「环境」面板停掉不用的 ComfyUI 实例（或让它 /free 卸载权重），再重试"
+		case strings.Contains(r, "磁盘"):
+			return "磁盘余量不足：清理 D 盘后重试（权重与产物都在 D://AI 与运行\\data）"
+		case strings.Contains(low, "cpu") || strings.Contains(r, "内存"):
+			return "CPU / 内存压力高：等当前编译或渲染任务结束再重试"
+		}
+	}
+	return "等当前任务结束后重试；持续被拦就查治理器状态（:30002 /api/flow/governor/status）里的 reasons"
 }

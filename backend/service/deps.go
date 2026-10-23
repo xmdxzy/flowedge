@@ -187,6 +187,58 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		Exclusive:  "comfyui",
 	}
 
+	// ---- ComfyUI-MOSS（MOSS-Image 专用工作树）----
+	//
+	// 为什么必须独立：MOSS 的节点（UNETLoader 的 moss 权重 / CLIPLoader type=moss_image /
+	// EmptyFlux2LatentImage）是 ComfyUI 0.41 才有的，主实例停在 0.31
+	// （comfy-kitchen 0.2.27 + torch 2.6 的血泪组合，升级会把现有 flux 出图一起搞坏）。
+	// 复用 H3 的 venv（同 commit、同 torch 2.14）而不是再装一套——省 ~10GB，
+	// 且两者本来就同属 gpu-exclusive 组，不会同时驻留。
+	mossHome := firstNonEmpty(os.Getenv("MOSS_HOME"), "D:/AI/ComfyUI-MOSS")
+	// 注意这里必须用 firstExisting 而不是 firstNonEmpty：
+	// MOSS 工作树复用 H3 的 venv，自己那份 `.venv` 并不存在。
+	// firstNonEmpty 只看字符串非空，会选中不存在的路径，然后 hint 报「venv 缺失」——
+	// 一个能跑的配置被警告成缺件（2026-10-23 实测踩到）。
+	mossPython := firstNonEmpty(os.Getenv("MOSS_PYTHON"), firstExisting(
+		filepath.ToSlash(filepath.Join(mossHome, ".venv/Scripts/python.exe")),
+		filepath.ToSlash(filepath.Join(h3Home, ".venv/Scripts/python.exe"))))
+	mossPort := "8190"
+	if u, err := url.Parse(mossInstanceURL()); err == nil && u.Port() != "" {
+		mossPort = u.Port()
+	}
+	mossHint := ""
+	if _, err := os.Stat(mossPython); err != nil {
+		mossHint = "未找到 " + mossPython + "：MOSS 工作树或可用的 torch 2.14 venv 缺失"
+	} else if _, err := os.Stat(filepath.Join(mossHome, "main.py")); err != nil {
+		mossHint = "未找到 " + filepath.Join(mossHome, "main.py") + "（MOSS 工作树缺失）"
+	}
+	mossArgs := []string{
+		filepath.Join(mossHome, "main.py"),
+		"--listen", "127.0.0.1", "--port", mossPort,
+		"--input-directory", filepath.Join(comfyHome, "input"),
+		"--output-directory", filepath.Join(comfyHome, "output"),
+		"--user-directory", filepath.Join(mossHome, "user"),
+		"--database-url", "sqlite:///D:/AI/ComfyUI-MOSS/user/comfyui-moss.db",
+		"--reserve-vram", "2",
+	}
+	if raw := strings.TrimSpace(os.Getenv("MOSS_ARGS")); raw != "" {
+		mossArgs = append([]string{filepath.Join(mossHome, "main.py")}, strings.Fields(raw)...)
+	}
+	mossEnv := append(os.Environ(), "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+	s.specs["comfy_moss"] = &DepSpec{
+		Name:       "comfy_moss",
+		Label:      "ComfyUI-MOSS（图内文字渲染 / 布局控制）",
+		Binary:     mossPython,
+		Args:       mossArgs,
+		WorkDir:    mossHome,
+		Env:        mossEnv,
+		Endpoint:   "http://127.0.0.1:" + mossPort,
+		HealthPath: "/system_stats",
+		Autostart:  false, // 按需拉起：只有后端选到 MOSS 才需要它
+		Hint:       mossHint,
+		Exclusive:  "comfyui",
+	}
+
 	// ---- ASR（faster-whisper 本地服务）----
 	asrHome := firstNonEmpty(os.Getenv("ASR_HOME"), conf.ASR.Home, detectASRHome())
 	asrPython := firstNonEmpty(os.Getenv("ASR_PYTHON"), conf.ASR.Python, detectVenvPython(asrHome))
@@ -213,25 +265,51 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		Hint:       asrHint,
 	}
 
-	// ---- TTS（Kokoro-82M 本地神经语音）----
+	// ---- TTS（Kokoro-82M 默认 / Audio8-TTS 可选）----
+	//
+	// 三个脚本共享同一套 HTTP 契约（POST /tts {text,voice} -> wav），所以换引擎
+	// 只需要换脚本名，不需要改节点、能力探测或预检：
+	//   TTS_SCRIPT=tts_audio8_pt_server.py TTS_PYTHON=D:/AI/envs/torch-cu124/Scripts/python.exe
+	//   TTS_PORT=8103 TTS_BASE_URL=http://127.0.0.1:8103
+	// Kokoro 有固定音色 + 语速；Audio8 支持零样本克隆 + 44.1kHz，但没有语速。
+	// Audio8 有两个后端：0.1B ONNX（CPU，本机实测产出无效语音）与 0.6B PyTorch（CUDA，可用）。
 	ttsHome := firstNonEmpty(os.Getenv("TTS_HOME"), asrHome)
-	ttsScript := filepath.Join(ttsHome, "tts_kokoro_server.py")
+	ttsScriptName := firstNonEmpty(os.Getenv("TTS_SCRIPT"), "tts_kokoro_server.py")
+	ttsScript := filepath.Join(ttsHome, ttsScriptName)
 	ttsPython := firstNonEmpty(os.Getenv("TTS_PYTHON"), detectVenvPython(ttsHome))
 	ttsAutostart := os.Getenv("TTS_AUTOSTART") == "1"
+	ttsLabel := "TTS（Kokoro-82M）"
+	defaultTtsPort := "8102"
+	if ttsScriptName != "tts_kokoro_server.py" {
+		ttsLabel = "TTS（" + strings.TrimSuffix(strings.TrimPrefix(ttsScriptName, "tts_"), "_server.py") + "）"
+		defaultTtsPort = "8103"
+	}
 	ttsHint := ""
 	if _, err := os.Stat(ttsScript); err != nil {
-		ttsHint = "未找到 tts_kokoro_server.py：运行 FlowEdge.exe --export-services 导出脚本后安装依赖（pip install kokoro soundfile）"
+		ttsHint = "未找到 " + ttsScriptName + "：运行 FlowEdge.exe --export-services 导出脚本后安装依赖" +
+			"（Kokoro: pip install kokoro；Audio8-ONNX: pip install -r onnx_runtime_0_1b_int8/requirements.txt；" +
+			"Audio8-PyTorch: 需 CUDA torch 环境，用 TTS_PYTHON 指向共享底座）"
 	}
 	ttsEnv := append(os.Environ(),
-		"TTS_PORT="+portFromURL(ttsBase, "8102"),
+		"TTS_PORT="+portFromURL(ttsBase, defaultTtsPort),
 		"KOKORO_DIR="+firstNonEmpty(os.Getenv("KOKORO_DIR"), "D:/AI/Models/tts"),
+		// Audio8-ONNX 专用；Kokoro/PyTorch 不读这几个变量，无条件传无害
+		"ARKTTS_RUNTIME_DIR="+firstNonEmpty(os.Getenv("ARKTTS_RUNTIME_DIR"), "D:/AI/Audio8_TTS/onnx_runtime_0_1b_int8"),
+		"ARKTTS_MODEL_DIR="+firstNonEmpty(os.Getenv("ARKTTS_MODEL_DIR"), "D:/AI/Models/audio8_tts_0_1b_int8"),
+		"ARKTTS_VOICES_DIR="+firstNonEmpty(os.Getenv("ARKTTS_VOICES_DIR"), filepath.Join(ttsHome, "voices-audio8")),
+		// Audio8-PyTorch 专用
+		"AUDIO8_MODEL_DIR="+firstNonEmpty(os.Getenv("AUDIO8_MODEL_DIR"), "D:/AI/Models/audio8_tts_0_6b"),
+		"AUDIO8_VOICES_DIR="+firstNonEmpty(os.Getenv("AUDIO8_VOICES_DIR"), filepath.Join(ttsHome, "voices-audio8-pt")),
+		"AUDIO8_DTYPE="+firstNonEmpty(os.Getenv("AUDIO8_DTYPE"), "bfloat16"),
+		// 0 = 常驻不自动卸载；FlowEdge 换侧前会走 /unload 显式释放
+		"AUDIO8_IDLE_UNLOAD="+firstNonEmpty(os.Getenv("AUDIO8_IDLE_UNLOAD"), "0"),
 	)
 	if os.Getenv("HF_ENDPOINT") == "" && os.Getenv("FLOWEDGE_HF_MIRROR") != "0" {
 		ttsEnv = append(ttsEnv, "HF_ENDPOINT=https://hf-mirror.com")
 	}
 	s.specs["tts"] = &DepSpec{
 		Name:       "tts",
-		Label:      "TTS（Kokoro-82M）",
+		Label:      ttsLabel,
 		Binary:     ttsPython,
 		Args:       []string{ttsScript},
 		WorkDir:    ttsHome,
@@ -464,6 +542,23 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// firstExisting 返回第一个**文件真实存在**的路径。
+//
+// 与 firstNonEmpty 的区别是"配置了"与"装好了"的区别：
+// 复用别人 venv 的场景下（MOSS 用 H3 的），写在前面那个路径本来就不该存在，
+// 用 firstNonEmpty 会选中它，然后在 os.Stat 处报「缺失」——把能跑的配置说成缺件。
+func firstExisting(paths ...string) string {
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 func detectVenvPython(home string) string {
 	if home == "" {
 		return ""
@@ -573,6 +668,8 @@ func readyTimeout(name string) time.Duration {
 		return 300 * time.Second // 首次要下载/预热模型（Kokoro 还要载入 pipeline）
 	case "comfy_h3":
 		return 180 * time.Second // 独立 venv + 20GB 权重，实测冷启 ~50s
+	case "comfy_moss":
+		return 300 * time.Second // 实测冷启 ~130s（988 节点注册 + torch 2.14 导入），180s 会误判失败
 	default:
 		return 120 * time.Second
 	}

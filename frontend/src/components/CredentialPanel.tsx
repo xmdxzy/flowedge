@@ -124,10 +124,10 @@ export default function CredentialPanel({ onClose }: Props) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
       <div
-        className="w-[520px] h-full bg-[#0D121C]/95 backdrop-blur-xl border-l border-border shadow-2xl flex flex-col"
+        className="w-[520px] h-full fe-drawer fe-scroll-thin"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-3 px-5 py-4 border-b border-border">
+        <div className="fe-drawer__hd">
           <div className="flex-1">
             <h2 className="text-sm font-semibold text-white">凭据</h2>
             <p className="text-[10px] text-gray-500">

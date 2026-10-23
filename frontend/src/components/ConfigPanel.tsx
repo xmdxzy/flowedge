@@ -186,12 +186,12 @@ export default function ConfigPanel({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end" onClick={onClose}>
       <div
-        className="w-[560px] h-full bg-[#0D121C]/95 backdrop-blur-xl border-l border-border shadow-2xl flex flex-col"
+        className="w-[560px] h-full fe-drawer fe-scroll-thin"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <div className="fe-drawer__hd">
           <div className="text-sm font-medium text-gray-200">配置</div>
-          <button onClick={onClose} className="text-gray-500 hover:text-gray-200 text-lg leading-none">
+          <button onClick={onClose} className="fe-drawer__x">
             ×
           </button>
         </div>

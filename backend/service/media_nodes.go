@@ -20,7 +20,7 @@ import (
 // 四个节点共用「上游找图 → 交给 ComfyUI 图 → 落盘」这条链路，
 // 差异只在 BuildMediaGraph 的分支里，节点本身保持很薄。
 
-// ensureComfy 确保指定 ComfyUI 实例在跑（"h3" 走 8189，其它走默认 8188）。
+// ensureComfy 确保指定 ComfyUI 实例在跑（"h3" 走 8189，"moss" 走 8190，其它走默认 8188）。
 //
 // 为什么必须显式做：两个实例互斥，H3 在跑时默认实例是停的；
 // 用户切去出图如果不自动切回，节点会直接收到 connection refused。
@@ -30,8 +30,11 @@ func (e *EngineV2) ensureComfy(profile string) error {
 		return nil
 	}
 	name := "comfyui"
-	if profile == "h3" {
+	switch profile {
+	case "h3":
 		name = "comfy_h3"
+	case "moss":
+		name = "comfy_moss"
 	}
 	if err := e.deps.Start(name); err != nil {
 		return fmt.Errorf("ComfyUI 实例（%s）不可用：%w", name, err)

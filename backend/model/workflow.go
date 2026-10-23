@@ -40,11 +40,34 @@ type WorkflowRun struct {
 	NodeStates json.RawMessage `gorm:"type:text" json:"node_states"`
 	Error      string          `gorm:"type:text" json:"error,omitempty"`
 	// 断点调试：停在哪个节点 / 为什么停（step=单步耗尽，breakpoint=断点）
-	PausedAt    string     `gorm:"size:64" json:"paused_at,omitempty"`
-	PauseReason string     `gorm:"size:32" json:"pause_reason,omitempty"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	EndedAt     *time.Time `json:"ended_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
+	// InvokedBy 谁触发了这次运行：manual / workbuddy / dsh / mcp / webhook / cron。
+	// 与开始节点声明的 entry_agent 分开记：声明是「预期」，这里是「实际」，
+	// 两者不一致时要在提交响应里告诉调用方（而不是默默按预期跑）。
+	InvokedBy   string `gorm:"size:32" json:"invoked_by,omitempty"`
+	PausedAt    string `gorm:"size:64" json:"paused_at,omitempty"`
+	PauseReason string `gorm:"size:32" json:"pause_reason,omitempty"`
+
+	// 评测语义：由评测层在**起跑时**注入，引擎只落库、只回填，绝不猜。
+	//
+	// 为什么放在 run 上而不是事后补：证据信封在运行结束那一刻落盘，
+	// 事后补等于改一份已经写死的「事实」——那是伪造证据，不是采集证据。
+	// 字段用指针：没传就是 null（没采集），不能写成空串冒充「采集到了空值」。
+	CaseID             *string `gorm:"size:128;index" json:"case_id,omitempty"`
+	DatasetFingerprint *string `gorm:"size:64" json:"dataset_fingerprint,omitempty"`
+	Category           *string `gorm:"size:64;index" json:"category,omitempty"`
+	Role               string  `gorm:"size:16;index" json:"role,omitempty"` // baseline / candidate
+	EvalBatch          string  `gorm:"size:64;index" json:"eval_batch,omitempty"`
+
+	// WorkflowVersion 起跑那一刻的图版本（0 = 没有快照）。
+	//
+	// 必须在起跑时钉住：原来在收尾时读「当前最大版本号」，一旦运行期间
+	// 有人改图并存了版本，一次旧图的运行会被记成新图的成绩 —— 配对评测
+	// 直接张冠李戴，且事后完全看不出来（版本号看着都对）。
+	WorkflowVersion int `gorm:"default:0" json:"workflow_version"`
+
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // NodeInstance 节点运行时状态

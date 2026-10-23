@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 
+import LLMProfilesEditor from './LLMProfilesEditor'
+
 interface ModelFile {
   name: string
   size_mb: number
@@ -110,6 +112,7 @@ export default function ModelsSection() {
           ))}
         </div>
       </div>
+          <LLMProfilesEditor />
     </div>
   )
 }

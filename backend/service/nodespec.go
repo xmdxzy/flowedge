@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"time"
 
 	"flowedge/backend/model"
@@ -38,13 +39,21 @@ type NodeSpec struct {
 
 var NodeSpecs = map[string]NodeSpec{
 	// ---- 控制流：不占显存，不产媒体 ----
-	"start":        {Type: "start"},
+	"start": {Type: "start"},
+	// 文件源：只引用已有文件，不吃显存、不产新媒体（Media=false，不进血缘白名单）
+	"input_source": {Type: "input_source"},
+	// 文本拆分：纯字符串处理，不吃显存、不产媒体
+	"text_split":   {Type: "text_split"},
 	"end":          {Type: "end"},
 	"if_else":      {Type: "if_else"},
 	"loop":         {Type: "loop"},
 	"sub_workflow": {Type: "sub_workflow"},
 	"aggregate":    {Type: "aggregate"},
 	"code":         {Type: "code"},
+	// 本地命令：跑外部程序（测试 / 构建 / 校验脚本），不吃显存、不产媒体。
+	// 超时按节点参数算，默认 2 分钟——它跑的是"应该很快"的确定性活，
+	// 真需要长跑的命令自己写 timeout_ms。
+	"command": {Type: "command", Timeout: commandTimeoutOf},
 
 	// ---- 数据/检索 ----
 	"http_request":   {Type: "http_request"},
@@ -93,6 +102,51 @@ var NodeSpecs = map[string]NodeSpec{
 	// 后期包装同样吃 CPU；竖屏(模糊垫底)+BGM+字幕一次重编码，可能跑几十秒
 	"post_production": {Type: "post_production", Media: true},
 	"quality_gate":    {Type: "quality_gate"},
+	// 一致性门：ffmpeg 抽帧 + CPU 算签名，不吃显存、不产媒体（它是门不是变换）。
+	// 超时按段数累计：每段三次抽帧（首/中/末），实测每段 ~3-8s。
+	"consistency_gate": {Type: "consistency_gate", Timeout: func(n *model.NodeInstance) time.Duration {
+		segs := 2
+		if n != nil {
+			if v, ok := n.Data["expected_segments"].(float64); ok && v > 1 {
+				segs = int(v)
+			}
+		}
+		return time.Duration(60+segs*20) * time.Second
+	}},
+
+	// agent_task：外部智能体。
+	//
+	// Side 留空是刻意的：外部智能体的显存由它自己管（可能是远程端点、可能是别人
+	// 启动的本地服务），FlowEdge 既不采样也不仲裁。写 "language" 会让调度器
+	// 以为该卸载本机模型给它腾地方，那是假的 —— 与「逻辑换侧 ≠ 真实卸载」同一个坑。
+	// 代价：并发跑 agent 与出图时，显存冲突要人自己协调（准入闸只看本机压力）。
+	"agent_task": {
+		Type: "agent_task",
+		Timeout: func(n *model.NodeInstance) time.Duration {
+			if ms, ok := n.Data["timeout_ms"].(float64); ok && ms > 0 {
+				return time.Duration(ms) * time.Millisecond
+			}
+			return 5 * time.Minute
+		},
+		MaxTimeout: time.Hour,
+	},
+
+	// mcp_call：外部 MCP 服务器的一个工具。
+	//
+	// Side 留空同 agent_task：工具的耗材在它自己那边（本地进程可能是浏览器、
+	// 数据库、某平台 CLI），引擎既采样不到也不该替它腾显存。
+	// 超时默认 180s：多数工具是一次 HTTP 往返或一次查询；抓整站/跑批的
+	// 服务器可以自己在节点上把 timeout_ms 调大（上限 30 分钟）。
+	"mcp_call": {
+		Type: "mcp_call",
+		Timeout: func(n *model.NodeInstance) time.Duration {
+			if ms, ok := n.Data["timeout_ms"].(float64); ok && ms > 0 {
+				return time.Duration(ms) * time.Millisecond
+			}
+			return 180 * time.Second
+		},
+		MaxTimeout: 30 * time.Minute,
+	},
 }
 
 // NodeSpecOf 查节点元数据。未登记的类型返回零值 + false，
@@ -145,7 +199,13 @@ var mediaProducerTypes = func() map[string]bool {
 }()
 
 // text2ImageTimeout 首张含模型加载给 4 分钟，此后每张按 75 秒累计。
+//
+// MOSS 后端另算（见 mossT2ITimeout）：它是 50 步模型，且可能要先把 8190 实例拉起来，
+// 沿用 flux 的 4 分钟会把一张正常的 MOSS 图判成超时。
 func text2ImageTimeout(n *model.NodeInstance) time.Duration {
+	if isMOSST2INode(n) {
+		return mossT2ITimeout(n)
+	}
 	prompts := len(splitPromptLines(n.Data["prompts"]))
 	batch := int(fieldFloat(n, "batch", 1))
 	if batch < 1 {
@@ -159,6 +219,51 @@ func text2ImageTimeout(n *model.NodeInstance) time.Duration {
 		n2 = 1
 	}
 	return time.Duration(240+n2*75) * time.Second
+}
+
+// isMOSST2INode 这个文生图节点会不会走 MOSS。
+//
+// 判据必须与 ResolveT2IBackend 一致（显式 moss，或 auto 且填了布局），
+// 但这里**不看提示词关键词**：超时在拿到上游文本之前就要算，
+// 而且按关键词猜会让"差一个词"就差 5 分钟超时，说不清。
+// 命中关键词但没猜到的情况由 MaxTimeout 兜底，不会被误杀。
+func isMOSST2INode(n *model.NodeInstance) bool {
+	if n == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(fieldString(n, "backend"))) {
+	case "moss":
+		return true
+	case "flux":
+		return false
+	}
+	return strings.TrimSpace(fieldString(n, "layout")) != ""
+}
+
+// mossT2ITimeout MOSS 出图超时：首张 10 分钟，此后每张 4 分钟。
+//
+// 组成（都是实测或可外推的固定成本，不是拍脑袋）：
+//
+//	8190 实例冷启        ~130s（实测：988 节点注册 + torch 2.14 导入）
+//	11GB 权重载入        ~60s
+//	50 步 @1024² 采样    60–150s（官方口径，本机未实测，取上界）
+//
+// 首张 600s 覆盖「冷启 + 载入 + 采样」的最坏组合还留了一倍余量；
+// 之后实例是热的，每张只算采样，240s 足够。
+func mossT2ITimeout(n *model.NodeInstance) time.Duration {
+	prompts := len(splitPromptLines(n.Data["prompts"]))
+	batch := int(fieldFloat(n, "batch", 1))
+	if batch < 1 {
+		batch = 1
+	}
+	n2 := prompts
+	if n2 < batch {
+		n2 = batch
+	}
+	if n2 < 1 {
+		n2 = 1
+	}
+	return time.Duration(600+(n2-1)*240) * time.Second
 }
 
 // text2VideoTimeout H3 按段数给（每段约 2–3 分钟），其余后端给 25 分钟。
@@ -191,4 +296,15 @@ func shotListTimeout(n *model.NodeInstance) time.Duration {
 		return maxShotlistTimeout
 	}
 	return ShotListBudget(shots, totalFrames)
+}
+
+// fieldString 读节点字符串字段（取不到返回空串，让调用方自己判空）。
+func fieldString(n *model.NodeInstance, key string) string {
+	if n == nil {
+		return ""
+	}
+	if s, ok := n.Data[key].(string); ok {
+		return s
+	}
+	return ""
 }

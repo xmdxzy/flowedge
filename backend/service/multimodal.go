@@ -173,102 +173,153 @@ func (s *Text2ImageService) buildGraphFromTemplate(name, prompt, negative string
 }
 
 // GenerateImage 生成图片：POST /prompt → 轮询 /history → GET /view 下载落盘，返回本地文件路径
+// GenerateImage 用服务默认 checkpoint 出图。
 func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (string, error) {
+	return s.GenerateImageWithCkpt(prompt, width, height, "")
+}
+
+// GenerateImageWithCkpt 节点级 checkpoint 覆盖：空 = 用服务默认。
+// 为什么要能按节点换：同一张图用 flux-schnell 求快、用 qwen_image 求质，
+// 是两条不同的流水线；强迫全局改配置等于一次只能存在一种。
+// T2IOptions 一次文生图的完整入参。
+//
+// Backend 为空 = auto：由提示词与布局决定（判据见 ResolveT2IBackend，可审计）。
+type T2IOptions struct {
+	Backend  T2IBackend
+	Prompt   string
+	Negative string
+	Width    int
+	Height   int
+	Steps    int
+	Cfg      float64
+	Ckpt     string // flux：checkpoint 名；空 = 服务默认
+	Layout   string // moss：layout JSON；非空时替代 Prompt 作为条件
+}
+
+// GenerateImageWithCkpt 节点级 checkpoint 覆盖：空 = 用服务默认。
+//
+// 为什么要能按节点换：同一张图用 flux-schnell 求快、用 MOSS 求字，
+// 是两条不同的流水线；强迫全局改配置等于一次只能存在一种。
+func (s *Text2ImageService) GenerateImageWithCkpt(prompt string, width, height int, ckpt string) (string, error) {
+	return s.GenerateImageWithBackend(T2IOptions{
+		Backend: BackendFlux, Prompt: prompt, Width: width, Height: height, Ckpt: ckpt,
+	})
+}
+
+// GenerateImageWithBackend 按后端出图：选实例 → 构图 → 提交 → 轮询 → 落盘。
+//
+// 为什么要多这一层而不是在 GenerateImageWithCkpt 里加 if：换后端换的不只是权重名，
+// 是**整套 ComfyUI 图 + 目标实例**。这两件事必须一起决定，分开决定必然出现
+// 「图按 MOSS 搭的，却发给了没有 MOSS 节点的主实例」。
+func (s *Text2ImageService) GenerateImageWithBackend(opt T2IOptions) (string, error) {
 	if s.BaseURL == "" {
 		return "", fmt.Errorf("comfyui not configured")
 	}
-	// 兼容矩阵预检（见 comfy_compat.go）：不兼容组合构图前显式失败
-	if err := CheckCheckpointCompat(s.Checkpoint); err != nil {
-		return "", err
-	}
-	if width <= 0 {
-		width = 1024
-	}
-	if height <= 0 {
-		height = 1024
-	}
+	backend, reason := ResolveT2IBackend(string(opt.Backend), opt.Prompt, strings.TrimSpace(opt.Layout) != "")
 
-	link := func(id string, slot int) []interface{} { return []interface{}{id, slot} }
+	var (
+		workflow map[string]interface{}
+		baseURL  string
+		timeout  time.Duration
+	)
 
-	// flux1-schnell fp8 checkpoint 标准 txt2img API 图（4 步 / cfg 1.0 / euler+simple）
-	workflow := map[string]interface{}{
-		"4": map[string]interface{}{
-			"class_type": "CheckpointLoaderSimple",
-			"inputs": map[string]interface{}{
-				"ckpt_name": s.Checkpoint,
-			},
-		},
-		"6": map[string]interface{}{
-			"class_type": "CLIPTextEncode",
-			"inputs": map[string]interface{}{
-				"text": prompt,
-				"clip": link("4", 1),
-			},
-		},
-		"33": map[string]interface{}{
-			"class_type": "CLIPTextEncode",
-			"inputs": map[string]interface{}{
-				"text": "",
-				"clip": link("4", 1),
-			},
-		},
-		"5": map[string]interface{}{
-			"class_type": "EmptyLatentImage",
-			"inputs": map[string]interface{}{
-				"width":      width,
-				"height":     height,
-				"batch_size": 1,
-			},
-		},
-		"3": map[string]interface{}{
-			"class_type": "KSampler",
-			"inputs": map[string]interface{}{
-				"seed":         time.Now().UnixNano(),
-				"steps":        s.bundleParamInt(RoleT2IPrimary, "steps", 4),
-				"cfg":          s.bundleParam(RoleT2IPrimary, "cfg", 1.0),
-				"sampler_name": "euler",
-				"scheduler":    "simple",
-				"denoise":      1.0,
-				"model":        link("4", 0),
-				"positive":     link("6", 0),
-				"negative":     link("33", 0),
-				"latent_image": link("5", 0),
-			},
-		},
-		"8": map[string]interface{}{
-			"class_type": "VAEDecode",
-			"inputs": map[string]interface{}{
-				"samples": link("3", 0),
-				"vae":     link("4", 2),
-			},
-		},
-		"9": map[string]interface{}{
-			"class_type": "SaveImage",
-			"inputs": map[string]interface{}{
-				"images":          link("8", 0),
-				"filename_prefix": "flowedge",
-			},
-		},
-	}
+	switch backend {
+	case BackendMOSS:
+		w, h := opt.Width, opt.Height
+		if w <= 0 {
+			w = int(s.bundleParam(RoleT2IMOSS, "width", mossDefaultW))
+		}
+		if h <= 0 {
+			h = int(s.bundleParam(RoleT2IMOSS, "height", mossDefaultH))
+		}
+		steps := opt.Steps
+		if steps <= 0 {
+			steps = int(s.bundleParam(RoleT2IMOSS, "steps", mossDefaultSteps))
+		}
+		cfg := opt.Cfg
+		if cfg <= 0 {
+			cfg = s.bundleParam(RoleT2IMOSS, "cfg", mossDefaultCFG)
+		}
+		unet := s.bundleFile(RoleT2IMOSS, "unet")
+		clip := s.bundleFile(RoleT2IMOSS, "clip")
+		vae := s.bundleFile(RoleT2IMOSS, "vae")
+		baseURL = s.baseForModelName(unet)
 
-	// 用户提供了模板就用模板：这样 ControlNet / LoRA / img2img / upscale
-	// 等任意 ComfyUI 图都能接入，而不必改 FlowEdge 的代码
-	if s.Template != "" {
-		g, err := s.buildGraphFromTemplate(s.Template, prompt, "", width, height, time.Now().UnixNano())
-		if err != nil {
+		// 换侧（AGENTS §2）：MOSS 权重约 11GB，加主实例驻留的 flux 17GB = 28GB > 24GB。
+		// 两者不在同一个进程，/free 是唯一能让显存真正归还的手段。
+		// 失败只记日志不返回——主实例可能压根没起，那本来就不需要腾地方。
+		if !strings.EqualFold(strings.TrimRight(baseURL, "/"), strings.TrimRight(s.BaseURL, "/")) {
+			if err := s.UnloadModels(); err != nil {
+				log.Printf("[t2i] 卸载主实例模型失败（继续：主实例可能未启动）：%v", err)
+			}
+		}
+
+		cond := opt.Prompt
+		if strings.TrimSpace(opt.Layout) != "" {
+			cond = opt.Layout // layout JSON 本身就是条件文本，直接喂 CLIPTextEncode
+		}
+		workflow = BuildMOSSGraph(cond, opt.Negative, unet, clip, vae, w, h, steps, cfg, time.Now().UnixNano())
+		// 50 步 @1024² 比 flux 的 4 步慢一个数量级，7 分钟会把正常的冷加载出图判成超时
+		timeout = 20 * time.Minute
+
+	default:
+		ckpt := strings.TrimSpace(opt.Ckpt)
+		if ckpt == "" {
+			ckpt = s.Checkpoint
+		}
+		// 兼容矩阵预检（见 comfy_compat.go）：不兼容组合构图前显式失败
+		if err := CheckCheckpointCompat(ckpt); err != nil {
 			return "", err
 		}
-		workflow = g
+		w, h := opt.Width, opt.Height
+		if w <= 0 {
+			w = int(s.bundleParam(RoleT2IPrimary, "width", 1024))
+		}
+		if h <= 0 {
+			h = int(s.bundleParam(RoleT2IPrimary, "height", 1024))
+		}
+		steps := opt.Steps
+		if steps <= 0 {
+			steps = int(s.bundleParam(RoleT2IPrimary, "steps", 4))
+		}
+		cfg := opt.Cfg
+		if cfg <= 0 {
+			cfg = s.bundleParam(RoleT2IPrimary, "cfg", 1.0)
+		}
+		baseURL = s.baseForModelName(ckpt)
+		workflow = BuildFluxGraph(opt.Prompt, opt.Negative, ckpt, w, h, steps, cfg, time.Now().UnixNano())
+
+		// 用户提供了模板就用模板：这样 ControlNet / LoRA / img2img / upscale
+		// 等任意 ComfyUI 图都能接入，而不必改 FlowEdge 的代码
+		if s.Template != "" {
+			g, err := s.buildGraphFromTemplate(s.Template, opt.Prompt, opt.Negative, w, h, time.Now().UnixNano())
+			if err != nil {
+				return "", err
+			}
+			workflow = g
+		}
+		timeout = 7 * time.Minute
 	}
 
-	// ComfyUI /prompt 协议要求 {"prompt": <graph>} 包裹
+	log.Printf("[t2i] backend=%s %dx%d → %s（%s）", backend, opt.Width, opt.Height, baseURL, reason)
+	return s.runComfyGraph(baseURL, workflow, timeout)
+}
+
+// runComfyGraph 提交一张 ComfyUI API 图，轮询 /history，下载产物落盘。
+//
+// baseURL 显式传入而不是读 s.BaseURL：MOSS 跑在另一个实例的另一个端口上，
+// 而这个实例是构图时才决定的。
+func (s *Text2ImageService) runComfyGraph(baseURL string, workflow map[string]interface{}, timeout time.Duration) (string, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = s.BaseURL
+	}
 	payload := map[string]interface{}{"prompt": workflow}
 	jsonBody, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal workflow failed: %w", err)
 	}
 
-	resp, err := s.httpClient().Post(s.BaseURL+"/prompt", "application/json", bytes.NewBuffer(jsonBody))
+	resp, err := s.httpClient().Post(baseURL+"/prompt", "application/json", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("comfyui request failed: %w", err)
 	}
@@ -285,12 +336,11 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 		return "", fmt.Errorf("comfyui returned no prompt_id: %.300s", string(respBody))
 	}
 
-	// 轮询执行结果（首次运行含模型冷加载，给足 7 分钟）
-	deadline := time.Now().Add(7 * time.Minute)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		time.Sleep(1500 * time.Millisecond)
 
-		hresp, err := s.httpClient().Get(s.BaseURL + "/history/" + queued.PromptID)
+		hresp, err := s.httpClient().Get(baseURL + "/history/" + queued.PromptID)
 		if err != nil {
 			continue
 		}
@@ -327,7 +377,7 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 		}
 
 		viewURL := fmt.Sprintf("%s/view?filename=%s&subfolder=%s&type=%s",
-			s.BaseURL, url.QueryEscape(imgFile), url.QueryEscape(imgSub), url.QueryEscape(imgType))
+			baseURL, url.QueryEscape(imgFile), url.QueryEscape(imgSub), url.QueryEscape(imgType))
 		dresp, err := s.httpClient().Get(viewURL)
 		if err != nil {
 			return "", fmt.Errorf("comfyui download failed: %w", err)
@@ -355,7 +405,7 @@ func (s *Text2ImageService) GenerateImage(prompt string, width, height int) (str
 		return outPath, nil
 	}
 
-	return "", fmt.Errorf("comfyui generation timed out after 7m (prompt_id=%s)", queued.PromptID)
+	return "", fmt.Errorf("comfyui generation timed out after %s (prompt_id=%s)", timeout, queued.PromptID)
 }
 
 // comfyHistoryEntry ComfyUI /history 返回条目
@@ -468,8 +518,9 @@ func NewTTSService(baseURL string) *TTSService {
 
 // TTSOptions 语音合成参数（当前仅内置 SAPI 后端使用；HTTP 服务端可选支持）
 type TTSOptions struct {
-	Voice string // 语音名片段，如 "Huihui"；空则用系统默认
-	Rate  int    // 语速 -10..10
+	Voice string  // 语音名片段，如 "Huihui"；空则用系统默认
+	Rate  int     // 语速 -10..10（SAPI 语义）
+	Speed float64 // 语速倍率（Kokoro /tts 的 speed 语义；>0 时才发给服务端）
 }
 
 // Synthesize 文字转语音（兼容旧调用）
@@ -522,6 +573,11 @@ func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptio
 	}
 	if opt.Rate != 0 {
 		reqBody["rate"] = opt.Rate
+	}
+	// Kokoro 系服务读 speed（倍率），SAPI 读 rate（-10..10）。两个键都发，
+	// 服务端认哪个用哪个—— dub-track.py 实测发的就是 speed。
+	if opt.Speed > 0 {
+		reqBody["speed"] = opt.Speed
 	}
 	jsonBody, _ := json.Marshal(reqBody)
 

@@ -78,27 +78,56 @@ func joinIsAny(n *model.NodeInstance) bool {
 
 // EngineV2 增强版工作流引擎
 type EngineV2 struct {
-	llm             *LLMService
-	llmStream       *LLMStreamService
-	t2i             *Text2ImageService
-	asr             *ASRService
-	tts             *TTSService
-	video           *VideoService
-	http            *HTTPService
-	rag             *RAGServiceV3
-	gpuSched        *GPUScheduler
-	wsHub           *WSHub
-	tools           *ToolExecutor
-	cache           *NodeCache
-	eventLog        *EventLogger
-	shotJobs        *ShotJobStore    // 镜头级作业（可 nil：无库时降级为不落盘）
-	creds           *CredentialStore // 凭据仓库（HTTP 节点按名称取密钥）
-	visionModel     string           // 自动探测到的本地视觉模型（vision 节点留空时使用）
-	vram            *vramArbiter     // 显存仲裁：同一时刻只跑一个重任务
-	vramMu          sync.Mutex       // 保护 vram 的懒初始化（见 arbiter 注释）
-	deps            *Supervisor      // 依赖进程托管（H3 需要按需切换实例）
-	profiles        *ProfileStore    // 显存档案（实测峰值，供提交前预测；可 nil）
-	nodes           nodeRegistry     // 节点类型注册表（内置 15 种 + 可注册自定义）
+	llm         *LLMService
+	llmStream   *LLMStreamService
+	t2i         *Text2ImageService
+	asr         *ASRService
+	tts         *TTSService
+	video       *VideoService
+	http        *HTTPService
+	rag         *RAGServiceV3
+	gpuSched    *GPUScheduler
+	wsHub       *WSHub
+	tools       *ToolExecutor
+	cache       *NodeCache
+	eventLog    *EventLogger
+	shotJobs    *ShotJobStore    // 镜头级作业（可 nil：无库时降级为不落盘）
+	creds       *CredentialStore // 凭据仓库（HTTP 节点按名称取密钥）
+	llmProfiles *LLMProfileStore // 自定义模型端点（节点 llm_profile 引用）
+	agents      *AgentStore      // 外部智能体名册（agent_task 节点引用）
+	// toolchain 工具链（skill / MCP / 插件 / 智能体的统一发现层）。
+	// mcp_call 节点靠它按名字找服务器；能 nil（老测试构造的引擎没有它）。
+	toolchain *Toolchain
+	// agentGate 外部智能体的并发配额。
+	//
+	// 为什么节点级还要一道：整图准入闸只在提交时问一次「现在能不能跑」，
+	// 但它管不了「一张图里 5 个 agent_task 同时起 5 个 Claude Code」——
+	// 那是提交之后才发生的扇出。每个 agent 都是独立进程，各吃各的内存，
+	// 一起上来能把机器压死，而准入闸那时早就放行了。
+	agentGateOnce sync.Once
+	agentGate     chan struct{}
+	cards         *CardStore // 能力卡片（节点 binding 引用）
+	// skillRoots 技能包索引的扫描根（agent_task 的 skill_refs 用它反查路径）。
+	// 空 = 用默认（用户级 + 冷存储 + DSH + agents + 项目级 + 额外根文件，见 SkillRoots）。
+	skillRoots []string
+	// pluginRoots 专家插件市场的技能根（plugins/<插件>/skills/<技能> 两级布局）。
+	// 与 skillRoots 分开：来源是外部专家生态，布局不同，合并会让「扫到几个包」失去意义。
+	pluginRoots []string
+	visionModel string        // 自动探测到的本地视觉模型（vision 节点留空时使用）
+	vram        *vramArbiter  // 显存仲裁：同一时刻只跑一个重任务
+	vramMu      sync.Mutex    // 保护 vram 的懒初始化（见 arbiter 注释）
+	deps        *Supervisor   // 依赖进程托管（H3 需要按需切换实例）
+	profiles    *ProfileStore // 显存档案（实测峰值，供提交前预测；可 nil）
+	nodes       nodeRegistry  // 节点类型注册表（内置 15 种 + 可注册自定义）
+	// hotNodes 运行期热注册的节点（插件重载用）。
+	//
+	// 为什么不直接写进 e.nodes：内置注册表在启动后是**只读**的，
+	// 而热重载发生在引擎跑着的时候（用户点「重新扫描」）。往同一个 map 里写、
+	// 另一个 goroutine 在读 → Go 直接 fatal（concurrent map read and map write），
+	// 不是"偶发不一致"那么轻。所以热注册单独一份，读写走 RWMutex。
+	hotNodes        nodeRegistry
+	hotSides        map[string]string
+	hotMu           sync.RWMutex
 	runMu           sync.Mutex
 	activeRuns      map[uint]context.CancelFunc        // runID -> 取消函数（支持手动中止）
 	resolveWorkflow func(uint) ([]byte, []byte, error) // 子工作流解析器
@@ -228,6 +257,12 @@ func (e *EngineV2) translatePromptToEnglish(prompt string) (string, error) {
 
 // nodeSideOf 节点类型的显存侧别：先查自定义注册时的声明，再回落到内置映射。
 func (e *EngineV2) nodeSideOf(nodeType string) string {
+	e.hotMu.RLock()
+	if s, ok := e.hotSides[nodeType]; ok && s != "" {
+		e.hotMu.RUnlock()
+		return s
+	}
+	e.hotMu.RUnlock()
 	if e.nodeSides != nil {
 		if s, ok := e.nodeSides[nodeType]; ok {
 			return s
@@ -320,6 +355,28 @@ func (e *EngineV2) SetEventLog(l *EventLogger) { e.eventLog = l }
 
 // SetCredentials 注入凭据仓库（HTTP 节点 credential 字段生效的前提）
 func (e *EngineV2) SetCredentials(c *CredentialStore) { e.creds = c }
+
+// SetCards 注入能力卡片仓库（节点 binding 字段生效的前提）。
+func (e *EngineV2) SetCards(c *CardStore) { e.cards = c }
+
+// SetLLMProfiles 注入自定义模型清单（节点 llm_profile 字段生效的前提）。
+// nil 时引用 profile 的节点会显式报错，而不是悄悄退回本机模型——
+// "以为在用云端、其实在跑本地"是最难查的一类问题。
+func (e *EngineV2) SetLLMProfiles(s *LLMProfileStore) { e.llmProfiles = s }
+
+// SetAgents 注入外部智能体名册（agent_task 节点生效的前提）。
+// nil 时该节点显式报"名册未加载"，而不是静默跳过 —— 静默跳过的后果是
+// 下游拿到空文本还以为 agent 给了空答案。
+func (e *EngineV2) SetAgents(s *AgentStore) { e.agents = s }
+
+// SetSkillRoots 指定技能包扫描根（agent_task 的 skill_refs 靠它找到 SKILL.md 路径）
+func (e *EngineV2) SetSkillRoots(roots []string) { e.skillRoots = roots }
+
+// SetPluginRoots 指定专家插件市场的技能根（agent_task 的 skill_refs 也要能反查插件技能）
+func (e *EngineV2) SetPluginRoots(roots []string) { e.pluginRoots = roots }
+
+// Agents 当前名册（可能为 nil）
+func (e *EngineV2) Agents() *AgentStore { return e.agents }
 
 // SetVisionModel 注入自动探测到的视觉模型名（vision 节点未显式指定模型时使用）
 func (e *EngineV2) SetVisionModel(name string) { e.visionModel = name }
@@ -416,6 +473,8 @@ func (e *EngineV2) ExecuteWithControl(nodesJSON, edgesJSON []byte, runID uint, r
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = withRunID(ctx, runID)
 	ctx = withRunControl(ctx, rc)
+	// 运行级 agent 并发配额（rc 未声明时注入空 context，行为与原来完全一致）
+	ctx = withAgentPool(ctx, rc.AgentConcurrency())
 
 	e.runMu.Lock()
 	if e.activeRuns == nil {
@@ -440,6 +499,8 @@ func (e *EngineV2) ResumeWithControl(nodesJSON, edgesJSON []byte, prev []model.N
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = withRunID(ctx, runID)
 	ctx = withRunControl(ctx, rc)
+	// 运行级 agent 并发配额（rc 未声明时注入空 context，行为与原来完全一致）
+	ctx = withAgentPool(ctx, rc.AgentConcurrency())
 
 	e.runMu.Lock()
 	if e.activeRuns == nil {
@@ -927,6 +988,14 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 				node.Status = "failed"
 				node.Error = execErr.Error()
 				node.ErrorCode = classifyError(execErr)
+				// 失败也留产物：门类节点「判不过」时会同时返回逐项检查与错误。
+				// 丢掉它，证据层就只能看到「节点失败且没有 checks」，把一次
+				// 「判不过」记成「没测到」(unscored) —— 评测结论直接反向，
+				// 且自进化会把门当成总在崩。判据是**有没有 checks**（evidence.go gateFacts），
+				// 所以这里保住 out 就是保住判据（2026-10-23 抓到）。
+				if out != nil {
+					node.Output = out
+				}
 				// 重试耗尽：仅在无法归类的通用执行错误时标记，
 				// 保留 timeout / config_missing 等更具体的错误码
 				if node.ErrorCode == model.ErrorCodeExecution && retryCount > 0 {
@@ -1084,7 +1153,13 @@ func (e *EngineV2) registerBuiltinNodes() {
 	}
 
 	e.nodes = nodeRegistry{
-		"start":         plain(e.execStartNode),
+		"start": plain(e.execStartNode),
+		// 外部文件入口：让「转写一段录音」这类目标在图上能正常表达，
+		// 而不是靠"孤立节点 + 参数"绕（模型不认那个写法，标定里 3/10 条就死在这）
+		"input_source":  plain(e.execInputSourceNode),
+		// 长文本按句/段/固定段数/字数拆开。缺它时 compose 会编造一个 split_text
+		// （2026-10-23 标定唯一剩下的失败就是这条）
+		"text_split":    plain(e.execTextSplitNode),
 		"llm":           e.execLLMNode,
 		"text2image":    plain(e.execText2ImageNode),
 		"asr":           plain(e.execASRNode),
@@ -1109,12 +1184,21 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"storyboard":      e.execStoryboardNode,
 		"shotlist":        e.execShotListNode,
 		"quality_gate":    e.execQualityGateNode,
-		"image2image":     e.execImage2ImageNode,
-		"inpaint":         e.execInpaintNode,
-		"upscale":         e.execUpscaleNode,
-		"text2video":      e.execText2VideoNode,
-		"end":             plain(e.execEndNode),
-		"code":            e.execCodeNode,
+		// 一致性门：像素侧的场景/配色/光比一致性判定（文本侧由 scene_grid 的锁句守）
+		"consistency_gate": e.execConsistencyGateNode,
+		"agent_task":       e.execAgentTaskNode,
+		// 外部 MCP 服务器的一个工具 = 图里一个节点。
+		// 「工具只出不进」的缺口在这里补上：别人的 MCP 服务器现在能编进流水线。
+		"mcp_call":    e.execMCPCallNode,
+		"image2image": e.execImage2ImageNode,
+		"inpaint":     e.execInpaintNode,
+		"upscale":     e.execUpscaleNode,
+		"text2video":  e.execText2VideoNode,
+		"end":         plain(e.execEndNode),
+		"code":        e.execCodeNode,
+		// 本地命令：agent_task 的确定性对偶（agent 改，command 验）。
+		// 缺它时"跑一遍测试"只能外挂 HTTP 服务，多一个进程就多一条失败面。
+		"command": e.execCommandNode,
 		// 导入任意 ComfyUI API 格式工作流（社区几万个 workflow JSON 的接入点）
 		"comfy_workflow": plain(e.execComfyWorkflowNode),
 	}
@@ -1133,7 +1217,46 @@ func (e *EngineV2) executeNode(ctx context.Context, node *model.NodeInstance, up
 		e.runMu.Unlock()
 	}
 
-	if fn, ok := e.nodes[node.Type]; ok {
+	if fn, ok := e.lookupNode(node.Type); ok {
+		// 输入处理段：所有节点统一在派发前过一遍上游文本。
+		// 放在这里而不是逐个节点里做，是因为"哪些节点要吃预处理"这件事
+		// 不该由 20 个执行体各答一次——那种写法必然漏，且新节点默认没有。
+		cardTraceOf := &cardTrace{}
+		upstream = e.applyInputStage(node, upstream, cardTraceOf)
+
+		// 能力卡片：工作流封装卡把**这个节点**替换成一次子工作流调用。
+		// 这是唯一能改执行结构的一类卡片；agent/skill 只改提示词，见 execLLMNode。
+		pipe := ParsePipeline(node.Data)
+		if pipe.Replace != nil {
+			wfID, bound := WorkflowIDOfBinding(Binding{Kind: pipe.Replace.Kind, ID: pipe.Replace.ID})
+			if bound {
+				inner := func(ctx context.Context, n *model.NodeInstance, up map[string]interface{}) (interface{}, error) {
+					if e.resolveWorkflow == nil {
+						return nil, fmt.Errorf("节点 %s 贴了工作流卡，但引擎没有装配工作流解析器", n.ID)
+					}
+					if d := e.depth.Add(1); d > maxSubWorkflowDepth {
+						e.depth.Add(-1)
+						return nil, fmt.Errorf("工作流卡嵌套过深（>%d）：%s", maxSubWorkflowDepth, n.ID)
+					}
+					defer e.depth.Add(-1)
+					out, err := e.executeInnerWorkflow(ctx, wfID, upstreamText(up), false)
+					if err != nil {
+						return nil, fmt.Errorf("工作流卡 #%d（节点 %s）: %w", wfID, n.ID, err)
+					}
+					return out, nil
+				}
+				return inner(ctx, node, upstream)
+			}
+		}
+		// 输出处理段：与输入段对称，统一在派发后做。
+		// 只改 map 里的 text 字段，不动其它产物（image / tool_calls / _usage）。
+		finish := func(out interface{}, err error) (interface{}, error) {
+			if err != nil {
+				return out, err
+			}
+			return e.applyOutputStage(node, out, pipe.Output, cardTraceOf), nil
+		}
+
 		// 重节点：局部采样显存峰值，落显存档案（供下次提交前预测）。
 		// 只在执行窗口内采样，空闲不烧 CPU（见 vram_sampler.go）。
 		if e.profiles != nil && isHeavyNode(node.Type) {
@@ -1142,9 +1265,9 @@ func (e *EngineV2) executeNode(ctx context.Context, node *model.NodeInstance, up
 			out, err := fn(ctx, node, upstream)
 			peak, samples := smp.Stop()
 			e.recordProfile(node, time.Since(start), peak, samples)
-			return out, err
+			return finish(out, err)
 		}
-		return fn(ctx, node, upstream)
+		return finish(fn(ctx, node, upstream))
 	}
 	return nil, fmt.Errorf("unknown node type: %s", node.Type)
 }
@@ -1163,12 +1286,103 @@ func (e *EngineV2) RegisterNodeType(typ string, fn NodeExecutor) {
 	e.nodes[typ] = fn
 }
 
-// NodeTypes 已注册的节点类型（供能力自检端点下发到前端）
-func (e *EngineV2) NodeTypes() []string {
-	out := make([]string, 0, len(e.nodes))
-	for k := range e.nodes {
+// ReplaceHotNodes 整体替换运行期热注册的节点表（插件重载入口）。
+//
+// 语义是"替换"而不是"合并"：插件被删掉/被停用后，它的节点类型必须跟着消失，
+// 否则画布上还能拖出来一个永远报"插件不存在"的节点。所以每次重载传入的是
+// **重扫后的完整集合**，不是增量。
+func (e *EngineV2) ReplaceHotNodes(nodes map[string]NodeExecutor, sides map[string]string) {
+	e.hotMu.Lock()
+	defer e.hotMu.Unlock()
+	if nodes == nil {
+		e.hotNodes = nil
+		e.hotSides = nil
+		return
+	}
+	m := make(nodeRegistry, len(nodes))
+	for k, v := range nodes {
+		m[k] = v
+	}
+	s := make(map[string]string, len(sides))
+	for k, v := range sides {
+		s[k] = v
+	}
+	e.hotNodes = m
+	e.hotSides = s
+}
+
+// lookupNode 查执行函数：内置优先，其次热注册。
+// 内置优先是刻意的——插件不许覆盖内置节点类型去劫持整条流水线。
+func (e *EngineV2) lookupNode(typ string) (NodeExecutor, bool) {
+	if fn, ok := e.nodes[typ]; ok {
+		return fn, true
+	}
+	e.hotMu.RLock()
+	defer e.hotMu.RUnlock()
+	fn, ok := e.hotNodes[typ]
+	return fn, ok
+}
+
+// HotNodeTypes 当前热注册的节点类型（插件面板显示"装了哪些节点"）
+func (e *EngineV2) HotNodeTypes() []string {
+	e.hotMu.RLock()
+	defer e.hotMu.RUnlock()
+	out := make([]string, 0, len(e.hotNodes))
+	for k := range e.hotNodes {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// NodeTypes 已注册的节点类型（供能力自检端点下发到前端）
+func (e *EngineV2) NodeTypes() []string {
+	seen := make(map[string]bool, len(e.nodes))
+	out := make([]string, 0, len(e.nodes))
+	for k := range e.nodes {
+		seen[k] = true
+		out = append(out, k)
+	}
+	e.hotMu.RLock()
+	for k := range e.hotNodes {
+		if !seen[k] {
+			out = append(out, k)
+		}
+	}
+	e.hotMu.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
+// ComposeLLM 暴露一个「温度 0 的单轮对话」给构图用。
+//
+// 不直接把 e 传出去：构图只需要"给提示词、拿文本"这一个能力，
+// 传整个引擎会让调用方顺手干别的事（改图、起跑），边界就糊了。
+func (e *EngineV2) ComposeLLM() ComposeLLM {
+	return func(prompt string) (string, error) {
+		model := ""
+		if e.llm != nil {
+			model = e.llm.Model
+		}
+		return e.deterministicChat(model, prompt)
+	}
+}
+
+// RAGQuery 供 handler 检索经验卡片（构图时作为参考经验）。
+// rag 未配置时返回空，不报错 —— 没有经验库也能构图，只是质量差些。
+func (e *EngineV2) RAGQuery(query string, topK int) []string {
+	if e.rag == nil {
+		return nil
+	}
+	results, err := e.rag.Query(query, topK)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Record.Content != "" {
+			out = append(out, r.Record.Content)
+		}
+	}
 	return out
 }

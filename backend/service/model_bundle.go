@@ -30,6 +30,7 @@ const (
 	RoleT2IPrimary     = "t2i.primary"      // 文生图主模型
 	RoleT2IBatch       = "t2i.batch"        // 批量出图（同 prompt 多张）
 	RoleT2IMultiPrompt = "t2i.multi_prompt" // 多提示词批量（分镜图/角色表）
+	RoleT2IMOSS        = "t2i.moss"         // MOSS-Image（文字渲染 / 布局控制，走 8190 独立实例）
 	RoleImg2Img        = "img2img"          // 图生图
 	RoleInpaint        = "inpaint"          // 局部重绘
 	RoleUpscale        = "upscale"          // 图片超分
@@ -103,6 +104,17 @@ func builtinBundles() map[string]*ModelBundle {
 			Files:  map[string]string{"ckpt": DefaultCheckpoint},
 			Params: map[string]float64{"steps": 4, "cfg": 1.0},
 			Notes:  "N 个 prompt 编进一张图共享权重，避免每条都重走 checkpoint 载入。",
+		},
+		RoleT2IMOSS: {
+			Label: "MOSS-Image（图内文字渲染 + 布局控制）",
+			Files: map[string]string{
+				"unet": "moss_image_sft_int8_convrot.safetensors",
+				"clip": "qwen3.5_9b_w4a8_gptq.safetensors",
+				"vae":  "flux2-vae_small.safetensors",
+			},
+			Params: map[string]float64{"steps": 50, "cfg": 3.0, "width": 1024, "height": 1024},
+			Notes: "MOSS 是三件套分离加载，不进 checkpoints 目录（走 diffusion_models / text_encoders / vae）。" +
+				"50 步是官方推荐；社区 8 步 DMD LoRA 可换，但要同时把 steps 改成 8。必须走 0.41+ 的 ComfyUI 实例。",
 		},
 		RoleImg2Img: {
 			Label:  "图生图",

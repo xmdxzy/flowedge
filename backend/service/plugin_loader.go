@@ -50,7 +50,13 @@ type pluginManifest struct {
 	URL         string `json:"url"`
 	Side        string `json:"side"` // 显存侧别（"" = 不占显存）
 	TimeoutMS   int    `json:"timeout_ms"`
+	// Enabled nil = 启用。停用的插件留在目录里但不注册节点——
+	// 「我想先留着但这次别加载」是常见需求，删掉再拷回来才是折腾。
+	Enabled *bool `json:"enabled,omitempty"`
 }
+
+// IsEnabled nil 视为启用（手写 json 时不用每次都写 enabled）
+func (m pluginManifest) IsEnabled() bool { return m.Enabled == nil || *m.Enabled }
 
 // RuntimePlugin 运行期插件（同时满足 NodePlugin 接口）
 type RuntimePlugin struct {
@@ -229,6 +235,25 @@ func LoadRuntimePlugins(dir string) ([]NodePlugin, []string) {
 		plugins = append(plugins, p)
 	}
 	return plugins, errs
+}
+
+// LoadOnePlugin 加载单个插件目录（热重载入口，语义同启动时加载）
+func LoadOnePlugin(dir string) (*RuntimePlugin, error) {
+	return loadOnePlugin(dir)
+}
+
+// LoadPluginManifest 只读清单，不编译脚本/不建 HTTP 客户端。
+// 工具台列「装了哪些插件」用它——列出清单不该触发任何副作用。
+func LoadPluginManifest(dir string) (pluginManifest, error) {
+	var m pluginManifest
+	raw, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
+	if err != nil {
+		return m, fmt.Errorf("缺少 plugin.json")
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return m, fmt.Errorf("plugin.json 解析失败：%w", err)
+	}
+	return m, nil
 }
 
 func loadOnePlugin(dir string) (*RuntimePlugin, error) {

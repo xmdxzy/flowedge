@@ -1,6 +1,8 @@
 package service
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"flowedge/backend/model"
@@ -66,6 +68,43 @@ func TestPreflightDeps_ComfyAutoStartNotBlocked(t *testing.T) {
 	if sup2.Startable("comfyui") {
 		if missing := PreflightDeps(nodes, caps, sup2); len(missing) != 0 {
 			t.Fatalf("可自动启动的 ComfyUI 不应被拦，got %+v", missing)
+		}
+	}
+}
+
+// 依赖从契约派生之后，视频后端的切换必须仍然生效：
+// H3 走 8189 独立实例，其余走主实例。这是唯一一个"同一模块两种服务"的特例，
+// 一旦 RequiresFor 写错，用户会看到"ComfyUI 没问题"却在 H3 上必然失败。
+func TestPreflightDeps_VideoBackendSwitchesDependency(t *testing.T) {
+	caps := Capabilities{}
+	h3 := []model.NodeInstance{{ID: "v", Type: "text2video", Data: map[string]interface{}{"backend": "h3"}}}
+	got := PreflightDeps(h3, caps, &Supervisor{specs: map[string]*DepSpec{}})
+	if len(got) != 1 || got[0].Dep != "comfy_h3" {
+		t.Fatalf("h3 后端应要求 comfy_h3，got %+v", got)
+	}
+
+	wan := []model.NodeInstance{{ID: "v", Type: "text2video", Data: map[string]interface{}{"backend": "wan"}}}
+	got = PreflightDeps(wan, caps, &Supervisor{specs: map[string]*DepSpec{}})
+	if len(got) != 1 || got[0].Dep != "comfyui" {
+		t.Fatalf("wan 后端应要求 comfyui，got %+v", got)
+	}
+}
+
+// preflight.go 里不许按节点类型分支。
+// 只要还有人写 `switch n.Type { case "asr": ... }`，新加的模态就必然漏预检——
+// 而漏预检的症状是"跑进去才报连接错误"，用户看到的是"工作流失败"，代价最高的一类故障。
+//
+// 判定用**结构**而不是字面量：depFix 里的 "asr"/"tts" 是依赖名（引擎托管的服务），
+// 不是节点类型，两者恰好同名，靠字符串匹配会误伤。
+func TestPreflightHasNoTypeSwitches(t *testing.T) {
+	raw, err := os.ReadFile("preflight.go")
+	if err != nil {
+		t.Fatalf("读 preflight.go 失败：%v", err)
+	}
+	src := string(raw)
+	for _, bad := range []string{"switch n.Type", "switch node.Type", "n.Type ==", "node.Type =="} {
+		if strings.Contains(src, bad) {
+			t.Errorf("preflight.go 出现按节点类型分支（%q）：依赖必须由契约的 Requires 声明", bad)
 		}
 	}
 }

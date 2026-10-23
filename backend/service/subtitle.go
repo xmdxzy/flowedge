@@ -100,10 +100,43 @@ func SubtitlesFromPlan(plan ShotPlan) []SubtitleLine {
 		if dur <= 0 {
 			continue
 		}
+		// 富模式：台词在 lines 表里（dialogue 字段是「无对白」占位）。
+		// 精确时点在 dub-track 的 report 里（lead/pause 实测起止），字幕这里是
+		// 计划值近似：首句前导之后在本镜时长内均分。要帧级对齐是 ASR 对齐的下一轮。
+		if texts := richLineTexts(sh); len(texts) > 0 {
+			lead := sh.Lead
+			if lead <= 0 {
+				lead = 0.25
+			}
+			if lead > dur/2 {
+				lead = dur / 2
+			}
+			per := (dur - lead) / float64(len(texts))
+			for i, t := range texts {
+				out = append(out, SubtitleLine{
+					Start: cursor + lead + float64(i)*per + 0.05,
+					End:   cursor + lead + float64(i+1)*per - 0.05,
+					Text:  t,
+				})
+			}
+			cursor += dur
+			continue
+		}
 		if txt := cleanDialogue(sh.Dialogue); txt != "" {
 			out = append(out, SubtitleLine{Start: cursor + 0.15, End: cursor + dur - 0.15, Text: txt})
 		}
 		cursor += dur
+	}
+	return out
+}
+
+// richLineTexts 富模式台词表里非空的原话（结构化模式的台词走 cleanDialogue）
+func richLineTexts(sh Shot) []string {
+	out := make([]string, 0, len(sh.Lines))
+	for _, ln := range sh.Lines {
+		if t := strings.TrimSpace(ln.Text); t != "" {
+			out = append(out, t)
+		}
 	}
 	return out
 }

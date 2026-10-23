@@ -72,13 +72,15 @@ func (e *EngineV2) execQualityGateNode(ctx context.Context, node *model.NodeInst
 			fails = append(fails, detail)
 		}
 	}
-	if len(fails) > 0 {
-		// 阻断：run 记 failed，下游级联 skipped
-		return nil, fmt.Errorf("质检未通过（%s）：%s", path, strings.Join(fails, "；"))
-	}
 
-	return map[string]interface{}{
-		"gate":    "pass",
+	// 产物先建好，判不过也原样带出去。
+	//
+	// 这不是「失败也返回成功」：error 仍然返回，run 仍然 failed、下游仍然 skipped。
+	// 带 checks 出去的**唯一**目的，是让证据层能区分「测了不合格」与「没测到」——
+	// 判据就是有没有 checks（evidence.go gateFacts）。返回 nil 会让一次真正的
+	// 质量不合格被记成 unscored，自进化看到的就不是「质量在漏」而是「门在崩」。
+	out := map[string]interface{}{
+		"gate":    map[bool]string{true: "pass", false: "fail"}[len(fails) == 0],
 		"checks":  checks,
 		"fixes":   fixes,
 		"path":    path,
@@ -88,7 +90,14 @@ func (e *EngineV2) execQualityGateNode(ctx context.Context, node *model.NodeInst
 		"frames":  info.frames,
 		"seconds": info.seconds,
 		"text":    gateSummary(checks),
-	}, nil
+	}
+	if len(fails) > 0 {
+		out["failures"] = fails
+		// 阻断：run 记 failed，下游级联 skipped
+		return out, fmt.Errorf("质检未通过（%s）：%s", path, strings.Join(fails, "；"))
+	}
+
+	return out, nil
 }
 
 // annotateFixes 给每一项「未通过」填可执行修复建议（通过的项不填，避免噪音）。
@@ -174,7 +183,12 @@ func parseGateRules(node *model.NodeInstance) gateRules {
 	getF("duration_min", &r.durationMin)
 	getF("duration_max", &r.durationMax)
 	getF("duration_tolerance", &r.durationTol)
-	getF("loudness_min_db", &r.loudnessMinDB)
+	// loudness_min_db 是 **dB，天然为负**（-20 比 -14 安静）。上面 getF 的
+	// `v > 0` 会把一切真实阈值静默丢弃——门看起来配了，其实永远不查。
+	// 单独走有符号解析：0 仍是「没配」，负数照收。
+	if v, ok := node.Data["loudness_min_db"].(float64); ok && v != 0 {
+		r.loudnessMinDB = v
+	}
 	getF("max_silence_gap", &r.maxSilenceGap)
 	getF("speech_max_seconds", &r.speechMaxSecs)
 	if r.durationTol == 0 {
@@ -312,9 +326,9 @@ func runGateChecks(ctx context.Context, path string, info *gateMediaInfo, r gate
 	}
 
 	// 响度 / 静音（仅视频/音频）
-	if info.kind != "image" && (r.loudnessMinDB > 0 || r.maxSilenceGap > 0 || r.forbidSpeech) {
+	if info.kind != "image" && (r.loudnessMinDB != 0 || r.maxSilenceGap > 0 || r.forbidSpeech) {
 		loud, silences := probeLoudnessAndSilence(path)
-		if r.loudnessMinDB > 0 {
+		if r.loudnessMinDB != 0 {
 			add("loudness_min", loud.mean >= r.loudnessMinDB, "warn", "均值 %.1fdB（门限 %.1fdB）", loud.mean, r.loudnessMinDB)
 		}
 		if r.maxSilenceGap > 0 {

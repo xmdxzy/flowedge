@@ -142,3 +142,27 @@ func TestRealBurnSubtitles(t *testing.T) {
 	}
 	t.Logf("烧字幕成功：%s 时长 %.2fs，与原片 PSNR=%s（画面确有变化）", filepath.Base(out), info.dur, val)
 }
+
+// 富模式台词表（lines）也要能排字幕——dialogue 字段是「无对白」占位，
+// 真正的话在 lines 里。旧实现只读 dialogue，富模式分镜表会被判「没有台词」。
+func TestSubtitlesFromPlanRichLines(t *testing.T) {
+	plan := ShotPlan{Shots: []Shot{
+		{ID: 1, Frames: 192, Lead: 0.25,
+			Lines: []PlanLine{{Text: "你输了"}, {Text: "还有谁"}}},
+		{ID: 2, Frames: 124, Dialogue: "无对白"},
+	}}
+	subs := SubtitlesFromPlan(plan)
+	if len(subs) != 2 {
+		t.Fatalf("应排出 2 条字幕，got %d：%+v", len(subs), subs)
+	}
+	// 首句落在 lead 之后（0.25s），两条都在第一镜 8s 内，且不重叠
+	if subs[0].Start < 0.25 || subs[0].End <= subs[0].Start {
+		t.Fatalf("首条字幕时点不对：%+v", subs[0])
+	}
+	if subs[1].Start <= subs[0].Start || subs[1].Start >= 8.0 {
+		t.Fatalf("第二条字幕时点不对：%+v", subs[1])
+	}
+	if subs[0].Text != "你输了" || subs[1].Text != "还有谁" {
+		t.Fatalf("字幕文本错：%+v", subs)
+	}
+}

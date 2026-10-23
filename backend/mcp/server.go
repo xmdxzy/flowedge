@@ -179,6 +179,13 @@ func (s *Server) callTool(raw json.RawMessage) (map[string]interface{}, error) {
 		if vars, ok := p.Arguments["vars"]; ok {
 			payload["vars"] = vars
 		}
+		// 谁在调：调用方自报（workbuddy / dsh / mcp / ...）。不传就记 mcp——
+		// "不知道是谁"也要如实写成 mcp，而不是冒充 manual。
+		if who, ok := p.Arguments["invoked_by"].(string); ok && who != "" {
+			payload["invoked_by"] = who
+		} else {
+			payload["invoked_by"] = "mcp"
+		}
 		body, err := s.request(http.MethodPost, fmt.Sprintf("/api/workflows/%d/run", id), payload)
 		if err != nil {
 			return nil, err
@@ -227,6 +234,72 @@ func (s *Server) callTool(raw json.RawMessage) (map[string]interface{}, error) {
 			return nil, err
 		}
 		return toolText(prettyJSON(body)), nil
+
+	// 读结构：智能体要"照着画布干活"，必须先能读到画布上写了什么。
+	case "flowedge_get_workflow":
+		id, err := argInt(p.Arguments, "workflow_id")
+		if err != nil {
+			return nil, err
+		}
+		body, err := s.request(http.MethodGet, fmt.Sprintf("/api/workflows/%d", id), nil)
+		if err != nil {
+			return nil, err
+		}
+		return toolText("工作流结构（节点 + 连线；参数在 node.data 里）：\n" + prettyJSON(body)), nil
+
+	// 读规格：任务书是"怎么干"的唯一来源，跑之前先读它。
+	case "flowedge_get_spec":
+		id, err := argInt(p.Arguments, "workflow_id")
+		if err != nil {
+			return nil, err
+		}
+		format, _ := p.Arguments["format"].(string)
+		if format != "json" {
+			format = "md"
+		}
+		body, err := s.request(http.MethodGet, fmt.Sprintf("/api/workflows/%d/spec?format=%s", id, format), nil)
+		if err != nil {
+			return nil, err
+		}
+		if format == "json" {
+			return toolText(prettyJSON(body)), nil
+		}
+		return toolText(string(body)), nil
+
+	// 读积木：知道自己能用哪些模块，是"组装"而不是"碰运气"。
+	case "flowedge_list_modules":
+		body, err := s.request(http.MethodGet, "/api/modules", nil)
+		if err != nil {
+			return nil, err
+		}
+		return toolText("可用模块（端口 / 参数标签 / 门层 / 显存侧）：\n" + prettyJSON(body)), nil
+
+	// 回写任务书：这是「读了任务书 → 真的改得动」的那一步。
+	// 先 dry_run 看会改什么，再真写；失败时引擎会把每条问题列出来，照它改。
+	case "flowedge_apply_spec":
+		id, err := argInt(p.Arguments, "workflow_id")
+		if err != nil {
+			return nil, err
+		}
+		edits, ok := p.Arguments["edits"]
+		if !ok {
+			return nil, fmt.Errorf("缺少参数 edits（形如 [{nodeId, path:\"data.xxx\", from, to, reason}]）")
+		}
+		payload := map[string]interface{}{"edits": edits}
+		if v, ok := p.Arguments["allow_gate_change"].(bool); ok {
+			payload["allowGateChange"] = v
+		}
+		if v, ok := p.Arguments["dry_run"].(bool); ok {
+			payload["dryRun"] = v
+		}
+		if v, ok := p.Arguments["base_version"]; ok && v != nil {
+			payload["baseVersion"] = v
+		}
+		body, err := s.request(http.MethodPost, fmt.Sprintf("/api/workflows/%d/spec/apply", id), payload)
+		if err != nil {
+			return nil, err
+		}
+		return toolText("回写结果：\n" + prettyJSON(body)), nil
 	}
 	return nil, fmt.Errorf("未知工具 %q（用 tools/list 查可用工具）", p.Name)
 }
@@ -321,6 +394,11 @@ func toolDefs() []interface{} {
 				"properties": map[string]interface{}{
 					"workflow_id": map[string]interface{}{"type": "integer", "description": "工作流 id（先调 flowedge_list_workflows）"},
 					"vars":        map[string]interface{}{"type": "object", "description": "运行变量，如 {\"prompt\": \"...\"}"},
+					"invoked_by": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"workbuddy", "dsh", "mcp", "manual"},
+						"description": "谁在调用这条工作流。请如实填写你自己的名字（workbuddy / dsh），会记进运行记录并与开始节点声明的入口比对",
+					},
 				},
 				"required": []string{"workflow_id"},
 			},
@@ -358,6 +436,66 @@ func toolDefs() []interface{} {
 					"height": map[string]interface{}{"type": "integer", "description": "高，默认 1024"},
 				},
 				"required": []string{"prompt"},
+			},
+		},
+		map[string]interface{}{
+			"name":        "flowedge_get_spec",
+			"description": "取一条工作流的**任务书**：执行顺序、每个模块吃什么吐什么、关键参数真实取值、验收门与 FAIL 条件、产物清单、以及图里没说清的地方。要按画布做事之前先读它——不要凭 workflow 名字猜流程。",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"workflow_id": map[string]interface{}{"type": "integer", "description": "工作流 id（先调 flowedge_list_workflows）"},
+					"format":      map[string]interface{}{"type": "string", "enum": []string{"md", "json"}, "description": "md=人/模型直接读（默认）；json=结构化，便于程序处理"},
+				},
+				"required": []string{"workflow_id"},
+			},
+		},
+		map[string]interface{}{
+			"name":        "flowedge_apply_spec",
+			"description": "按任务书**回写**工作流参数（读得懂也要改得动）。每条编辑必须带 from（现场旧值），它是乐观锁：值对不上说明这期间图被改过，引擎会整批拒绝并要求重新取任务书。只允许改 data.*；门层参数（帧数/时长/响度/静音缺口等）默认禁止，确需放宽必须 allow_gate_change=true 并写 reason。建议先 dry_run=true 预演。",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"workflow_id": map[string]interface{}{"type": "integer", "description": "工作流 id"},
+					"edits": map[string]interface{}{
+						"type":        "array",
+						"description": "编辑列表。整批原子：有一条不过则全部不生效。",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"nodeId": map[string]interface{}{"type": "string", "description": "节点 id（任务书 modules[].id）"},
+								"path":   map[string]interface{}{"type": "string", "description": "只允许 data.<key>，可点分下钻，如 data.min_frames"},
+								"from":   map[string]interface{}{"description": "现场旧值（必填）。与引擎当前值不一致会被拒绝"},
+								"to":     map[string]interface{}{"description": "新值"},
+								"reason": map[string]interface{}{"type": "string", "description": "为什么改；动门层参数时必填"},
+							},
+							"required": []string{"nodeId", "path", "from", "to"},
+						},
+					},
+					"allow_gate_change": map[string]interface{}{"type": "boolean", "description": "允许改动门层参数（放宽验收）。默认 false"},
+					"dry_run":           map[string]interface{}{"type": "boolean", "description": "只校验不落盘，返回将改什么"},
+					"base_version":      map[string]interface{}{"type": "integer", "description": "可选：取任务书时的版本号，用于粗粒度乐观锁"},
+				},
+				"required": []string{"workflow_id", "edits"},
+			},
+		},
+		map[string]interface{}{
+			"name":        "flowedge_get_workflow",
+			"description": "取工作流的原始结构（nodes + edges + 每个节点的 data）。需要读具体参数、或要判断某一步为什么这么配时使用；只想知道流程怎么走，用 flowedge_get_spec 更省。",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"workflow_id": map[string]interface{}{"type": "integer", "description": "工作流 id"},
+				},
+				"required": []string{"workflow_id"},
+			},
+		},
+		map[string]interface{}{
+			"name":        "flowedge_list_modules",
+			"description": "列出本机引擎支持的模块（逻辑与模态同一套结构：端口类型 / 参数标签 / 门层 / 是否吃显存）。要判断「这件事能不能在本地做」「该用哪个模块拼」时使用。",
+			"inputSchema": map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
 			},
 		},
 	}

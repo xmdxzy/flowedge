@@ -33,7 +33,7 @@ function EditNode({ type, data, selected }: NodeProps) {
     <div
       className={`min-w-[210px] rounded-lg border bg-surface shadow-lg transition-all duration-200 hover:shadow-xl hover:-translate-y-0.5
         ${selected ? 'border-primary shadow-primary-glow' : 'border-border'}
-        ${status === 'running' ? 'node-running' : ''}
+        ${status !== 'pending' ? 'node-' + status : ''}
       `}
     >
       <div className={`flex items-center gap-2 rounded-t-lg bg-gradient-to-r ${spec.tone} px-3 py-2 border-b border-border`}>

@@ -20,6 +20,9 @@ export const PALETTE: PaletteSection[] = [
     label: '控制',
     items: [
       { type: 'start', label: '开始', icon: '▶', tone: 'tone-control' },
+      // 外部文件入口。与 start 同组、同一角色（无输入），但它吐的是文件路径而不是文本。
+      // 没有它，「转写这段录音」在图上根本表达不出来：start 只输出 text，接不到 audio 端口。
+      { type: 'input_source', label: '文件源', icon: '▤', tone: 'tone-control' },
       { type: 'end', label: '结束', icon: '■', tone: 'tone-control' },
       { type: 'if_else', label: '条件分支', icon: '⑂', tone: 'tone-warn' },
       { type: 'loop', label: '循环', icon: '⟳', tone: 'tone-warn' },
@@ -30,6 +33,10 @@ export const PALETTE: PaletteSection[] = [
     label: 'AI 推理',
     items: [
       { type: 'llm', label: '大语言模型', icon: '✦', tone: 'tone-ai' },
+      { type: 'agent_task', label: '外部智能体', icon: '⇢', tone: 'tone-purple' },
+      // 外部 MCP 服务器的一个工具。选中后在右侧属性面板挑服务器与工具，
+      // 服务器清单来自工具台（自动扫 WorkBuddy / Cursor / Claude 等本机配置）。
+      { type: 'mcp_call', label: 'MCP 工具', icon: '⚒', tone: 'tone-purple' },
       { type: 'text2image', label: '文生图', icon: '◈', tone: 'tone-ai' },
       { type: 'rag_query', label: '知识库检索', icon: '⌕', tone: 'tone-ai' },
     ],
@@ -79,9 +86,15 @@ export const PALETTE: PaletteSection[] = [
     items: [
       { type: 'http_request', label: 'HTTP 请求', icon: '⇄', tone: 'tone-data' },
       { type: 'code', label: '代码执行', icon: '{ }', tone: 'tone-data' },
+      // 本地命令：跑测试 / 构建 / 校验脚本。agent_task 的对偶——agent 改，它验。
+      { type: 'command', label: '本地命令', icon: '$_', tone: 'tone-data' },
       { type: 'data_transform', label: '数据转换', icon: '⇋', tone: 'tone-muted' },
+      // 文本拆分：长文案按句/段/固定段数/字数切开。以前没有它，模型会编一个 split_text
+      { type: 'text_split', label: '文本拆分', icon: '⋮⋮', tone: 'tone-data' },
       { type: 'aggregate', label: '变量聚合', icon: '⋃', tone: 'tone-muted' },
       { type: 'quality_gate', label: '质检门', icon: '✓', tone: 'tone-warn' },
+      // 一致性门：跨镜头接缝 / 场景漂移的数值门（另一个会话新增，这里补上入口，否则测试点不到）
+      { type: 'consistency_gate', label: '一致性门', icon: '≋', tone: 'tone-warn' },
     ],
   },
   {
@@ -95,6 +108,9 @@ export const PALETTE: PaletteSection[] = [
 
 // 各节点类型的常用输出字段（用于变量提示；与后端 defaultOutputFields 对齐）
 export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
+  // 四个端口互斥：实际只有 kind 对应的那一个键有值（其余不出现）
+  input_source: ['kind', 'text', 'image', 'audio', 'video', 'path', 'bytes', 'source'],
+  text_split: ['text', 'parts', 'count', 'chars', 'mode', 'merged_overflow'],
   http_request: ['text', 'status_code'],
   if_else: ['text', 'branch'],
   loop: ['text', 'all', 'iterations', 'stopped_by'],
@@ -107,6 +123,7 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   asr: ['text', 'model'],
   rag_query: ['text', 'context', 'sources', 'hits'],
   code: ['text', 'code_out'],
+  command: ['text', 'status_code', 'exit_code', 'stderr', 'elapsed_ms', 'truncated'],
   aggregate: ['text', 'count', 'values', 'nodes', 'aggregate'],
   vision: ['text', 'model', 'images', 'tokens', 'reference'],
   select: ['image', 'score', 'passed', 'threshold', 'picked', 'candidates', 'note'],
@@ -123,6 +140,9 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
     'degraded', 'degrade_level', 'degrade_note', // P3 显存降级留痕
   ],
   quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
+  consistency_gate: ['gate', 'segments', 'seams', 'drifts', 'anchors', 'worst', 'checks', 'thresholds', 'order', 'failures', 'text'],
+  agent_task: ['text', 'info', 'agent', 'agent_kind', 'exit_code', 'elapsed_ms', 'nondeterministic'],
+  mcp_call: ['text', 'json', 'is_error', 'server', 'tool', 'elapsed_ms'],
   subtitles: ['video', 'srt', 'lines', 'source'],
   post_production: ['video', 'aspect', 'width', 'height', 'bgm', 'duck', 'srt', 'lines', 'source'],
   comfy_workflow: ['files', 'count', 'image', 'images', 'video', 'videos', 'bindings_used'],
@@ -153,6 +173,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   text2video: 'comfy',
   shotlist: 'comfy', // 分镜执行：H3 或 Wan 任一实例
   quality_gate: 'video', // 质检需要 ffmpeg/ffprobe
+  consistency_gate: 'video', // 一致性门要抽帧，同样依赖 ffmpeg/ffprobe
   subtitles: 'video', // 烧字幕只需要 ffmpeg（带 libass）
   post_production: 'video', // 竖屏/BGM/字幕都走 ffmpeg
 }
@@ -205,3 +226,50 @@ export const initialEdges: Edge[] = [
   { id: 'e1-2', source: 'start-1', target: 'llm-1' },
   { id: 'e2-3', source: 'llm-1', target: 'end-1' },
 ]
+
+// LLM 节点的「任务预设」。
+//
+// 为什么用预设而不是一个空 textarea：空框里模型会把输入当聊天问题回答，
+// 用户以为在"改写提示词"，实际拿到一段客套话。预设把角色与输出格式写死，
+// 只有「自定义」才交还控制权。
+export const LLM_TASK_PRESETS = [
+  {
+    id: 'image',
+    label: '画面改写（→ 出图提示词）',
+    hint: '把想法改写成 flux 可用的英文提示词，逗号分隔、只写可见元素',
+    prompt:
+      '你是画面提示词改写器。把用户输入改写成文生图模型可用的英文提示词：' +
+      '逗号分隔的短句，只写可见元素（主体 / 动作 / 环境 / 光线 / 镜头 / 画质），' +
+      '不写感受与解释，不加引号与前缀。只输出改写结果本身。',
+  },
+  {
+    id: 'translate',
+    label: '中文 → 英文',
+    hint: '只翻译，不改写',
+    prompt:
+      'Translate the input into English. Output ONLY the translation — no explanations, ' +
+      "no quotes, no 'Translation:' prefix. Keep proper nouns and composition terms intact.",
+  },
+  {
+    id: 'storyboard',
+    label: '剧本 → 分镜表',
+    hint: '输出严格 JSON：shots[] 含 frames / prompt / line',
+    prompt:
+      '把剧本拆成分镜表，只输出 JSON：' +
+      '{"title":"…","character":"…","shots":[{"id":1,"frames":24,"transition":"cut","prompt":"…","line":"…"}]}。' +
+      '一镜只讲一件事；prompt 用英文画面描述；不改剧情、不加旁白。',
+  },
+  {
+    id: 'summary',
+    label: '三句话摘要',
+    hint: '是什么 / 结论 / 下一步',
+    prompt:
+      '把输入压缩成三句话：第一句说是什么，第二句说关键结论，第三句说下一步。不要客套，不要复述原文。',
+  },
+  {
+    id: 'custom',
+    label: '自定义…',
+    hint: '自己写系统提示词',
+    prompt: '',
+  },
+] as const

@@ -33,7 +33,7 @@ function LoopNode({ data, selected }: NodeProps) {
     <div
       className={`min-w-[210px] rounded-lg border bg-surface shadow-node transition-all duration-200 hover:shadow-node-hover hover:-translate-y-0.5
         ${selected ? 'border-warning shadow-[0_0_0_1px_rgba(251,191,36,0.45),0_0_24px_rgba(251,191,36,0.25)]' : 'border-border'}
-        ${status === 'running' ? 'node-running' : ''}
+        ${status !== 'pending' ? 'node-' + status : ''}
       `}
     >
       {/* 头部 */}

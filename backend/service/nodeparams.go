@@ -39,10 +39,12 @@ func ValidateNodeParams(nodes []model.NodeInstance, hasInbound map[string]bool) 
 		n := &nodes[i]
 		switch n.Type {
 		case "text2image":
-			// prompt 单发或 prompts 批量（一行一条），至少一条非空
-			if !nonEmpty(n.Data["prompt"]) && len(splitPromptLines(n.Data["prompts"])) == 0 {
+			// 提示词可以来自两处：节点自带的 prompt / prompts（老工作流与 API 调用），
+			// 或者上游文本线（UI 现在只有这一条路）。
+			// 有入边就放行——运行期真的会从上游取 text（engine_v2_nodes.go 的 upstream 循环）。
+			if !nonEmpty(n.Data["prompt"]) && len(splitPromptLines(n.Data["prompts"])) == 0 && !hasInbound[n.ID] {
 				issues = append(issues, NodeParamIssue{n.ID, n.Type, "prompt",
-					"文生图缺少提示词：填 prompt（单张）或 prompts（一行一条，批量）"})
+					"文生图缺少提示词：请连一条文本线到本节点（提示词只来自上游）"})
 			}
 		case "image2image", "upscale":
 			// 输入图可来自 image_path 字段或上游连线

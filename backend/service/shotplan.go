@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -31,12 +32,94 @@ type Shot struct {
 	Camera     string  `json:"camera"`     // 固定/缓慢推近/缓慢拉远/横移/跟拍/摇
 	Action     string  `json:"action"`     // 单一可见动作 + 收尾节拍
 	Light      string  `json:"light"`      // 光线与色温
-	Ambience   string  `json:"ambience"`   // 持续环境声（全集共用同一句更稳）
+	Ambience   string  `json:"ambience"`   // 结构化模式：持续环境声描述；富模式：环境声文件路径
 	SFX        string  `json:"sfx"`        // 与画面事件绑定的动作音效
 	Music      string  `json:"music"`      // 音乐或「无音乐」
 	Dialogue   string  `json:"dialogue"`   // 默认「无对白」；有台词时写「身份：原话」
 	Transition string  `json:"transition"` // 与下一镜的衔接：cut | dissolve | continue
-	Frames     int     `json:"frames"`     // 实际帧数（吸附后回填）
+	Frames     int     `json:"frames"`     // 实际帧数（富模式显式声明；缺省由秒数吸附）
+
+	// ---- 富模式（scripts/shot-film.py 的实战 schema）字段 ----
+	// 与结构化模式共用同一个 Shot：两种 plan 只是同一事物的两种写法。
+	// 富模式手写整段六段式提示词（质量上限更高），结构化模式字段编译（更省事）。
+	Prompt    string     `json:"prompt"`     // 富模式：六段式整段提示词（优先于字段编译）
+	Lines     []PlanLine `json:"lines"`      // 富模式：台词表（TTS 念稿 + ASR 验词的依据）
+	Lead      float64    `json:"lead"`       // 富模式：首句前导静音（秒；≤0 时按 0.25）
+	Beat      string     `json:"beat"`       // 叙事功能名（setup/clash/finish…），节奏权重的键
+	RefImages *bool      `json:"ref_images"` // 富模式：显式 false = 本段不用参考图（会换脸，门要拦）
+
+	AmbienceGain float64 `json:"ambience_gain"` // 富模式：环境声混入增益（缺省 0.85）
+}
+
+// PlanLine 一句台词（富模式台词表）
+type PlanLine struct {
+	Speaker string  `json:"speaker"`
+	Text    string  `json:"text"`
+	Speed   float64 `json:"speed"` // 语速倍率（缺省 1.0）
+	Pause   float64 `json:"pause"` // 句间停顿秒数（缺省 0.35，对齐 dub-track.py）
+}
+
+// UnmarshalJSON 台词行的缺省值必须和 dub-track.py 逐字对齐：
+// speed 缺省 1.0、pause 缺省 0.35。用指针字段区分「没给」与「给了 0」——
+// 直接给零值会把「没给 pause」静默变成「不停顿」。
+func (l *PlanLine) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Speaker string   `json:"speaker"`
+		Text    string   `json:"text"`
+		Speed   *float64 `json:"speed"`
+		Pause   *float64 `json:"pause"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	l.Speaker = raw.Speaker
+	l.Text = raw.Text
+	l.Speed = 1.0
+	if raw.Speed != nil {
+		l.Speed = *raw.Speed
+	}
+	l.Pause = 0.35
+	if raw.Pause != nil {
+		l.Pause = *raw.Pause
+	}
+	return nil
+}
+
+// HasDialogue 这个镜头有没有台词（两种模式统一判定：
+// 富模式看台词表，结构化模式看 dialogue 字段是不是「无对白」）。
+func (sh *Shot) HasDialogue() bool {
+	if len(sh.Lines) > 0 {
+		for _, ln := range sh.Lines {
+			if strings.TrimSpace(ln.Text) != "" {
+				return true
+			}
+		}
+	}
+	d := strings.TrimSpace(sh.Dialogue)
+	return d != "" && !strings.Contains(d, "无对白") && !strings.EqualFold(d, "none")
+}
+
+// DialogueText 这个镜头要念的原话（富模式取台词表第一句；
+// 结构化模式取「身份：原话」冒号后的部分，与 CompileShotPrompt 同一套切分）。
+func (sh *Shot) DialogueText() string {
+	for _, ln := range sh.Lines {
+		if t := strings.TrimSpace(ln.Text); t != "" {
+			return t
+		}
+	}
+	d := strings.TrimSpace(sh.Dialogue)
+	if d == "" || strings.Contains(d, "无对白") || strings.EqualFold(d, "none") {
+		return ""
+	}
+	// 用 rune 切片：中文冒号是 3 字节，按 byte+1 截会切出乱码
+	if r := []rune(d); len(r) > 0 {
+		for i, c := range r {
+			if (c == '：' || c == ':') && i < len(r)-1 {
+				return strings.TrimSpace(string(r[i+1:]))
+			}
+		}
+	}
+	return d
 }
 
 // ShotPlan 整条片子的分镜表
@@ -44,11 +127,42 @@ type ShotPlan struct {
 	Title     string `json:"title"`
 	Style     string `json:"style"`     // 全局风格锚（逐镜重复，防风格漂移）
 	Character string `json:"character"` // 角色锁定描述（逐镜完整重复，H3 无角色记忆）
-	Ambience  string `json:"ambience"`  // 全集统一的底噪
-	Shots     []Shot `json:"shots"`
+	Ambience  string `json:"ambience"`  // 全集统一的底噪（结构化：描述；富模式：wav 文件路径）
+
+	// ---- 富模式顶层字段 ----
+	Characters []string               `json:"characters"` // 定妆图路径（身份由图像锁，不靠文字）
+	RefAudio   []string               `json:"ref_audio"`  // 参考音频（音色基准，≤3）
+	Width      int                    `json:"width"`      // 富模式可声明分辨率
+	Height     int                    `json:"height"`
+	Gates      map[string]interface{} `json:"gates"`    // 五层控制门（真相源，spec 与运行期都读它）
+	Segments   []Shot                 `json:"segments"` // shots 的富模式别名
+	Shots      []Shot                 `json:"shots"`
+}
+
+// AmbienceFile 解析环境声文件路径：段级 > plan 级，且必须是真实存在的文件。
+// 结构化模式里 Ambience 是文字描述（「远处持续的环境底噪」），这个方法返回空——
+// 两种模式共用一个字段，用「文件是否存在」判别，不靠猜。
+func (p *ShotPlan) AmbienceFile(sh Shot) string {
+	for _, cand := range []string{sh.Ambience, p.Ambience} {
+		c := strings.TrimSpace(cand)
+		if c == "" {
+			continue
+		}
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 // ParseShotPlan 解析 LLM 或用户给的分镜 JSON（容忍 ```json 包裹与前后废话）
+//
+// 兼容两种 schema：
+//   - 结构化模式（storyboard 节点产出）：shots[] + 字段编译成提示词
+//   - 富模式（scripts/shot-film.py 实战 schema）：segments[] + 手写六段式提示词
+//   - characters 定妆图 + lines 台词表 + gates 五层门
+//
+// 两者只是同一事物的两种写法，解析后统一成 ShotPlan.Shots。
 func ParseShotPlan(raw string) (*ShotPlan, error) {
 	s := strings.TrimSpace(raw)
 	if i := strings.Index(s, "{"); i > 0 {
@@ -61,6 +175,12 @@ func ParseShotPlan(raw string) (*ShotPlan, error) {
 	if err := json.Unmarshal([]byte(s), &p); err != nil {
 		return nil, fmt.Errorf("分镜 JSON 解析失败：%w", err)
 	}
+	// 富模式别名合并：segments 与 shots 二选一，两个都给时以 shots 为准。
+	// 合并后清空别名——下游只认 Shots 一个真相源（两处并存必漂移）。
+	if len(p.Shots) == 0 && len(p.Segments) > 0 {
+		p.Shots = p.Segments
+	}
+	p.Segments = nil
 	if len(p.Shots) == 0 {
 		return nil, fmt.Errorf("分镜表为空")
 	}
@@ -73,12 +193,19 @@ func ParseShotPlan(raw string) (*ShotPlan, error) {
 		if sh.ID == 0 {
 			sh.ID = i + 1
 		}
-		sh.Frames = SnapFrames(sh.Seconds)
+		// 富模式显式声明帧数时**不许**吸附覆盖：总长/切点的数学全部建立在
+		// 声明值上，静默改动会让门检结论与成片对不上。缺省才按秒数吸附。
+		if sh.Frames <= 0 {
+			sh.Frames = SnapFrames(sh.Seconds)
+		}
 		if sh.Dialogue == "" {
 			sh.Dialogue = "无对白"
 		}
 		if sh.Ambience == "" {
 			sh.Ambience = p.Ambience
+		}
+		if sh.Lead <= 0 {
+			sh.Lead = 0.25 // 对齐 shot-film.py 的 seg.get("lead") or 0.25
 		}
 		sh.Transition = normalizeTransition(sh.Transition)
 		if sh.Axis == "" {

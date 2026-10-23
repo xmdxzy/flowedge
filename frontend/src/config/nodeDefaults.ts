@@ -79,6 +79,15 @@ export function getDefaultNodeData(type: string): Record<string, any> {
         loudness_min_db: 0, max_silence_gap: 0,
         forbid_speech: false, speech_max_seconds: 1.5,
       }
+    case 'consistency_gate':
+      // 阈值默认取标定值：同场景实测 布局≥0.99 / 配色≥0.985 / 亮度差≤0.043，
+      // 换景样本分别落在 0.39 / 0.57 / 0.08。默认值必须能判 FAIL，否则门就没牙。
+      return {
+        inputs: '', anchor: '',
+        layout_min: 0.94, palette_min: 0.92, luma_max: 0.07,
+        drift_layout_min: 0.92, drift_palette_min: 0.90,
+        check_drift: true, warn_only: false,
+      }
     case 'note':
       return { text: '' }
     case 'group':

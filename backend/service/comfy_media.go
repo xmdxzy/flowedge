@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -687,8 +688,42 @@ func saveImage(prefix string) map[string]interface{} { return saveImageFrom("8",
 // 为什么单独一条路径：逐张调用会在 --disable-smart-memory 下每张都重载 17GB，
 // 10 张就是十分钟的纯加载时间。batch_size 直接交给 ComfyUI，显存里只加载一次。
 func (s *Text2ImageService) GenerateImages(prompt string, width, height, batch int) ([]string, error) {
+	return s.GenerateImagesWithCkpt(prompt, width, height, batch, "")
+}
+
+// GenerateImagesWithBackend 按后端批量出图（MOSS / flux）。
+//
+// MOSS 为什么逐条调而不是塞 batch_size：官方 50 步 @1024² 下单张就已经是几十秒级，
+// 一次提交 N 张会把超时与显存同时顶到上限，而且失败时整批一起废掉。
+// flux 那条 batch 路径（GenerateImagesWithCkpt）不动——它靠「共用一次 17GB 加载」
+// 省时间，那是 4 步模型才成立的逻辑。
+func (s *Text2ImageService) GenerateImagesWithBackend(prompts []string, opt T2IOptions) ([]string, error) {
+	out := make([]string, 0, len(prompts))
+	for i, p := range prompts {
+		one := opt
+		one.Prompt = p
+		path, err := s.GenerateImageWithBackend(one)
+		if err != nil {
+			if len(out) == 0 {
+				return nil, err
+			}
+			// 已经出了一部分就带着已有结果返回：让下游能看见前几张，
+			// 错误写进日志而不是整批作废（出片流程里 N-1 张也是资产）
+			log.Printf("[t2i] 批量第 %d/%d 张失败：%v", i+1, len(prompts), err)
+			return out, nil
+		}
+		out = append(out, path)
+	}
+	return out, nil
+}
+
+// GenerateImagesWithCkpt 批量出图 + 节点级 checkpoint 覆盖（空 = 服务默认）。
+func (s *Text2ImageService) GenerateImagesWithCkpt(prompt string, width, height, batch int, ckpt string) ([]string, error) {
+	if strings.TrimSpace(ckpt) == "" {
+		ckpt = s.Checkpoint
+	}
 	if batch <= 1 {
-		one, err := s.GenerateImage(prompt, width, height)
+		one, err := s.GenerateImageWithCkpt(prompt, width, height, ckpt)
 		if err != nil {
 			return nil, err
 		}
@@ -701,7 +736,7 @@ func (s *Text2ImageService) GenerateImages(prompt string, width, height, batch i
 		height = 1024
 	}
 	graph := map[string]interface{}{
-		"4":  ckptNode(s.Checkpoint),
+		"4":  ckptNode(ckpt),
 		"6":  clipEncode(prompt, "4"),
 		"33": clipEncode("", "4"),
 		"5": map[string]interface{}{"class_type": "EmptyLatentImage", "inputs": map[string]interface{}{

@@ -46,6 +46,24 @@ func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, up
 		instruction = p
 	}
 
+	// 能力管线：输入段先把上游文本过一遍（翻译 / 清洗 / 抽字段），
+	// 本体段用角色卡替换提示词，输出段再把结果整形。
+	pipe := ParsePipeline(node.Data)
+
+	// 本体角色卡优先于节点自填的提示词：贴卡的动作本身就是"我要按这张卡的方式干活"，
+	// 若两者拼接，卡片里"只输出 JSON"这类硬约束会被旧提示词稀释掉。
+	boundTools := []string(nil)
+	if pipe.Body != nil {
+		if sys, ok := e.cardSystem(*pipe.Body); ok {
+			instruction = sys
+			if pipe.Body.Kind == CardAgent && e.cards != nil {
+				if c, ok := e.cards.Agent(pipe.Body.ID); ok {
+					boundTools = c.Tools
+				}
+			}
+		}
+	}
+
 	upstreamText := ""
 	for _, out := range upstream {
 		if m, ok := out.(map[string]interface{}); ok {
@@ -81,9 +99,47 @@ func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, up
 		defer e.gpuSched.ReleaseModel(schedName)
 	}
 
+	// 节点级模型 profile：指向别的端点（云端 API / 另一台机器上的 Ollama）。
+	// 没填 profile 就用引擎全局那一个，行为与以前完全一致。
+	svc := e.llm
+	if name, _ := node.Data["llm_profile"].(string); strings.TrimSpace(name) != "" {
+		if e.llmProfiles == nil {
+			return nil, fmt.Errorf("节点引用了模型 %q，但引擎没有加载模型清单", name)
+		}
+		p, ok := e.llmProfiles.Get(name)
+		if !ok {
+			return nil, fmt.Errorf("模型 %q 不存在：请在节点面板的「我的模型」里新建，或清空该选择", name)
+		}
+		if custom := e.llmServiceForProfile(p); custom != nil {
+			svc = custom
+		}
+	}
+
 	// 工具调用：节点声明了 tools 时走「工具轮（非流式）+ 最终答案轮（流式）」
-	if toolNames := nodeToolNames(node); len(toolNames) > 0 && e.llm != nil {
-		return e.execLLMWithTools(ctx, node, prompt, reqModel, toolNames)
+	toolNames := nodeToolNames(node)
+	if len(toolNames) == 0 && len(boundTools) > 0 {
+		toolNames = boundTools // 节点没勾就用卡片默认工具（就近优先：节点 > 卡片）
+	}
+	if len(toolNames) > 0 && svc != nil {
+		res, err := e.execLLMWithTools(ctx, node, prompt, reqModel, toolNames, svc)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+
+	// 流式只对引擎自带的那个服务做：自定义端点的流式协议未必一致，
+	// 硬套会得到"半个字都没有"的空结果，比慢更糟。
+	if svc != e.llm {
+		result, u, err := svc.ChatWithModelUsage(prompt, reqModel)
+		if err != nil {
+			return nil, err
+		}
+		out := map[string]interface{}{"text": result}
+		if u.PromptTokens > 0 || u.CompletionTokens > 0 {
+			out["_usage"] = u
+		}
+		return out, nil
 	}
 
 	// 流式优先：token 经 WS 实时推送前端（打字机效果）
@@ -157,8 +213,14 @@ func nodeToolNames(node *model.NodeInstance) []string {
 //  3. 模型给出最终答案 → 流式重放一次以保留打字机效果
 //
 // 轮次上限 4，防止模型无限索要工具
-func (e *EngineV2) execLLMWithTools(ctx context.Context, node *model.NodeInstance, prompt, reqModel string, toolNames []string) (interface{}, error) {
-	const maxRounds = 4
+func (e *EngineV2) execLLMWithTools(ctx context.Context, node *model.NodeInstance, prompt, reqModel string, toolNames []string, svc *LLMService) (interface{}, error) {
+	// 轮数可配：写死 4 轮会把"查三次知识库再总结"这类合法任务截断在第三步。
+	maxRounds := 4
+	if v, ok := node.Data["max_tool_rounds"].(float64); ok && v >= 1 && v <= 12 {
+		maxRounds = int(v)
+	}
+	// 工具失败是否中止：默认继续（工具是辅助），流水线要求严格时可打开。
+	strictTools, _ := node.Data["tool_strict"].(bool)
 	runID := runIDFrom(ctx)
 	usage := LLMUsage{} // 累计所有工具轮与最终答案轮的 token 消耗
 
@@ -174,7 +236,7 @@ func (e *EngineV2) execLLMWithTools(ctx context.Context, node *model.NodeInstanc
 	trace := make([]map[string]interface{}, 0, 4)
 
 	for round := 0; round < maxRounds; round++ {
-		msg, u, err := e.llm.ChatWithToolsUsage(messages, specs, reqModel)
+		msg, u, err := svc.ChatWithToolsUsage(messages, specs, reqModel)
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +251,8 @@ func (e *EngineV2) execLLMWithTools(ctx context.Context, node *model.NodeInstanc
 				textMode = true
 			} else {
 				final := msg.Content
-				if e.llmStream != nil {
+				// 自定义端点不用流式（协议未必一致），其余保持打字机效果
+				if e.llmStream != nil && svc == e.llm {
 					messages = append(messages, toolChatMessage{Role: "assistant", Content: msg.Content})
 					if streamed, answerUsage, serr := e.streamFinalAnswer(ctx, node, messages, reqModel); serr == nil && streamed != "" {
 						final = streamed
@@ -227,6 +290,11 @@ func (e *EngineV2) execLLMWithTools(ctx context.Context, node *model.NodeInstanc
 			if runErr != nil {
 				result = "工具执行失败: " + runErr.Error()
 				status = "error"
+				// strict 模式：工具挂了就停，而不是让模型拿着"工具执行失败"继续编答案。
+				// 需要严格门禁的流水线打开这个开关。
+				if strictTools {
+					return nil, fmt.Errorf("工具 %s 执行失败（tool_strict 开启，中止）：%w", tc.Function.Name, runErr)
+				}
 			}
 			rec := map[string]interface{}{
 				"tool":      tc.Function.Name,
@@ -310,14 +378,27 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		return nil, fmt.Errorf("text2image node has no prompt")
 	}
 
+	// 节点级权重覆盖：不同节点可以用不同 checkpoint（快/质两条线并存）
+	ckptOverride, _ := node.Data["ckpt"].(string)
+
+	// 后端（flux / moss / auto）。
+	// MOSS 的价值是**图内文字渲染与 bbox 布局控制**——flux 这两件事都做不到，
+	// 而且换 checkpoint 名也换不来：两套模型的 ComfyUI 构图完全不同。
+	backendExplicit, _ := node.Data["backend"].(string)
+
 	// 中文提示词自动翻译（flux 文本编码器以英文为主，纯中文提示词经常只画出
 	// 通用风景——README「已知限制」第一条）。默认关；开了才会走 LLM。
 	// 必须在进扩散侧之前做：LLM 是语言侧，顺序反了会和 flux 互相卸载权重
 	// （同 H3 prompt_opt 的顺序纪律）。
 	translated := false
 	translateNote := ""
-	if v, ok := node.Data["auto_translate"].(bool); ok && v && e.llm != nil {
-		if hasCJK(prompt) {
+	if mode := translateModeOfNode(node); mode != "off" && e.llm != nil && hasCJK(prompt) {
+		// 「自动」只在语言侧权重**已经驻留**时才翻：
+		// 为一次翻译单独加载 LLM 再卸载，代价约 180 秒，比出图本身贵一个量级。
+		// 这就是三态存在的理由——不是所有中文都值得付这次换侧。
+		if mode == "auto" && e.ResidentSide() != sideLanguage {
+			translateNote = "auto 模式：语言模型未驻留，本次跳过翻译（省一次换侧）；需要必翻请切到「总是先翻译」"
+		} else {
 			en, terr := e.translatePromptToEnglish(prompt)
 			if terr != nil {
 				// 翻译失败降级为原文，不阻断执行（flux 中文弱是降级不是错误），
@@ -352,10 +433,6 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 	// 24GB 上不能同时养 flux 与 14B LLM：换侧（清语言侧）并独占执行
 	release := e.enterSide(sideDiffusion)
 	defer release()
-	// H3 实例在跑时默认实例是停的，出图前自动切回（已健康时是空操作）
-	if err := e.ensureComfy(""); err != nil {
-		return nil, err
-	}
 
 	// 显存调度：flux 与 LLM 抢同一块 24GB 显存，不纳入调度就会出现
 	// 「LLM 已加载 + 直接起 flux」→ OOM。此前只有 LLM 节点走调度。
@@ -377,6 +454,55 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		height = int(h)
 	}
 
+	// 布局（MOSS 专有）：来自节点参数或上游 JSON 端口。
+	// 上游能算出来（比如 LLM 输出版式）就比手填坐标靠谱，所以两边都收。
+	layoutJSON := ""
+	boxes := ParseMOSSBoxes(node.Data["layout"])
+	if len(boxes) == 0 {
+		for _, out := range upstream {
+			if m, ok := out.(map[string]interface{}); ok {
+				if b := ParseMOSSBoxes(m["layout"]); len(b) > 0 {
+					boxes = b
+					break
+				}
+			}
+		}
+	}
+	if len(boxes) > 0 {
+		var lerr error
+		layoutJSON, lerr = BuildMOSSLayoutJSON(prompt, boxes, width, height)
+		if lerr != nil {
+			return nil, fmt.Errorf("布局 JSON 编译失败：%w", lerr)
+		}
+	}
+	backend, backendReason := ResolveT2IBackend(backendExplicit, prompt, layoutJSON != "")
+	t2iOpt := T2IOptions{
+		Backend: backend, Prompt: prompt,
+		Width: width, Height: height, Ckpt: ckptOverride, Layout: layoutJSON,
+	}
+	if n, ok := node.Data["negative"].(string); ok {
+		t2iOpt.Negative = n
+	}
+	if s, ok := node.Data["steps"].(float64); ok && int(s) > 0 {
+		t2iOpt.Steps = int(s)
+	}
+	if c, ok := node.Data["cfg"].(float64); ok && c > 0 {
+		t2iOpt.Cfg = c
+	}
+
+	// 实例选择：H3 在跑时默认实例是停的，出图前自动切回（已健康时是空操作）。
+	// MOSS 走第三个实例（8190）：主实例是 0.31，没有 UNETLoader 的 moss 权重、
+	// 没有 CLIPLoader 的 moss_image 类型、也没有 EmptyFlux2LatentImage，发过去必 400。
+	profile := ""
+	if backend == BackendMOSS {
+		profile = "moss"
+	}
+	if err := e.ensureComfy(profile); err != nil {
+		return nil, err
+	}
+	// TODO(改到这里被打断)：backend 解析出去了还没接上使用点，先用空引用占位避免编译断链
+	_ = backend
+
 	// 多提示词批量（分镜 / 角色表 / 表情包）：
 	//   prompts 字段一行一条；或勾了 split_lines 时把上游整段文本按行拆。
 	// 关键收益不是并行，而是**只加载一次 17GB 模型**——逐条跑每条都要重载。
@@ -394,7 +520,15 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		if len(prompts) > 12 {
 			prompts = prompts[:12] // 单次图上限：再多只会把排队时间拉长，收益不再增长
 		}
-		paths, err := e.t2i.GenerateImagesFromPrompts(prompts, width, height)
+		var (
+			paths []string
+			err   error
+		)
+		if backend == BackendMOSS {
+			paths, err = e.t2i.GenerateImagesWithBackend(prompts, t2iOpt)
+		} else {
+			paths, err = e.t2i.GenerateImagesFromPrompts(prompts, width, height)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -408,6 +542,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			"translate_error":     translateNote,
 			"scene_lock":          sceneLock,
 			"scene_lock_injected": lockInjected,
+			"backend":             string(backend),
+			"backend_reason":      backendReason,
 		}, nil
 	}
 
@@ -422,7 +558,17 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 	}
 
 	if batch > 1 {
-		paths, err := e.t2i.GenerateImages(prompt, width, height, batch)
+		var paths []string
+		var err error
+		if backend == BackendMOSS {
+			many := make([]string, 0, batch)
+			for i := 0; i < batch; i++ {
+				many = append(many, prompt)
+			}
+			paths, err = e.t2i.GenerateImagesWithBackend(many, t2iOpt)
+		} else {
+			paths, err = e.t2i.GenerateImagesWithCkpt(prompt, width, height, batch, ckptOverride)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -438,10 +584,22 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 			"translate_error":     translateNote,
 			"scene_lock":          sceneLock,
 			"scene_lock_injected": lockInjected,
+			"backend":             string(backend),
+			"backend_reason":      backendReason,
 		}, nil
 	}
 
-	imagePath, err := e.t2i.GenerateImage(prompt, width, height)
+	var (
+		imagePath string
+		err       error
+	)
+	if backend == BackendMOSS {
+		// MOSS 的提示词可能是 layout JSON（有布局时）——输出里仍然回原始提示词，
+		// 下游拿到的必须是人写的那句，不是引擎编出来的 JSON。
+		imagePath, err = e.t2i.GenerateImageWithBackend(t2iOpt)
+	} else {
+		imagePath, err = e.t2i.GenerateImageWithCkpt(prompt, width, height, ckptOverride)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +611,8 @@ func (e *EngineV2) execText2ImageNode(node *model.NodeInstance, upstream map[str
 		"translate_error":     translateNote,
 		"scene_lock":          sceneLock,
 		"scene_lock_injected": lockInjected,
+		"backend":             string(backend),
+		"backend_reason":      backendReason,
 	}, nil
 }
 
@@ -700,10 +860,20 @@ func (e *EngineV2) execHTTPNode(node *model.NodeInstance, upstream map[string]in
 		return nil, err
 	}
 
-	return map[string]interface{}{
+	out := map[string]interface{}{
 		"text":        respBody,
 		"status_code": statusCode,
-	}, nil
+	}
+	// 契约声明了 json 端口就得真给：响应是合法 JSON 时解成结构化值，
+	// 下游可以直接 {{id.json.field}} 取值，不用再套一层 code 节点去 parse。
+	// 之前这里只返回 text —— 契约与实现不一致，用户按契约连线会拿到空值。
+	if trimmed := strings.TrimSpace(respBody); strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var any interface{}
+		if json.Unmarshal([]byte(trimmed), &any) == nil {
+			out["json"] = any
+		}
+	}
+	return out, nil
 }
 
 func (e *EngineV2) execTransformNode(node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
@@ -1064,4 +1234,24 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// translateModeOfNode 提示词翻译策略：off / auto / force。
+//
+// 兼容旧数据：只有 auto_translate 布尔时，true 视为 force（保持老工作流行为完全一致），
+// false 视为 off。新字段优先。
+func translateModeOfNode(n *model.NodeInstance) string {
+	if n == nil || n.Data == nil {
+		return "off"
+	}
+	if m, ok := n.Data["translate_mode"].(string); ok {
+		switch m {
+		case "off", "auto", "force":
+			return m
+		}
+	}
+	if v, ok := n.Data["auto_translate"].(bool); ok && v {
+		return "force"
+	}
+	return "off"
 }
