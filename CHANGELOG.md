@@ -4,6 +4,26 @@ All notable changes to FlowEdge are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 date-based versioning (`vYYYY.MM.DD`).
 
+## [v2026.10.23-evo-gate-stillimage]
+
+> 主题：真渲闭环（用户授权的最便宜路径）闭合——全项目第一份「真实 GPU 渲染过门」
+> 证据，并抓到第 7 个真 bug：静图门的探测层把一张完好的 PNG 判成「文件损坏」。
+
+### 修：静图门不再被「探测不到时长」弹回（第 7 个真 bug）
+
+`probeGateMedia` 曾无条件要求 `seconds>0`：PNG 天生 0s，完好的图被判「文件可能
+损坏」，wf 56/57/58 三个静图流配了 `min_width/min_height` 却从未执行过——
+「声明有门其实没门」家族第 4 成员。现在只有「无尺寸+无音轨+无时长」才判损坏。
+两个回归用例钉住：静图过门且每项带实测值；坏文件仍然硬错（不许假通过）。
+
+### 证：第一份真实渲染过门证据
+
+隔离实例（:18086，生产 DB 副本）跑 wf 56 still-a，MOSS 真实出图 768×1024
+（29.85s）：`result=passed / gateScore=1`，三条检查带实测值（宽 768≥768 /
+高 1024≥1024 / 视频流存在）。修复前同素材记 `unscored/gate_error`——崩溃被诚实
+记账，wf 56 燃料门因此保持 `ready=false`（可配对 case 需 ≥8、类别需 ≥2，
+是数据量问题不是代码问题）。证据与复现步骤：`outputs/evo-capstone-2026-10-23/`。
+
 ## [v2026.10.23-evo-promotion]
 
 > 主题：把「人按下晋升」变成可审计的记录，并给自进化第一个界面。
