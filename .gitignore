@@ -78,3 +78,13 @@ docs/动作生成与动捕*
 data/generated/
 data/runs/
 运行/
+
+# 接口导出的临时 JSON 与手动备份（调试落盘，非源码）
+/cards.json
+/doc.json
+/list.json
+/.tmp-modules.json
+*.bak-*
+
+# 本地产出目录（截图证据、研究中间产物）
+/outputs/

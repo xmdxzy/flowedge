@@ -4,6 +4,278 @@ All notable changes to FlowEdge are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 date-based versioning (`vYYYY.MM.DD`).
 
+## [v2026.10.23-evo-promotion]
+
+> 主题：把「人按下晋升」变成可审计的记录，并给自进化第一个界面。
+> 晋升台账（promotions 表 + 2 端点）+ 前端「进化」面板；
+> 抓到第 5 个真 bug：Go `omitempty` 空 slices 炸掉整棵 React 树。
+
+### 增：晋升台账（promotions 表）
+
+`POST /api/evolution/promote`（人按晋升/保留，唯一能写 `action=promote/keep` 的入口，
+理由必填）+ `GET /api/evolution/promotions`（台账查询）。
+`decide`/`monitor` 加 `record` 参数归档引擎结论（`action=archive`，actor=engine）；
+`rollback apply=true` 自动落库（from=快照版本号）。校验牙齿：空理由 / 缺 toVersion /
+枚举外 action 一律拒绝，13 条单测钉住。
+
+### 增：前端「进化」面板
+
+顶栏「进化」按钮进入。一屏五区：燃料（门覆盖率/就绪度）→ 失分排行（lossShare 排序）→
+候选（from→to + 依据）→ 判定（配对数值）→ 晋升台账（表单 + 记录）。
+配色全走主题令牌，深浅主题各截一张验过（`outputs/ui-theme-2026-10-23/`）。
+
+### 修：omitempty 空 slices 炸掉 React 树（第 5 个真 bug）
+
+`fuel.blockers`/`fuel.categories` 在 Go 侧 `omitempty`，空时整个键不出现；
+`decision.reasons` nil slice 序列化成 `null`。面板按完整形状 `.length`/`.map`
+→ 选中工作流后白屏，无错误边界整棵树卸载。三处 `?? []` 兜底 + 类型改可选，
+回归测试用真实最小形状钉住。与「门失败丢 checks」同根：**后端「空」与前端「无」
+不是一回事**。
+
+### 验证
+
+后端 `go test ./...` 全过；前端 113 用例全过 + `tsc --noEmit` 干净；
+隔离实例端到端 `verify-evolution-loop.py` 44/44（新增台账四类记录齐全等 10 断言）。
+
+## [v2026.10.23-evo-instrument]
+
+> 主题：把尺子接进生产。门覆盖率 1/15 → 10/15，并抓到第 4 个真 bug：
+> 阈值反推漏乘 `segments`，会让门把合格的 31 秒成片判成「时长超标」。
+
+### 修：阈值反推漏乘 segments（instrument）
+
+`text2video.frames` 是**单段**帧数，`segments` 才是段数。修士斗法 v.frames=124、
+segments=6，成片实测 1484 帧 / 31.05s，而按单段反推得 `duration_max=5.43s` ——
+门第一次跑就会把合格成片判死。这比不接门更糟：门看着在工作，实际在乱杀。
+
+修法：`frames × segments` 反推帧数与时长；帧数只取下界（`interp=true` 会让实测帧数≈2×，
+宁松不误杀），时长按 `total ÷ fps`（插帧不改时长）。单测
+`TestInstrumentGates_MultipliesSegments` 钉住 706 / 29.45 / 32.55。
+
+### 生产落图：10 条工作流接上质检门
+
+wf 2 / 39 / 47 / 48 / 50 / 56 / 57 / 58 / 74 各 1 门（wf 113 原有 2 门）。每条落图前
+自动存快照（`workflow_versions`），撤回一条命令。
+
+阈值全部用**历史成功运行的真实产物**跑 ffprobe 对账（736×416/1484 帧/31.05s 等），
+不是拍脑袋；两条例外（wf 48、canonical）无成功历史，标注为待首次真跑复核。
+
+### 撤：wf 3 语音闭环｜合成→转写
+
+终点前驱是 `asr`，输出只有 `{text}`，`pickArtifactPath` 只认 `video/audio/image`，
+接门等于把一条能跑的链路改成永远「缺少输入产物」。用
+`POST /api/evolution/rollback {"toVersion":1,"apply":true}` 撤回 —— 这也是回滚路径
+第一次在生产图上实战（快照留 v2，可再滚回）。
+
+### 结论
+
+自进化的第一瓶颈一直是尺子，不是算法。现在 10 条主力图有门，生产每跑一次就会自动
+产出 `gateChecks`，下一条要补的是评测层注入 `caseId/role` —— 那才是「改前改后」判定
+的前提。
+
+## [v2026.10.23-evo-loop]
+
+> 主题：自进化闭环补全——从"能读证据给结论"变成"能自己接尺子、跑配对、盯回归、滚回去"。
+> 过程中抓到 3 个真 bug，每个都会让整套自进化在真机上静默失效。
+
+### 修：门判不过被记成「没测到」（评测口径反向）
+
+`quality_gate` / `consistency_gate` 判不过时返回 `(nil, err)`，引擎在失败分支丢掉产物，
+而证据层的判据是**「失败的门有没有留下 checks」**：没 checks = 门崩了（`unscored`）。
+于是每一次真实的质量不合格都被记成"没测到"，燃料门判"数据不够"，归因看到的是
+"门在崩"而不是"质量在漏"。修法：失败时保留产出（`engine_v2.go` 一处 `if out != nil`），
+两个门判不过时返回带 `checks` 的产物（`quality_gate.go` / `consistency.go`）。
+真机复验：candidate 侧两例 `result=failed`，不再是 `unscored`。
+
+### 修：证据里的版本号在收尾时才读
+
+原来是运行结束才读「当前最新版本」。运行期间改图并存版本，一次旧图的成绩会被记到
+新版本上，且事后看不出。`workflow_runs` 新增 `workflow_version`，起跑时钉住，信封只搬不改。
+
+### 加：评测语义可以注入 run
+
+`workflow_runs` 新增 `case_id / dataset_fingerprint / category / role / eval_batch`；
+`POST /api/workflows/:id/run` 可传这些字段（`role` 只收 baseline/candidate）。
+引擎只落库、只回填，不猜 —— 没传就是 null。
+
+### 加：五个端点补齐闭环
+
+- `POST /api/evolution/instrument` 自动接尺子：门只接在终点前（插中间会切断产物传递），
+  阈值从图里的生成参数反推（124 帧 ×0.95 = 117），默认 dry-run，落图前快照。
+- `POST /api/evolution/evaluate` 按 case 列表 + 指定版本图跑配对；用内存图跑历史版本，
+  不动当前图；异步受理、队列串行。
+- `GET /api/evolution/batch` 批次进度（`done` 与 `scored` 分开报）。
+- `POST /api/evolution/variants` 文本梯度：模型读归因产变体，from 由引擎校正，
+  改判据的编辑摘掉并留痕，触防作弊线的整条拒绝。
+- `GET /api/evolution/monitor` + `POST /api/evolution/rollback` 回归监测与回滚：
+  只给判定与目标版本，回滚前再快照一次（滚错能滚回）。
+
+### 验证
+
+- `scripts/verify-evolution-loop.py`：真建图、真起跑、真回滚 → **29/29**
+- `scripts/verify-evolution.py`：v1 的 6 条牙齿断言仍全绿
+- `go test ./...` 全绿（新增 instrument / variants / regression / evidence 用例）
+- 全库接门 dry-run：**11 条生产图可自动接门**，覆盖率 1/13 → 12/13（**未动生产图**，
+  接门会改变线上行为，需一次明确确认）
+
+## [v2026.10.23-toolchain]
+
+> 主题：把「我装的东西在哪」变成能回答的问题——四类工具一张表，装完即见、就地能用。
+
+### 工具台（`/api/toolchain` + 界面「工具」）
+
+- **要解决的问题**：skill / MCP / 插件 / 智能体四类外部能力过去各有各的发现方式，
+  彼此不知道对方存在：技能包扫 5 处根（10-23 才补）、插件**只在启动时**扫一次、
+  MCP 只有"出"没有"进"、智能体只认手写名册。用户的原话是「我明明装了很多啊」。
+  根因不是缺功能，是**没有一张把它们放在一起、且会自动发现新东西的表**。
+- **统一条目形状**：`kind/id/name/source/path/enabled/managed/usable/detail/use/actions`。
+  `enabled`（配置层）与 `usable`（现在真能用）分开——启用了但命令不在 PATH 也必须看得见。
+- **每次请求重扫**，不缓存目录树（一次 ≈ 0.25s）。装完即见，不必重启、不必点刷新。
+  需要缓存的是 MCP 探活（要 spawn 子进程），见下。
+- 实测本机一轮：智能体 52 / 技能 60 / MCP 3 / 插件 63，共 178 条。
+- 只读与可写严格分开：`data/` 下的可增删改；别人的配置文件（WorkBuddy / Cursor /
+  Claude / DSH / 项目级）只读，启停写覆盖层 `data/mcp-overrides.json`，原文件零改动（有测试盯）。
+
+### MCP 客户端（第一次"进得来"）
+
+- `service/mcp_client.go`：stdio（按行分隔 JSON-RPC）+ streamable HTTP（兼容 JSON 与 SSE 两种响应）。
+- 发现来源：引擎自有 `data/mcp.json`、`~/.workbuddy/mcp.json`、`~/.cursor/mcp.json`、
+  `~/.claude.json`、Claude Desktop、`~/.dsh/mcp.json`、项目级 `.mcp.json`；
+  同名先到先得，其余记 `shadowed` 一并返回（改错文件时能看出来）。
+- 探活 = 真握手 + `tools/list`（本地 stdio 服务器没有端口，只探 TCP 等于没探）。
+- 不继承父进程环境、不透传代理（同 agent_task 的教训）；子进程不弹黑框；用完杀进程树。
+
+### 新节点 `mcp_call`（外部 MCP 服务器的一个工具 = 图里一个节点）
+
+- 参数：`server` / `tool` / `args`（可写 `{{text}}` 引用上游）/ `timeout_ms` / `allow_failure`。
+- 连不上、工具不存在 → 硬失败；服务器 `isError` 默认阻断（可勾选放行但如实记录）。
+- 契约里标 `Nondeterministic`：外部世界会变，评测必须与非确定性图同组。
+- 实测：`xuce-brain.brain_rules` 图内调用 success，121ms，文本正常回流到下游。
+
+### 插件：热注册，不重启
+
+- 引擎新增 `hotNodes`（独立 RWMutex 保护）：启动与「重新扫描」走**同一条** `Toolchain.Reload`，
+  避免两套实现漂移；语义是整体替换——停用的插件节点类型立刻消失。
+- 前端：未知节点类型落到 `GenericNode`（否则插件装好、引擎能跑，拖到画布却是空白），
+  左侧节点库动态出现「插件」分组，属性面板给通用 JSON 参数编辑器。
+- `plugin.json` 支持 `enabled` 字段。
+
+### 智能体与技能
+
+- 智能体：名册 + **PATH 自动发现**（claude/codex/gemini/qwen/aider/opencode/crush/goose/
+  cursor-agent/droid）+ 插件里的 `agents/*.md` 定义（只读，同 ID 多版本去重）。
+  发现的 CLI 可一键「纳管到名册」。
+- 技能：并入同一张表，附「怎么用它」的一句话（引用名 / 节点字段）。
+
+### 顺带
+
+- 项目手册与模块契约同步到 33 种内置节点（`TestProjectManualCoversAllModules`）。
+- 新增 8 个后端用例（去重/覆盖层/热注册/两种 HTTP 传输/参数占位）。
+
+## [v2026.10.23]
+
+> 主题：把「写了锁」和「锁住了」之间的缺口补上——一致性第一次有了像素侧的判据。
+
+### 一致性门 `consistency_gate`（新增第 31 个内置节点）
+
+- **要解决的问题**：引擎在场景一致性上原有的东西**全在文本侧**——九宫格锁保证各段
+  收到同一句锁句，字节全等门保证这句没被 LLM 改写。但模型收到同一句锁句仍然各自采样：
+  成片看着换了场地，而时长、帧数、锁句三项检查**全部正常**。
+  这就是「用工具没报错当没问题」那一类验收维度错误（AGENTS §0.12②）。
+- **三条判据，各自独立判、各自单独报**（不合成总分——加权总分会让「布局全变但色调没变」
+  被「色调没变」掩盖，那是拿调参掩盖结构错误）：
+  - `layout` 九宫格**块色相**直方图巴氏系数均值 → 陈设/构图/局部换景
+  - `palette` 全局 HSV 联合直方图巴氏系数 → 整体色调漂移
+  - `luma` 整帧平均亮度差 → 换了个曝光
+- **格位与九宫格锁对齐**：报错会说「第 2→3 段接缝 top-left 格漂了」，
+  直接对应要改的那一格，而不是「画面不太一样」。
+- 另查**累积漂移**（各段相对首段）：两两接缝全过、整条跑偏是长片最典型的失败态。
+- 支持 `anchor` 锚图（定妆图/首段关键帧），每段额外与锚比一次。
+- 挂在五层门的 `identity` 层——这一层原本只有提示词侧检查（定妆图数量、`<Picture N>` 引用）。
+- `warn_only` 供调参阶段用；输出永远回显实际生效的 `thresholds`，否则「判过了」无法复核。
+
+### 阈值是标定出来的，不是拍的
+
+拿本机真实成片的一帧做受控变换（真值由构造保证），默认阈值取在两组之间：
+
+| 变体（真值） | 布局 | 配色 | 亮度差 |
+|---|---|---|---|
+| 亮度 +4%（同） | 1.000 | 1.000 | 0.007 |
+| 色相 +5°（同） | 0.997 | 0.995 | 0.000 |
+| 5% 噪声（同） | 0.993 | 0.985 | 0.043 |
+| 裁切 3%（同） | 0.998 | 1.000 | 0.002 |
+| 色相 +120°（异） | 0.394 | 0.570 | 0.015 |
+| 上半换色（异） | 0.673 | 0.842 | 0.044 |
+| 亮度 -35%（异） | 1.000 | 0.965 | **0.081**（只有亮度差抓到） |
+
+默认：布局 ≥0.94 / 配色 ≥0.92 / 亮度差 ≤0.07。
+
+判别力由 `TestConsistencyDiscriminationOnRealFootage` 用真实成片钉住
+（合成图不足以评估判别力：颜色分布太集中，会逼着人把门调松）。
+
+### 度量选型：四个都是实测踩出来的
+
+1. **降采样必须面积平均** —— 最近邻时同片两镜头 0.53、换片对照 0.48，两者分不开。
+2. **直方图必须平滑** —— 分桶边界是悬崖，整幅画面同时跨桶会让相似度从 0.95 掉到 0.08。
+3. **块级色相按饱和度加权** —— 硬开关会让卡在阈值附近的块在「有颜色/全空」之间跳，
+   同场景抖动被判成换景（实测 0.333）。
+4. **dHash 被淘汰** —— 色相旋转 120°/亮度 -35%/上半换色，它全是 0.98+；
+   而同段视频首末帧就有 0.61。**信噪比 < 1**，理由写进代码注释防止有人改回去。
+
+### 顺手修的既有断链
+
+- `service/instances.go`：`mossURL` 未定义（同文件已有 `mossInstanceURL()`），补上调用。
+- `service/nodespec.go`：补 `fieldString`（`isMOSST2INode` 已在用）。
+- `service/skillpack.go`：`skillVerdict` 缺 `Retain` 字段。
+- `service/comfy_media.go`：缺 `log` import。
+- `rag_v3.go` 项目手册：节点数 30→32，补 `consistency_gate` 与漏登记的 `input_source`。
+
+### 技能包
+
+新增 `flowedge-shot-consistency`（用户级 skill，SKILL.md + 3 篇 references），
+在引擎侧判定为 `mirrored`（引擎已用代码实现，技能包是人读镜像，不复制内容），
+证据指向 `consistency.go` 与 `scene_grid.go` 的实现行。
+
+### 自进化闭环（Agent Lightning 评估后落地）
+
+借 `microsoft/agent-lightning` v1.0 的架构骨架，不借它的 RL 优化器——
+本地没有可训练权重、rollout 也不是秒级。换成**文本梯度 + 配对选择**，
+并补一条它不需要、我们必须有的**防 cheat 门**（它的 reward 在 agent 外，我们的门在同一张图里）。
+
+- `service/evolution.go`（新增）：归因（`GateChecks` → 具体门节点 + 可调旋钮）、
+  `AuditVariant`（改判据 / 删门 / 删判据键 / 砍节点 四类硬拦）、
+  `ProjectionFor`（L0 结构分 / L1 干跑 / L2 真渲 三级，只有前置过了才允许烧 GPU）、
+  `InspectFuel`（样本不足不产结论）、`Decide`（配对判定 + 五条硬门）。
+- 判据与产出参数分家：`gateParamKeys` 是扁平表，`loudness_min_db`（门上判据）与
+  `loudness`（后期归一目标）同名不同质。一刀切会把唯一有标准答案的改进自己拦掉，
+  所以 `Knob` 分 `GateLocked`（拦）与 `GateRelated`（放行但记 warning）。
+- `handler/evolution.go`（新增）+ 四端点：`GET /api/evolution/status`（含全库门覆盖率）、
+  `POST /api/evolution/{propose,audit,decide}`。真跑复用 `/evidence/trial`，不新增写图路径。
+- `Evidence` schema v2：`GateCheckEvidence` 加 `nodeId`，归因能指到具体门节点（v1 信封原样可读）。
+- `scripts/verify-evolution.py`：6 条断言自检，真机 6/6 通过。
+- **现状**：12 条生产工作流**零门覆盖**，`data/evidence/` 为空——自进化的第一瓶颈是尺子不是算法。
+- 未做：LLM 文本梯度变体生成、晋升落库与回归监测、前端面板。
+
+### canonical 出片工作流：把整本手册编译成一条能跑的图
+
+`data/workflows/canonical-film.json`（线上 DB #113，30s 三镜参考实现）——五层门预检、
+一致性门、后期、质检门串成**菱形汇合**：sl-1 同时喂 cg-1 与 pp-1，qg-1 必须同时等两者，
+任一门 FAIL 都过不了交付前最后一关。配套 `canonical_film_test.go` 四个测试：
+plan 过五层门 / 任务书每个门层与阈值都在 / 图结构可运行且汇合点纪律 / 违约 plan 在执行器层被拦
+（`deps=nil` 证明开机前拦，不烧显存）。`scripts/verify-canonical-live.py` 在线 35 项断言全过
+（五层门 / 17 个阈值 / 四门节点 / 无裸门警告 / 菱形汇合），任务书落盘
+`data/workflows/canonical-film-spec.md`。手册新增「九·附」章节。
+
+### 三门修复（ canonical 落地时挖出来的）
+
+- **`quality_gate` 负 dB 阈值全线失效**：`loudness_min_db` 天然为负，旧解析 `v > 0`
+  把一切真实阈值静默丢弃——「声明有门却没有阈值」的运行期版本，门看着配了其实永远不查。
+  改判 `!= 0`，两个新测试钉住（-20 照收 / 0 视为未配 / 暗噪视频低于门限时 warn 且 Detail 带阈值）。
+- **门的词汇表缺一致性门阈值**：`gateParamKeys["identity"]` 补 `layout_min`/`palette_min`/
+  `luma_max`/`drift_*`——否则一致性门的阈值在任务书上不存在，evolution 也失去对它的保护。
+- **`post_production` 门层缺 audio**：响度两遍法归一是它的音频门动作，只登记 technical
+  会被 spec 判裸门。GateLayers 改 `["technical", "audio"]`。
+
 ## [v2026.10.21]
 
 > 主题：把「只在我这台机器上跑得通」变成「装得上、接得进、测得准」。
