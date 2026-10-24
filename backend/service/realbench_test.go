@@ -64,7 +64,7 @@ func TestRealSideSwitchBenchmark(t *testing.T) {
 		e := NewEngineV2(
 			NewLLMService(ollama, llmModel),
 			NewText2ImageService(comfy, ckpt),
-			nil, nil, nil, nil, nil, nil, nil,
+			nil, nil, nil, nil, nil,
 		)
 		e.SetSideAwareScheduling(sideAware)
 

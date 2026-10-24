@@ -26,13 +26,7 @@ import ASRNode from './nodes/ASRNode'
 import TTSNode from './nodes/TTSNode'
 import VideoNode from './nodes/VideoNode'
 import IfElseNode from './nodes/IfElseNode'
-import SubWorkflowNode from './nodes/SubWorkflowNode'
 import LoopNode from './nodes/LoopNode'
-import HTTPNode from './nodes/HTTPNode'
-import TransformNode from './nodes/TransformNode'
-import RAGNode from './nodes/RAGNode'
-import CodeNode from './nodes/CodeNode'
-import AggregateNode from './nodes/AggregateNode'
 import NoteNode from './nodes/NoteNode'
 import GroupNode from './nodes/GroupNode'
 import VisionNode from './nodes/VisionNode'
@@ -58,18 +52,11 @@ import ExecutionPanel from './components/ExecutionPanel'
 import ContextMenu from './components/ContextMenu'
 import DebugPanel from './components/DebugPanel'
 import CapabilityPanel from './components/CapabilityPanel'
-import TriggerPanel from './components/TriggerPanel'
 import GalleryPanel from './components/GalleryPanel'
-import CredentialPanel from './components/CredentialPanel'
 import ConfigPanel from './components/ConfigPanel'
-import ToolchainPanel from './components/ToolchainPanel'
-import EvolutionPanel from './components/EvolutionPanel'
 import RunEstimate from './components/RunEstimate'
 import NodeInspector from './components/NodeInspector'
 import CommandPalette, { type CommandItem } from './components/CommandPalette'
-import KBPanel from './components/KBPanel'
-import DiagnosticsPanel from './components/DiagnosticsPanel'
-import ComposePanel from './components/ComposePanel'
 import { PALETTE, CANVAS_ONLY_TYPES, initialNodes, initialEdges } from './config/graph'
 import { autoLayout, boundingBox, nextId, stripCanvasOnlyEdges, stripCanvasOnlyNodes } from './lib/graphUtils'
 import {
@@ -82,17 +69,8 @@ import {
   type ThemePref,
 } from './lib/theme'
 import ThemeSwitch from './components/ThemeSwitch'
-import {
-  fetchCards,
-  fetchProfiles,
-  setCardIndex,
-  type CardCatalog,
-  type LLMProfile,
-} from './lib/cards'
-import withCardBadge from './components/withCardBadge'
+import { type LLMProfile } from './lib/llmProfiles'
 import GenericNode from './nodes/GenericNode'
-import { fetchToolchain } from './lib/toolchain'
-import { fetchAgents, type AgentStatus } from './lib/agents'
 import { fetchModules, setModules } from './lib/modules'
 
 const baseNodeTypes: NodeTypes = {
@@ -104,16 +82,11 @@ const baseNodeTypes: NodeTypes = {
   tts: TTSNode,
   video_compose: VideoNode,
   if_else: IfElseNode,
-  sub_workflow: SubWorkflowNode,
   loop: LoopNode,
-  http_request: HTTPNode,
-  data_transform: TransformNode,
-  rag_query: RAGNode,
-  code: CodeNode,
-  aggregate: AggregateNode,
+  quality_loop: EditNode,
   vision: VisionNode,
   select: EditNode,
-  storyboard: TransformNode,
+  storyboard: GenericNode,
   shotlist: EditNode,
   quality_gate: EditNode,
   consistency_gate: EditNode,
@@ -127,22 +100,9 @@ const baseNodeTypes: NodeTypes = {
   group: GroupNode,
 }
 
-// 能力卡片徽章：在节点右上角叠一枚形状徽章（圆 / 六边形 / 三层堆叠）。
-//
-// 为什么用 HOC 而不是改 20 个节点组件：徽章是**统一表达**，
-// 改组件会得到 20 份略有差异的实现，且新加节点必然漏一次。
-// 这里一次包装，所有节点（含以后新增的）自动获得。
-const wrappedNodeTypes: NodeTypes = Object.fromEntries(
-  Object.entries(baseNodeTypes).map(([k, C]) => [k, withCardBadge(C as React.ComponentType<any>)]),
-) as NodeTypes
-
-// 未知类型（运行期插件节点）落到通用卡片渲染。
-//
-// 不兜底的话：插件装好、引擎能跑，但拖到画布上 ReactFlow 找不到组件，
-// 整块空白/报错——「插件生态」就在最后一步断掉。用 Proxy 而不是把表补全，
-// 是因为插件类型名由用户随时新增，前端不可能预知。
-const FallbackNode = withCardBadge(GenericNode as React.ComponentType<any>)
-const nodeTypes = new Proxy(wrappedNodeTypes, {
+// 未知类型（自定义节点）落到通用卡片渲染：插件/自定义节点装好后能直接拖上画布。
+const FallbackNode = GenericNode as React.ComponentType<any>
+const nodeTypes = new Proxy(baseNodeTypes, {
   get(target, prop) {
     if (typeof prop !== 'string') return Reflect.get(target, prop)
     return target[prop] ?? FallbackNode
@@ -151,15 +111,6 @@ const nodeTypes = new Proxy(wrappedNodeTypes, {
 
 // ReactFlowProvider 包裹：useReactFlow 需要 Provider 祖先
 // 插件节点的显示名写进 data._label：画布上的通用卡片不认识类型名，
-// 只能靠这个字段把「用户起的标题」显示出来（内置节点各自有硬编码标题，不受影响）。
-function withPluginLabel(
-  type: string,
-  data: Record<string, unknown>,
-  plugins: { type: string; label: string }[],
-): Record<string, unknown> {
-  const hit = plugins.find((p) => p.type === type)
-  return hit ? { ...data, _label: hit.label } : data
-}
 
 // 毫秒转人类可读时长：短任务用秒，长任务用分钟（多模态单节点常跑一两分钟）
 function fmtDuration(ms: number): string {
@@ -222,43 +173,9 @@ function FlowEditor() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
-  // 能力卡片 / 本机模型 / 自定义端点：三者都是"环境信息"，拉一次就够，
-  // 单独放一份而不是塞进 nodes，避免每次保存工作流把它们写进 JSON。
-  const [cards, setCards] = useState<CardCatalog | null>(null)
+  // 本机模型 / 自定义端点：环境信息（拉一次，向下传给属性面板）
   const [availableModels, setAvailableModels] = useState<string[]>([])
   const [llmProfiles, setLlmProfiles] = useState<LLMProfile[]>([])
-  // 外部智能体名册：agent_task 节点的下拉与探活徽章
-  const [agentStatuses, setAgentStatuses] = useState<AgentStatus[]>([])
-  const reloadPlugins = useCallback(() => {
-    fetchToolchain(false)
-      .then((v) =>
-        setPluginNodes(
-          v.entries
-            .filter((e) => e.kind === 'plugin' && e.enabled && e.meta?.node_type)
-            .map((e) => ({
-              type: String(e.meta?.node_type),
-              label: e.name,
-              icon: '⚒',
-              tone: 'tone-warn',
-            })),
-        ),
-      )
-      .catch(() => setPluginNodes([]))
-  }, [])
-
-  useEffect(() => {
-    reloadPlugins()
-  }, [reloadPlugins])
-
-  const reloadAgents = useCallback(() => {
-    fetchAgents(true).then((list) => setAgentStatuses(list))
-  }, [])
-  // 外部接入方式：开始节点面板要回答"谁在调这条工作流"
-  const [entry, setEntry] = useState<{ saved: boolean; webhook: boolean; cron: string }>({
-    saved: false,
-    webhook: false,
-    cron: '',
-  })
   // 模型元信息：下拉里必须能显示"叫什么、多大"，不能只写"自动探测"
   const [modelMeta, setModelMeta] = useState<{
     def: string
@@ -267,28 +184,20 @@ function FlowEditor() {
     checkpoints: string[]
     vision: string
   }>({ def: '', sizes: {}, ckpt: '', checkpoints: [], vision: '' })
-  const [credOpen, setCredOpen] = useState(false)
   const [configOpen, setConfigOpen] = useState(false)
   // 工具台：智能体 / 技能 / MCP / 插件四类工具的统一入口。
   // 「我刚装的东西在哪」这一类问题只有这一个面板能回答，所以给了一级按钮。
-  const [toolsOpen, setToolsOpen] = useState(false)
   // 运行期插件节点（data/plugins/<name>/plugin.json）→ 左侧节点库的「插件」分组。
   // 静态 PALETTE 不可能包含用户后装的插件，所以这份清单从 /api/toolchain 拉，
   // 每次打开工具台/重扫后刷新；拉不到就退化成空分组（不影响内置节点）。
-  const [pluginNodes, setPluginNodes] = useState<{ type: string; label: string; icon: string; tone: string }[]>([])
   // 估算结果里的「会不会撞墙」：由 RunEstimate 上报，运行前据此二次确认。
   // 存 ref 而不是 state——runWorkflow 是闭包，读 state 会读到旧值。
   const riskRef = useRef<{ risky: boolean; detail: string }>({ risky: false, detail: '' })
   const [lastRunId, setLastRunId] = useState<number | null>(null)
   const [canResume, setCanResume] = useState(false)
-  const [kbOpen, setKbOpen] = useState(false)
-  const [diagOpen, setDiagOpen] = useState(false)
-  const [evoOpen, setEvoOpen] = useState(false)
   // 窄屏（≤1320）顶栏放不下 12 个入口：低频 5 个改从「⋯」进，宽屏保持快捷入口
   const narrow = useMediaQuery(NARROW_QUERY)
-  const [composeOpen, setComposeOpen] = useState(false)
   const [envOpen, setEnvOpen] = useState(false)
-  const [triggerOpen, setTriggerOpen] = useState(false)
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [cmdOpen, setCmdOpen] = useState(false)
   const [tplLibOpen, setTplLibOpen] = useState(false)
@@ -332,48 +241,10 @@ function FlowEditor() {
     fetchModules().then((mods) => mods.length && setModules(mods))
   }, [])
 
-  // 卡片库在弹层里被编辑后重新拉目录（画布徽章的名字也要跟着变）
-  const reloadCards = useCallback(() => {
-    fetchCards().then((c) => {
-      if (!c) return
-      setCards(c)
-      setCardIndex(c)
-    })
-  }, [])
-
-  // 外部接入信息：保存后才知道 Webhook / 定时是否开启
-  useEffect(() => {
-    if (!currentWorkflowId) {
-      setEntry({ saved: false, webhook: false, cron: '' })
-      return
-    }
-    let alive = true
-    fetch(`/api/workflows/${currentWorkflowId}/trigger`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        if (!alive) return
-        setEntry({
-          saved: true,
-          webhook: Boolean(d?.trigger_enabled),
-          cron: String(d?.cron_expr || ''),
-        })
-      })
-      .catch(() => {
-        if (alive) setEntry({ saved: true, webhook: false, cron: '' })
-      })
-    return () => {
-      alive = false
-    }
-  }, [currentWorkflowId])
-
-  // 卡片目录 + 本机模型 + 自定义端点（一次性拉取）
+  // 本机模型 + 自定义端点：环境信息，拉一次就够。
+  // 不塞进 nodes，避免每次保存工作流把它们写进 JSON。
   useEffect(() => {
     let alive = true
-    fetchCards().then((c) => {
-      if (!alive || !c) return
-      setCards(c)
-      setCardIndex(c) // 徽章要在节点上显示卡片名，走模块级索引
-    })
     fetch('/api/models')
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
@@ -388,13 +259,12 @@ function FlowEditor() {
         })
       })
       .catch(() => {})
-    fetchProfiles().then((p) => {
-      if (alive && p) setLlmProfiles(p.profiles || [])
-    })
-    // 名册带探活（LookPath / TCP dial），慢一点但换来"能不能用"的真答案
-    fetchAgents(true).then((list) => {
-      if (alive) setAgentStatuses(list)
-    })
+    fetch('/api/llm/profiles')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive && d) setLlmProfiles(d.profiles || [])
+      })
+      .catch(() => {})
     return () => {
       alive = false
     }
@@ -735,15 +605,6 @@ function FlowEditor() {
     setSelectedNode(node)
   }, [])
 
-  // 面板里点"上游/下游"的节点名，直接选中那个节点（不用回画布上找）
-  const selectNodeById = useCallback(
-    (id: string) => {
-      const target = nodes.find((n) => n.id === id)
-      if (target) setSelectedNode(target)
-    },
-    [nodes],
-  )
-
   const onPaneClick = useCallback(() => {
     setSelectedNode(null)
     setContextMenu(null)
@@ -801,7 +662,7 @@ function FlowEditor() {
       type,
       // 错开排布：此前用 Math.random() 落点，连续添加会重叠成一坨
       position: { x: 200 + (nodeIdRef.current % 5) * 60, y: 150 + (nodeIdRef.current % 5) * 60 },
-      data: withPluginLabel(type, getDefaultNodeData(type), pluginNodes),
+      data: getDefaultNodeData(type),
     }
     // 分组框永远垫在最底层，避免盖住节点
     setNodes((nds) => (type === 'group' ? [newNode, ...nds] : [...nds, newNode]))
@@ -830,7 +691,7 @@ function FlowEditor() {
         id,
         type,
         position,
-        data: withPluginLabel(type, getDefaultNodeData(type), pluginNodes),
+        data: getDefaultNodeData(type),
       }
       pushHistory()
       setNodes((nds) => [...nds, newNode])
@@ -1312,15 +1173,8 @@ function FlowEditor() {
       run: () => setTplLibOpen(true),
     })
     list.push(
-      { id: 'panel-kb', label: '打开知识库', icon: '⌕', section: '面板', run: () => setKbOpen(true) },
-      { id: 'panel-compose', label: '构图（一句话生成工作流）', icon: '◇', section: '面板', run: () => setComposeOpen(true) },
-      { id: 'panel-diag', label: '运行诊断（哪里在漏）', icon: '◎', section: '面板', run: () => setDiagOpen(true) },
-      { id: 'panel-evo', label: '自进化（燃料 / 失分 / 判定 / 晋升台账）', icon: '∞', section: '面板', run: () => setEvoOpen(true) },
       { id: 'panel-env', label: '查看运行环境', icon: '◍', section: '面板', run: () => setEnvOpen(true) },
-      { id: 'panel-tools', label: '打开工具台（技能 / MCP / 插件 / 智能体）', icon: '⚒', section: '面板', run: () => setToolsOpen(true) },
-      { id: 'panel-trigger', label: '配置触发器', icon: '⚡', section: '面板', run: () => setTriggerOpen(true) },
       { id: 'panel-gallery', label: '打开产物画廊', icon: '▣', section: '面板', run: () => setGalleryOpen(true) },
-      { id: 'panel-cred', label: '管理凭据', icon: '🔑', section: '面板', run: () => setCredOpen(true) },
       { id: 'act-run', label: '运行工作流', hint: 'Ctrl+Enter', icon: '▶', section: '动作', run: () => runWorkflow() },
       { id: 'act-save', label: '保存工作流', icon: '▤', section: '动作', run: () => saveWorkflow() },
       { id: 'act-layout', label: '自动布局', icon: '⌗', section: '动作', run: () => doAutoLayout() },
@@ -1411,7 +1265,6 @@ function FlowEditor() {
         <NodePalette
           envReady={envReady}
           usage={nodeUsage}
-          plugins={pluginNodes}
           onAdd={addNode}
           onDragStart={onDragStart}
         />
@@ -1553,51 +1406,14 @@ function FlowEditor() {
             <button onClick={saveWorkflow} className="fe-tb" title="保存到本地库">
               保存
             </button>
-            <button
-              onClick={() => setToolsOpen(true)}
-              className="fe-tb"
-              title="工具台：智能体 / 技能 / MCP / 插件（全盘发现，装完即见）"
-            >
-              工具
-            </button>
             {!narrow && (
-              <>
-                <button
-                  onClick={() => setComposeOpen(true)}
-                  className="fe-tb"
-              title="说一句要做什么，生成工作流与任务书（只生成，不执行）"
-            >
-              构图
-            </button>
-            <button
-              onClick={() => setKbOpen(true)}
-              className="fe-tb"
-              title="项目专属语义知识库"
-            >
-              知识库
-            </button>
-            <button
-              onClick={() => setDiagOpen(true)}
-              className="fe-tb"
-              title="聚合运行证据，诊断哪里在漏，并生成可试的参数候选"
-            >
-              诊断
-            </button>
-            <button
-              onClick={() => setEvoOpen(true)}
-              className="fe-tb"
-              title="自进化：燃料够不够、失分漏在哪、配对判定、晋升台账（晋升必须人按）"
-            >
-              进化
-            </button>
-                <button
-                  onClick={() => setGalleryOpen(true)}
-                  className="fe-tb"
-                  title="浏览生成的图片 / 视频 / 音频"
-                >
-                  产物
-                </button>
-              </>
+              <button
+                onClick={() => setGalleryOpen(true)}
+                className="fe-tb"
+                title="浏览生成的图片 / 视频 / 音频"
+              >
+                产物
+              </button>
             )}
 
             <div className="fe-vsep" />
@@ -1622,48 +1438,13 @@ function FlowEditor() {
                     <div className="mi-group">内容</div>
                     {/* 窄屏专用：顶栏收起这五项后从这里进；宽屏不渲染，避免重复入口 */}
                     {narrow && (
-                      <>
-                    <button
-                      onClick={() => {
-                        setComposeOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      构图 · 一句话生成
-                    </button>
-                    <button
-                      
-                      onClick={() => {
-                        setKbOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      知识库
-                    </button>
-                    <button
-                      
-                      onClick={() => {
-                        setDiagOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      运行诊断
-                    </button>
-                    <button
-                      
-                      onClick={() => {
-                        setEvoOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      自进化
-                    </button>
-                    <button
-                      
-                      onClick={() => {
-                        setGalleryOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      产物画廊
-                    </button>
-                    <div className="mi-sep" />
-                      </>
+                      <button
+                        onClick={() => {
+                          setGalleryOpen(true); setMoreOpen(false)
+                        }}
+                      >
+                        产物画廊
+                      </button>
                     )}
                     <button
                       onClick={() => {
@@ -1672,13 +1453,6 @@ function FlowEditor() {
                     >
                       模板库
                       <span className="mi-k">{tplEntries.length}</span>
-                    </button>
-                    <button
-                      onClick={() => {
-                        setTriggerOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      触发 · Webhook / 定时
                     </button>
                     <div className="mi-sep" />
                     <div className="mi-group">环境与能力</div>
@@ -1696,13 +1470,6 @@ function FlowEditor() {
                       }}
                     >
                       环境自检
-                    </button>
-                    <button
-                      onClick={() => {
-                        setCredOpen(true); setMoreOpen(false)
-                      }}
-                    >
-                      凭据管理
                     </button>
                     <button
                       onClick={() => {
@@ -1928,33 +1695,6 @@ function FlowEditor() {
         />
       )}
 
-      {/* 项目知识库面板 */}
-      <KBPanel open={kbOpen} onClose={() => setKbOpen(false)} />
-      <DiagnosticsPanel open={diagOpen} onClose={() => setDiagOpen(false)} onNotify={setRunResult} />
-
-      {/* 自进化面板：燃料 / 失分 / 候选 / 判定 / 晋升台账 */}
-      {evoOpen && (
-        <EvolutionPanel
-          workflowId={currentWorkflowId}
-          onClose={() => setEvoOpen(false)}
-          onNotify={setRunResult}
-        />
-      )}
-      <ComposePanel
-        open={composeOpen}
-        onClose={() => setComposeOpen(false)}
-        onNotify={setRunResult}
-        onLoad={(ns, es, nm) => {
-          // 载入的是"还没保存的新图"：必须清掉 currentWorkflowId，
-          // 否则下一步「保存」会覆盖原来那条工作流（人在画布上看的是新图，存掉的却是旧图）。
-          pushHistory()
-          setNodes(ns)
-          setEdges(es)
-          setWorkflowName(nm)
-          setCurrentWorkflowId(undefined)
-        }}
-      />
-
       {/* 模板库：分组 / 搜索 / 置顶 */}
       <TemplateLibrary
         open={tplLibOpen}
@@ -1965,25 +1705,9 @@ function FlowEditor() {
       {/* 运行环境自检面板 */}
       {envOpen && <CapabilityPanel onClose={() => setEnvOpen(false)} />}
 
-      {/* 工具台：四类工具一套面板 */}
-      {toolsOpen && (
-        <ToolchainPanel
-          onClose={() => {
-            setToolsOpen(false)
-            reloadPlugins()
-          }}
-          onNotify={setRunResult}
-        />
-      )}
-
-      {/* 触发器面板 */}
-      {triggerOpen && <TriggerPanel workflowId={currentWorkflowId} onClose={() => setTriggerOpen(false)} />}
-
       {/* 产物画廊 */}
       {galleryOpen && <GalleryPanel onClose={() => setGalleryOpen(false)} />}
 
-      {/* 凭据管理 */}
-      {credOpen && <CredentialPanel onClose={() => setCredOpen(false)} />}
       {configOpen && <ConfigPanel onClose={() => setConfigOpen(false)} />}
 
       {/* 命令面板 */}
@@ -2000,15 +1724,9 @@ function FlowEditor() {
         onNotify={setRunResult}
         savedWorkflows={savedWorkflows}
         currentWorkflowId={currentWorkflowId}
-        cards={cards}
         availableModels={availableModels}
         modelMeta={modelMeta}
         llmProfiles={llmProfiles}
-        agents={agentStatuses}
-        onReloadAgents={reloadAgents}
-        entry={entry}
-        onSelectNode={selectNodeById}
-        onReloadCards={reloadCards}
         onErrorAction={(a) => {
           if (a === 'open-env') setEnvOpen(true)
         }}

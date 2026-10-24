@@ -44,7 +44,7 @@ const paletteTypes = PALETTE.flatMap((s) => s.items.map((i) => i.type))
 
 test('后端每个节点类型都在前端调色板里（否则能力等于不存在）', () => {
   const back = backendNodeTypes()
-  assert.ok(back.length >= 29, `只解析到 ${back.length} 个类型，解析规则可能过期`)
+  assert.ok(back.length >= 20, `只解析到 ${back.length} 个类型，解析规则可能过期`)
   const missing = back.filter((t) => !paletteTypes.includes(t))
   assert.deepEqual(missing, [], `这些节点后端能跑但用户点不到：${missing.join(', ')}`)
 })

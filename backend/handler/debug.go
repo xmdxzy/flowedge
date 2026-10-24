@@ -24,16 +24,15 @@ import (
 // 两者都是异步的（节点可能跑几分钟，不能被 HTTP 超时打断），
 // 前端靠轮询 GET /api/runs/:runId 拿到 paused_at / status=paused。
 type DebugHandler struct {
-	db      *gorm.DB
-	engine  *service.EngineV2
-	lineage *service.LineageStore
+	db     *gorm.DB
+	engine *service.EngineV2
 
 	mu   sync.Mutex
 	busy map[uint]bool
 }
 
-func NewDebugHandler(db *gorm.DB, engine *service.EngineV2, lineage *service.LineageStore) *DebugHandler {
-	return &DebugHandler{db: db, engine: engine, lineage: lineage, busy: map[uint]bool{}}
+func NewDebugHandler(db *gorm.DB, engine *service.EngineV2) *DebugHandler {
+	return &DebugHandler{db: db, engine: engine, busy: map[uint]bool{}}
 }
 
 type debugRequest struct {
@@ -162,11 +161,6 @@ func (h *DebugHandler) advance(c *gin.Context, step bool, budget int, breakpoint
 		run.NodeStates = json.RawMessage(statesJSON)
 		h.db.Save(&run)
 
-		if h.lineage != nil {
-			var edges []model.EdgeInstance
-			_ = json.Unmarshal(edgesJSON, &edges)
-			h.lineage.RecordRun(wf.ID, run.ID, states, edges)
-		}
 	}()
 
 	c.JSON(http.StatusAccepted, gin.H{

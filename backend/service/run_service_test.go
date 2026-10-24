@@ -48,7 +48,7 @@ func seedRun(t *testing.T, db *gorm.DB, status string) (model.Workflow, model.Wo
 }
 
 func newTestRunService(db *gorm.DB) *RunService {
-	eng := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	eng := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	s := NewRunService(db, eng, nil)
 	s.SetSynchronous() // 测试里不等 goroutine，否则只能 sleep
 	return s

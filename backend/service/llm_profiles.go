@@ -212,19 +212,9 @@ func (e *EngineV2) llmServiceForProfile(p LLMProfile) *LLMService {
 		svc.Backend = ResolveLLMBackend(base, "")
 	}
 
-	// 凭据：约定 headers 里放 Authorization: Bearer xxx
-	if p.Credential != "" && e.creds != nil {
-		headers, _, err := e.creds.Resolve(p.Credential)
-		if err == nil {
-			auth := headers["Authorization"]
-			if auth == "" {
-				auth = headers["authorization"]
-			}
-			key := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
-			if key != "" {
-				svc = svc.WithAuth(key)
-			}
-		}
+	// 凭据：端点清单里的 credential 直接就是 Bearer key（不再经过凭据仓库）
+	if p.Credential != "" {
+		svc = svc.WithAuth(p.Credential)
 	}
 	return svc
 }

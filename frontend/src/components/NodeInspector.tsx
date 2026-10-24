@@ -1,12 +1,9 @@
 import type { Edge, Node } from '@xyflow/react'
 
 import { LLM_TASK_PRESETS, NODE_OUTPUT_FIELDS, PALETTE } from '../config/graph'
-import NodePipeline, { type PeerRef } from './NodePipeline'
-import { type Binding, type CardCatalog, type LLMProfile } from '../lib/cards'
+import type { LLMProfile } from '../lib/llmProfiles'
 import { SOURCE_CONSUMERS, SOURCE_PORT, effectiveSourceKind, extOf, inferSourceKind, isPlaceholderPath } from '../lib/inputSource'
-import { agentStateClass, agentStateLabel, type AgentStatus } from '../lib/agents'
 import ErrorNotice from './ErrorNotice'
-import MCPCallFields from './MCPCallFields'
 import GenericNodeFields from './GenericNodeFields'
 import type { ErrorAction } from '../lib/errorHints'
 import { typeLabel } from '../lib/modules'
@@ -19,27 +16,6 @@ import { typeLabel } from '../lib/modules'
 //
 // 它不持有任何状态：tab 由上层给、数据改动一律 onUpdate 回调出去。
 // 这样 App 仍然是唯一的状态源，拆分不会引入两份真相。
-
-/** 吃文本输入的节点：输入处理段对它们有意义。 */
-const TEXT_IN = new Set([
-  'llm', 'prompt_opt', 'storyboard', 'scene_grid', 'vision', 'select',
-  'text2image', 'text2video', 'tts', 'asr', 'sub_workflow', 'code',
-  'data_transform', 'http_request', 'rag_query', 'if_else', 'loop',
-  'end', 'comfy_workflow', 'shotlist', 'subtitles', 'post_production',
-])
-
-/** 产出图片/视频的节点：输出段只对「看图」类卡有意义。 */
-const MEDIA_OUT = new Set([
-  'text2image', 'image2image', 'inpaint', 'upscale', 'text2video',
-  'video_compose', 'comfy_workflow', 'shotlist',
-])
-
-/** 产出文本的节点：输出处理段对它们有意义（出图的节点产 image，整形文本没落点）。 */
-const TEXT_OUT = new Set([
-  'start', 'llm', 'prompt_opt', 'storyboard', 'scene_grid', 'vision', 'select',
-  'asr', 'data_transform', 'http_request', 'rag_query', 'if_else', 'loop',
-  'aggregate', 'code',
-])
 
 /** 不显示「可用变量」的节点：它们没有手写文本参数，列引用只会干扰。 */
 const NO_VAR_PICKER = new Set(['text2image', 'end', 'start'])
@@ -65,16 +41,10 @@ export interface NodeInspectorProps {
   /** 子工作流节点要选一个已保存的工作流 */
   savedWorkflows?: any[]
   currentWorkflowId?: number
-  /** 能力卡片目录（App 拉一次，向下透传） */
-  cards?: CardCatalog | null
   /** 本机 Ollama 已装模型（模型下拉用） */
   availableModels?: string[]
   /** 自定义模型端点 */
   llmProfiles?: LLMProfile[]
-  /** 外部智能体名册（agent_task 的「智能体」下拉）。含探活结果，不只是配置 */
-  agents?: AgentStatus[]
-  /** 名册重新体检（面板上「重新探测」按钮） */
-  onReloadAgents?: () => void
   /** 模型元信息：默认模型名 / 各模型体积 / 出图权重 */
   modelMeta?: {
     def: string
@@ -84,11 +54,7 @@ export interface NodeInspectorProps {
     vision?: string
   }
   /** 点上游/下游直接选中那个节点 */
-  onSelectNode?: (id: string) => void
-  /** 卡片库被编辑后重新拉目录 */
-  onReloadCards?: () => void
   /** 这条工作流的外部接入方式（开始节点显示"谁在调我"） */
-  entry?: { saved: boolean; webhook: boolean; cron: string }
 }
 
 export default function NodeInspector({
@@ -102,39 +68,10 @@ export default function NodeInspector({
   onErrorAction,
   savedWorkflows = [],
   currentWorkflowId,
-  cards = null,
   availableModels = [],
   llmProfiles = [],
-  agents = [],
-  onReloadAgents,
   modelMeta = { def: '', sizes: {}, ckpt: '', checkpoints: [], vision: '' },
-  onSelectNode,
-  entry = { saved: false, webhook: false, cron: '' },
-  onReloadCards,
 }: NodeInspectorProps) {
-  // LLM 的工具配置（搬进处理链后，这里只负责把数据取出来）
-  const llmTools = (node?.data?.tools as string[]) || []
-  const llmTrace = ((node?.data?.output as Record<string, unknown> | undefined)?.tool_calls as
-    | { tool?: string; status?: string; arguments?: string }[]
-    | undefined) || []
-
-  // 接线：谁喂我、我喂谁。索引按节点 id 建，边里只有 id。
-  const peers = (() => {
-    const byId = new Map<string, string>()
-    nodes.forEach((n) => byId.set(n.id, (n.type as string) || '?'))
-    const of = (id: string) => byId.get(id) || '?'
-    const isCanvas = (id: string) => {
-      const t = byId.get(id)
-      return t === 'note' || t === 'group'
-    }
-    const ins: PeerRef[] = edges
-      .filter((e) => e.target === node?.id && !isCanvas(e.source))
-      .map((e) => ({ id: e.source, type: of(e.source), port: (e.targetHandle as string) || undefined }))
-    const outs: PeerRef[] = edges
-      .filter((e) => e.source === node?.id && !isCanvas(e.target))
-      .map((e) => ({ id: e.target, type: of(e.target), port: (e.targetHandle as string) || undefined }))
-    return { in: ins, out: outs }
-  })()
 
   return (
     <div className="w-72 shrink-0 border-l border-border bg-surface p-4 overflow-y-auto">
@@ -198,43 +135,6 @@ export default function NodeInspector({
           </p>
         </div>
 
-        {/* 处理链：接线 + 输入/本体/输出三段。三类卡可以同时挂。
-            开始节点例外——它只有一个提示词，挂卡没有落点。 */}
-        {node.type !== 'start' && (
-        <div className="mb-2">
-          <NodePipeline
-            data={node.data as Record<string, unknown>}
-            cards={cards}
-            upstream={peers.in}
-            downstream={peers.out}
-            textIn={TEXT_IN.has(node.type || '')}
-            textOut={TEXT_OUT.has(node.type || '')}
-            mediaOut={MEDIA_OUT.has(node.type || '')}
-            bodyCapable={node.type === 'llm'}
-            nodeType={node.type}
-            onChange={(list: Binding[]) => onUpdate('bindings', list)}
-            onJump={(id) => onSelectNode?.(id)}
-            onNotify={onNotify}
-            onReloadCards={onReloadCards}
-            tools={
-              node.type === 'llm'
-                ? {
-                    list: llmTools,
-                    maxRounds: Number(node.data.max_tool_rounds ?? 4),
-                    strict: node.data.tool_strict === true,
-                    trace: llmTrace,
-                    onChange: (patch) => {
-                      if (patch.tools) onUpdate('tools', patch.tools)
-                      if (patch.maxRounds !== undefined) onUpdate('max_tool_rounds', patch.maxRounds)
-                      if (patch.strict !== undefined) onUpdate('tool_strict', patch.strict)
-                    },
-                  }
-                : undefined
-            }
-          />
-        </div>
-        )}
-
         {/* 可用变量：只有"要手写引用"的节点才显示。
             text2image / end 这类不吃手写文本的节点列一堆 {{...}} 只是噪音。 */}
         {!NO_VAR_PICKER.has(node.type || '') && (() => {
@@ -278,23 +178,6 @@ export default function NodeInspector({
 
         {node.type === 'start' && (
           <div className="flex flex-col gap-3">
-            {/* 前置上游"源"：不是画布节点，而是工作流级事实——谁把任务交进来。 */}
-            <NodePipeline
-              data={node.data as Record<string, unknown>}
-              cards={cards}
-              upstream={peers.in}
-              downstream={peers.out}
-              textIn={false}
-              textOut={false}
-              bodyCapable={false}
-              lineageOnly
-              entrySource={(node.data.entry_agent as string) || 'manual'}
-              onEntrySourceChange={(v) => onUpdate('entry_agent', v)}
-              entryExtra={entry}
-              onChange={() => {}}
-              onJump={(id) => onSelectNode?.(id)}
-              onNotify={onNotify}
-            />
 
             <div>
               <label className="text-xs text-gray-400 block mb-1">输入提示词</label>
@@ -616,9 +499,7 @@ export default function NodeInspector({
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <label className="text-xs text-gray-400">任务</label>
-                  {(node.data.bindings as unknown[] | undefined)?.some(
-                    (b) => (b as { stage?: string }).stage === 'body',
-                  ) && <span className="text-[9px] text-amber-500/90">本体角色卡已接管提示词，预设不生效</span>}
+
                 </div>
                 <select
                   value={preset.id}
@@ -1226,113 +1107,6 @@ export default function NodeInspector({
               换景样本落在 0.39 / 0.57 / 0.08。拿不准就先勾「只报不拦」跑一遍。
             </p>
           </div>
-        )}
-
-        {node.type === 'agent_task' && (() => {
-          // 选中的那个（可能已停用/不可用，仍要显示真实状态）
-          const picked = agents.find((a) => a.id === (node.data.agent_id as string))
-          const usable = agents.filter((a) => a.enabled === undefined || a.enabled === true)
-          return (
-            <div className="flex flex-col gap-3">
-              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2 py-1.5">
-                <p className="text-[10px] text-amber-300 leading-relaxed">
-                  ⚠ 这一步<strong className="font-medium">不承诺可复现</strong>：同一输入两次结果可能不同。
-                  任务书会标出「非确定性」，评测时本图要与确定性图分开统计。
-                </p>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-[10px] text-gray-500">智能体</label>
-                  {onReloadAgents && (
-                    <button
-                      type="button"
-                      onClick={onReloadAgents}
-                      className="text-[10px] text-data hover:underline"
-                    >
-                      重新探测
-                    </button>
-                  )}
-                </div>
-                {usable.length === 0 ? (
-                  <p className="text-[10px] text-amber-400 leading-relaxed">
-                    没有可用的智能体。请在 <code className="text-data">data/agents.json</code> 里配置
-                    （或 <code className="text-data">PUT /api/agents</code>），内置示例默认是停用的。
-                  </p>
-                ) : (
-                  <select
-                    value={(node.data.agent_id as string) || ''}
-                    onChange={(e) => onUpdate('agent_id', e.target.value)}
-                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
-                  >
-                    <option value="">— 选一个 —</option>
-                    {/* 不可用的仍然可选：允许先编排后补环境，但要在下面标出真实状态 */}
-                    {usable.map((a) => (
-                      <option key={a.id} value={a.id}>
-                        {a.label}（{a.kind}）· {agentStateLabel(a)}
-                      </option>
-                    ))}
-                  </select>
-                )}
-                {picked && (
-                  <p className={`text-[10px] mt-1 ${agentStateClass(picked)}`}>
-                    {picked.detail || agentStateLabel(picked)}
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label className="text-[10px] text-gray-500 block mb-1">
-                  任务描述（留空则用上游文本）
-                </label>
-                <textarea
-                  value={(node.data.prompt as string) || ''}
-                  onChange={(e) => onUpdate('prompt', e.target.value)}
-                  rows={4}
-                  placeholder="例如：把这段分镜改写成 80 字以内的旁白，保留雨夜氛围"
-                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="text-[10px] text-gray-500 block mb-1">超时</label>
-                  <select
-                    value={String((node.data.timeout_ms as number) || '')}
-                    onChange={(e) => onUpdate('timeout_ms', e.target.value ? Number(e.target.value) : undefined)}
-                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
-                  >
-                    <option value="">默认（5 分钟）</option>
-                    <option value="60000">1 分钟</option>
-                    <option value="300000">5 分钟</option>
-                    <option value="900000">15 分钟</option>
-                    <option value="1800000">30 分钟</option>
-                    <option value="3600000">1 小时</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[10px] text-gray-500 block mb-1">失败策略</label>
-                  <label className="flex items-center gap-2 text-[11px] text-gray-400 h-[26px]">
-                    <input
-                      type="checkbox"
-                      checked={node.data.allow_failure === true}
-                      onChange={(e) => onUpdate('allow_failure', e.target.checked)}
-                    />
-                    失败也往下传
-                  </label>
-                </div>
-              </div>
-
-              <p className="text-[10px] text-gray-600 leading-relaxed">
-                节点里只存 agent_id；真正的命令行只存在服务端 <code className="text-data">data/agents.json</code>，
-                图不能当命令执行器。工作目录留空则每次执行用独立临时目录。
-              </p>
-            </div>
-          )
-        })()}
-
-        {node.type === 'mcp_call' && (
-          <MCPCallFields data={node.data as Record<string, unknown>} onUpdate={onUpdate} />
         )}
 
         {/* 运行期插件节点：静态调色板里没有的类型一律走通用 JSON 参数编辑 */}

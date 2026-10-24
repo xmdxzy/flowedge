@@ -107,6 +107,25 @@ agent 的 shell 起不了任何活过本次调用的进程——沙箱每命令�
 反例：`gulp compile` 会因仓库自带的 `.vscode/extensions` 自测扩展报错而 `exit 1`，但主程序产物完全正常——只看退出码会误判整件事失败。
 同源规则见 §0.12 ②「用工具没报错当没问题」和本条的镜像面。
 
+### 0.16 轻装化后的事实（2026-10-24，先读这条再动手）
+
+FlowEdge 已裁到只剩两件事：**本地多模态生成** + **质量门控循环**。细节见
+`docs/轻装化-FlowEdge-Lite-v1.md`。会做错的地方：
+
+- **别再找这些 API**：`/api/cards`、`/api/skills`、`/api/toolchain`、`/api/mcp/*`（客户端侧）、
+  `/api/agents`、`/api/kb/*`、`/api/evidence/*`、`/api/evolution/*`、`/api/triggers`、
+  `/api/hooks/*`、`/api/credentials`、`/api/workflows/:id/versions`、`/v1/*`。它们已删除，不是坏了。
+- **别再找这些节点**：`agent_task`、`mcp_call`、`command`、`code`、`http_request`、
+  `data_transform`、`rag_query`、`aggregate`、`sub_workflow`。旧图用到它们会报 `unknown node type`，这是预期。
+- **循环提升现在用 `quality_loop`，不是自己拼 `loop + quality_gate`**：它内建
+  「生成→打分→诊断→改参数→重跑→择优」，未达标会显式失败并带逐轮报告。修复项只做有确定解的
+  数值项（帧数/宽高/时长下限/音轨/禁人声），语义类问题走重采样。
+- **节点缓存已删**：故意。缓存命中会让「重跑一轮」变成假重跑，质量循环就失去意义。
+- **前端测试必须 `NODE_ENV=test`**：这个 shell 里 `NODE_ENV=production`，`act()` 会整体抛错，
+  表现为 73 个用例全红——那是环境，不是代码。
+- 代码量参考：backend 145 个 Go 文件 / ~23.5k 行，frontend 64 个源文件 / ~9.2k 行；
+  API 40 条，节点 26 种。数字明显超出说明有东西被加回来了。
+
 ## 1–4. 环境硬约束（权重 / 显存 / 进程 / 下载）
 
 

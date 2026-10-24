@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,14 @@ import (
 
 	"flowedge/backend/service"
 )
+
+func postJSON(r *gin.Engine, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
 
 func newEstimateRouter(h *EstimateHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)

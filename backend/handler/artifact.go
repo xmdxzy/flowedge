@@ -5,12 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-
-	"flowedge/backend/service"
 )
 
 // ArtifactHandler 产物管理：浏览 data/generated 下生成的图片 / 视频 / 音频
@@ -18,43 +15,11 @@ import (
 // 生图、视频、语音的产物以前只能去文件夹里翻；这里提供一个统一入口，
 // 前端可以网格预览、点开看大图、把文件路径复制回工作流复用。
 type ArtifactHandler struct {
-	dir     string
-	lineage *service.LineageStore
+	dir string
 }
 
 func NewArtifactHandler(dir string) *ArtifactHandler {
 	return &ArtifactHandler{dir: dir}
-}
-
-// SetLineage 注入血缘仓库（提供 /api/artifacts/:name/lineage）
-func (h *ArtifactHandler) SetLineage(l *service.LineageStore) {
-	h.lineage = l
-}
-
-// Lineage 单件产物的来源链（自身 + 逐层上游）
-func (h *ArtifactHandler) Lineage(c *gin.Context) {
-	if h.lineage == nil {
-		c.JSON(http.StatusOK, gin.H{"available": false})
-		return
-	}
-	name := c.Param("name")
-	self, ancestors, ok := h.lineage.Get(name)
-	if !ok {
-		c.JSON(http.StatusOK, gin.H{"available": false, "name": name, "reason": "该产物没有血缘记录（可能产生于血缘功能上线前）"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"available": true, "self": self, "ancestors": ancestors})
-}
-
-// LineageList 全部血缘记录（画廊批量展示来源用）
-func (h *ArtifactHandler) LineageList(c *gin.Context) {
-	if h.lineage == nil {
-		c.JSON(http.StatusOK, gin.H{"items": []service.ArtifactLineage{}, "count": 0})
-		return
-	}
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "200"))
-	items := h.lineage.List(limit)
-	c.JSON(http.StatusOK, gin.H{"items": items, "count": len(items)})
 }
 
 var artifactExt = map[string]string{

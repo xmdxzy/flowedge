@@ -82,7 +82,7 @@ func heavyNode(e *EngineV2, rec *sideRecorder, side string) NodeExecutor {
 // 这是「消除换侧抖动」的核心断言：一旦离开某个侧别就不再回来。
 func TestSideAwareSchedulingGroupsBySide(t *testing.T) {
 	rec := newSideRecorder()
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	e.RegisterNodeTypeWithSide("hd1", sideDiffusion, heavyNode(e, rec, sideDiffusion))
 	e.RegisterNodeTypeWithSide("hd2", sideDiffusion, heavyNode(e, rec, sideDiffusion))
 	e.RegisterNodeTypeWithSide("hl1", sideLanguage, heavyNode(e, rec, sideLanguage))
@@ -139,7 +139,7 @@ func TestSideAwareSchedulingGroupsBySide(t *testing.T) {
 // 同侧多个节点仍应并发，而不是退化成串行。
 func TestSideAwareSchedulingKeepsBranchesParallel(t *testing.T) {
 	probe := &overlapProbe{}
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	e.RegisterNodeTypeWithSide("hd", sideDiffusion, func(_ context.Context, node *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
 		release := e.enterSide(sideDiffusion)
 		defer release() // 与真实节点一致：整个执行期间持锁
@@ -181,7 +181,7 @@ func TestSideAwareSchedulingKeepsBranchesParallel(t *testing.T) {
 // 所以「换了一次侧」不等于「掏了 180 秒」——扩散侧本来就没驻留时，
 // 换侧是空操作。效率评估只能看 unloads，看 switches 会高估代价。
 func TestUnloadCountSeparateFromSwitch(t *testing.T) {
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil) // t2i == nil：没有扩散服务
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil) // t2i == nil：没有扩散服务
 
 	e.enterSide(sideDiffusion)() // 从空进入第一侧：不算换侧
 	if got := e.SideSwitchCount(); got != 0 {

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,11 +14,32 @@ import (
 )
 
 // newTestEngine 构造一个不依赖外部模型服务的引擎（用于纯 DAG 逻辑测试）
+//
+// 只注册测试替身节点：test_echo（原样回传 value）与 test_sleep（睡 ms 毫秒），
+// 用来驱动纯编排逻辑（分支/汇合/重试/断点），不需要任何模型或网络服务。
 func newTestEngine() *EngineV2 {
-	return &EngineV2{
-		llm: nil, t2i: nil, asr: nil, tts: nil, video: nil,
-		http: nil, rag: nil, gpuSched: nil, wsHub: nil,
-	}
+	e := &EngineV2{}
+	e.registerBuiltinNodes()
+	e.RegisterNodeType("test_echo", func(_ context.Context, n *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
+		v, _ := n.Data["value"].(string)
+		return map[string]interface{}{"text": v}, nil
+	})
+	e.RegisterNodeType("test_fail", func(_ context.Context, n *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
+		return nil, fmt.Errorf("intentional failure")
+	})
+	e.RegisterNodeType("test_append", func(_ context.Context, n *model.NodeInstance, up map[string]interface{}) (interface{}, error) {
+		suffix, _ := n.Data["suffix"].(string)
+		return map[string]interface{}{"text": upstreamText(up) + suffix}, nil
+	})
+	e.RegisterNodeType("test_sleep", func(_ context.Context, n *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
+		ms, _ := n.Data["ms"].(float64)
+		if ms <= 0 {
+			ms = 50
+		}
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		return map[string]interface{}{"text": "slept"}, nil
+	})
+	return e
 }
 
 func marshalNodes(t *testing.T, nodes []map[string]interface{}) []byte {
@@ -139,8 +161,8 @@ func TestEngine_DiamondDAG(t *testing.T) {
 
 	nodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "x"}},
-		{"id": "m1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"template": "A"}},
-		{"id": "m2", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"template": "B"}},
+		{"id": "m1", "type": "test_echo", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"value": "A"}},
+		{"id": "m2", "type": "test_echo", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"value": "B"}},
 		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
 	})
 	edges := marshalEdges(t, []map[string]interface{}{
@@ -182,46 +204,13 @@ func TestGPUScheduler_Thresholds(t *testing.T) {
 	}
 }
 
-// 测试向量存储：余弦相似度
-func TestVectorStore_Similarity(t *testing.T) {
-	vs := NewVectorStore(t.TempDir())
-
-	id1, err := vs.Add(VectorRecord{
-		Content:   "人工智能的发展",
-		Embedding: SimpleEmbed("人工智能的发展"),
-	})
-	if err != nil || id1 == "" {
-		t.Fatalf("add record 1 failed: %v", err)
-	}
-
-	_, err = vs.Add(VectorRecord{
-		Content:   "完全无关的内容xyz",
-		Embedding: SimpleEmbed("完全无关的内容xyz"),
-	})
-	if err != nil {
-		t.Fatalf("add record 2 failed: %v", err)
-	}
-
-	if vs.Count() != 2 {
-		t.Errorf("count = %d, want 2", vs.Count())
-	}
-
-	results, err := vs.SearchByText("人工智能", 1)
-	if err != nil || len(results) != 1 {
-		t.Fatalf("search failed: %v, results=%d", err, len(results))
-	}
-	if results[0].Record.Content != "人工智能的发展" {
-		t.Errorf("top result = %s, want 人工智能的发展", results[0].Record.Content)
-	}
-}
-
 // 测试节点级重试：no-url 的 http_request 节点重试 2 次（delay 120ms）后整体失败
 func TestEngine_NodeRetry(t *testing.T) {
 	e := newTestEngine()
 
 	nodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "x"}},
-		{"id": "h1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"retry": 2, "retry_delay_ms": 120}},
+		{"id": "h1", "type": "test_fail", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"retry": 2, "retry_delay_ms": 120}},
 	})
 	edges := marshalEdges(t, []map[string]interface{}{
 		{"id": "e1", "source": "s1", "target": "h1"},
@@ -256,7 +245,7 @@ func TestEngine_Resume(t *testing.T) {
 	// 第一跑：中间 http_request 节点没有 url → 失败
 	badNodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "hello"}},
-		{"id": "m1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{}},
+		{"id": "m1", "type": "test_fail", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{}},
 		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
 	})
 	badEdges := marshalEdges(t, []map[string]interface{}{
@@ -275,13 +264,13 @@ func TestEngine_Resume(t *testing.T) {
 	// 第二跑：修复中间节点（换成 data_transform），从断点恢复
 	fixedNodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "hello"}},
-		{"id": "m1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"template": "fixed-output"}},
+		{"id": "m1", "type": "test_echo", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"value": "fixed-output"}},
 		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
 	})
 
 	prev := []model.NodeInstance{
 		{ID: "s1", Type: "start", Status: "success", Output: map[string]interface{}{"text": "hello"}},
-		{ID: "m1", Type: "http_request", Status: "failed"},
+		{ID: "m1", Type: "test_sleep", Status: "failed"},
 		{ID: "e1", Type: "end", Status: "pending"},
 	}
 
@@ -311,53 +300,6 @@ func TestEngine_Resume(t *testing.T) {
 	if persistCalls < 2 {
 		t.Errorf("persist called %d times, want >= 2 (initial + layers)", persistCalls)
 	}
-}
-
-// 测试子工作流：外层文本注入内层 start，内层 end 输出回传外层
-func TestEngine_SubWorkflow(t *testing.T) {
-	e := newTestEngine()
-
-	innerNodes := marshalNodes(t, []map[string]interface{}{
-		{"id": "in-s", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{}},
-		{"id": "in-e", "type": "end", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{}},
-	})
-	innerEdges := marshalEdges(t, []map[string]interface{}{
-		{"id": "ie1", "source": "in-s", "target": "in-e"},
-	})
-	e.SetResolver(func(id uint) ([]byte, []byte, error) {
-		if id == 77 {
-			return innerNodes, innerEdges, nil
-		}
-		return nil, nil, fmt.Errorf("workflow %d not found", id)
-	})
-
-	outerNodes := marshalNodes(t, []map[string]interface{}{
-		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "outer-text"}},
-		{"id": "sub1", "type": "sub_workflow", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"workflow_id": 77}},
-		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
-	})
-	outerEdges := marshalEdges(t, []map[string]interface{}{
-		{"id": "a", "source": "s1", "target": "sub1"},
-		{"id": "b", "source": "sub1", "target": "e1"},
-	})
-
-	states, err := e.Execute(outerNodes, outerEdges)
-	if err != nil {
-		t.Fatalf("sub workflow execution failed: %v", err)
-	}
-
-	for _, n := range states {
-		if n.ID == "e1" && n.Status == "success" {
-			if m, ok := n.Output.(map[string]interface{}); ok {
-				if m["text"] != "outer-text" {
-					t.Errorf("sub workflow output text = %v, want outer-text", m["text"])
-				}
-				return
-			}
-			t.Fatalf("end output is not a map: %v", n.Output)
-		}
-	}
-	t.Fatalf("outer end node did not succeed")
 }
 
 // 测试 LLM 流式：token 经 WS 广播、model 覆盖传导、最终输出完整
@@ -441,7 +383,7 @@ func loopInner(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 	nodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "in-s", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{}},
-		{"id": "in-t", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"template": "{{input}}+"}},
+		{"id": "in-t", "type": "test_append", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"suffix": "+"}},
 		{"id": "in-e", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
 	})
 	edges := marshalEdges(t, []map[string]interface{}{
@@ -586,43 +528,6 @@ func TestEngine_LoopMaxIterations(t *testing.T) {
 	}
 }
 
-// 模板引擎：{{input}} 与 JSON 字段路径替换（此前 replacePlaceholders 是空壳，模板等于摆设）
-func TestTransform_TemplatePlaceholders(t *testing.T) {
-	e := newTestEngine()
-
-	nodes := marshalNodes(t, []map[string]interface{}{
-		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": `{"name":"道门","nested":{"v":7}}`}},
-		{"id": "t1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"template": "项目={{name}} 版本={{nested.v}} 原文={{input}}"}},
-	})
-	edges := marshalEdges(t, []map[string]interface{}{
-		{"id": "a", "source": "s1", "target": "t1"},
-	})
-
-	states, err := e.Execute(nodes, edges)
-	if err != nil {
-		t.Fatalf("transform execute failed: %v", err)
-	}
-	for _, n := range states {
-		if n.ID == "t1" {
-			got := n.Output.(map[string]interface{})["text"]
-			want := `项目=道门 版本=7 原文={"name":"道门","nested":{"v":7}}`
-			if got != want {
-				t.Errorf("template render = %q, want %q", got, want)
-			}
-			return
-		}
-	}
-	t.Fatalf("transform node state missing")
-}
-
-// 纯文本输入时只替换 {{input}}，其它占位符保留原文
-func TestTransform_PlainInputKeepsUnknownPlaceholders(t *testing.T) {
-	got := replacePlaceholders("前缀-{{input}}-{{unknown}}", "纯文本")
-	if got != "前缀-纯文本-{{unknown}}" {
-		t.Errorf("render = %q", got)
-	}
-}
-
 // 分支汇合：if_else 命中 false 后，true 分支被裁剪、汇合节点仍必须执行
 // （此前的缺陷：被跳过的前驱不会递减前驱计数 → 汇合节点永远等不到 remaining==0）
 func TestEngine_BranchMerge(t *testing.T) {
@@ -631,9 +536,9 @@ func TestEngine_BranchMerge(t *testing.T) {
 	nodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "no-match"}},
 		{"id": "c1", "type": "if_else", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"condition_type": "contains", "compare_value": "HIT"}},
-		{"id": "t1", "type": "data_transform", "position": map[string]float64{"x": 2, "y": -1}, "data": map[string]interface{}{"template": "true-branch"}},
-		{"id": "f1", "type": "data_transform", "position": map[string]float64{"x": 2, "y": 1}, "data": map[string]interface{}{"template": "false-branch"}},
-		{"id": "m1", "type": "data_transform", "position": map[string]float64{"x": 3, "y": 0}, "data": map[string]interface{}{"template": "merged:{{input}}"}},
+		{"id": "t1", "type": "test_echo", "position": map[string]float64{"x": 2, "y": -1}, "data": map[string]interface{}{"value": "true-branch"}},
+		{"id": "f1", "type": "test_echo", "position": map[string]float64{"x": 2, "y": 1}, "data": map[string]interface{}{"value": "false-branch"}},
+		{"id": "m1", "type": "test_echo", "position": map[string]float64{"x": 3, "y": 0}, "data": map[string]interface{}{"value": "merged:{{input}}"}},
 		{"id": "e1", "type": "end", "position": map[string]float64{"x": 4, "y": 0}, "data": map[string]interface{}{}},
 	})
 	edges := marshalEdges(t, []map[string]interface{}{
@@ -666,27 +571,21 @@ func TestEngine_BranchMerge(t *testing.T) {
 
 // join=any：深分支不必等另一条链的后续层，汇合节点可与其并行
 func TestEngine_JoinAny(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(250 * time.Millisecond)
-		fmt.Fprint(w, "slow-done")
-	}))
-	defer srv.Close()
 
 	run := func(join string) (jStart time.Time, bEnd time.Time) {
 		e := newTestEngine()
-		e.http = NewHTTPService()
 
-		data := map[string]interface{}{"template": "{{input}}"}
+		data := map[string]interface{}{"value": "{{input}}"}
 		if join != "" {
 			data["join"] = join
 		}
 
 		nodes := marshalNodes(t, []map[string]interface{}{
 			{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
-			{"id": "x1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"template": "fast"}},
-			{"id": "a1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"template": "slow-seed"}},
-			{"id": "b1", "type": "http_request", "position": map[string]float64{"x": 2, "y": 1}, "data": map[string]interface{}{"method": "GET", "url": srv.URL}},
-			{"id": "j1", "type": "data_transform", "position": map[string]float64{"x": 3, "y": 0}, "data": data},
+			{"id": "x1", "type": "test_echo", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"value": "fast"}},
+			{"id": "a1", "type": "test_echo", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"value": "slow-seed"}},
+			{"id": "b1", "type": "test_sleep", "position": map[string]float64{"x": 2, "y": 1}, "data": map[string]interface{}{"ms": 250}},
+			{"id": "j1", "type": "test_echo", "position": map[string]float64{"x": 3, "y": 0}, "data": data},
 			{"id": "e1", "type": "end", "position": map[string]float64{"x": 4, "y": 0}, "data": map[string]interface{}{}},
 		})
 		edges := marshalEdges(t, []map[string]interface{}{
@@ -733,11 +632,10 @@ func TestEngine_JoinAny(t *testing.T) {
 // continue_on_error：节点失败不中断工作流，错误对象向下游传播
 func TestEngine_ContinueOnError(t *testing.T) {
 	e := newTestEngine()
-	e.http = NewHTTPService()
 
 	nodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "x"}},
-		{"id": "f1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"continue_on_error": true}},
+		{"id": "f1", "type": "test_fail", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"continue_on_error": true}},
 		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
 	})
 	edges := marshalEdges(t, []map[string]interface{}{
@@ -765,232 +663,6 @@ func TestEngine_ContinueOnError(t *testing.T) {
 	}
 	if m, ok := failOut.(map[string]interface{}); !ok || m["error"] == nil {
 		t.Errorf("failed node should propagate an error object downstream, got %v", failOut)
-	}
-}
-
-// 工具调用：模型要求 calc → 本地执行 → 结果回填 → 模型给出最终答案
-func TestEngine_ToolCalling(t *testing.T) {
-	var (
-		callCount   int
-		sawToolMsg  bool
-		sawToolSpec bool
-	)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Messages []struct {
-				Role       string `json:"role"`
-				Content    string `json:"content"`
-				ToolCallID string `json:"tool_call_id"`
-			} `json:"messages"`
-			Tools []map[string]interface{} `json:"tools"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		callCount++
-		if len(req.Tools) > 0 {
-			sawToolSpec = true
-		}
-		for _, m := range req.Messages {
-			if m.Role == "tool" && m.Content == "14" && m.ToolCallID == "call_1" {
-				sawToolMsg = true
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		if callCount == 1 {
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"",
-				"tool_calls":[{"id":"call_1","type":"function","function":{"name":"calc","arguments":"{\"expression\":\"(2+5)*2\"}"}}]}}]}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"计算结果是 14"},"finish_reason":"stop"}]}`))
-	}))
-	defer srv.Close()
-
-	e := newTestEngine()
-	e.llm = NewLLMService(srv.URL, "test-model")
-	e.http = NewHTTPService()
-
-	nodes := marshalNodes(t, []map[string]interface{}{
-		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "算一下 (2+5)*2"}},
-		{"id": "l1", "type": "llm", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"tools": []interface{}{"calc"}}},
-		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
-	})
-	edges := marshalEdges(t, []map[string]interface{}{
-		{"id": "a", "source": "s1", "target": "l1"},
-		{"id": "b", "source": "l1", "target": "e1"},
-	})
-
-	states, err := e.Execute(nodes, edges)
-	if err != nil {
-		t.Fatalf("tool calling execute failed: %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("model called %d times, want 2 (tool round + final answer)", callCount)
-	}
-	if !sawToolSpec {
-		t.Error("tools declaration was not sent to the model")
-	}
-	if !sawToolMsg {
-		t.Error("tool result was not fed back into the conversation")
-	}
-
-	for _, n := range states {
-		if n.ID != "l1" {
-			continue
-		}
-		m, ok := n.Output.(map[string]interface{})
-		if !ok {
-			t.Fatalf("llm output not a map: %v", n.Output)
-		}
-		if m["text"] != "计算结果是 14" {
-			t.Errorf("final text = %v", m["text"])
-		}
-		trace, _ := m["tool_calls"].([]map[string]interface{})
-		if trace == nil {
-			if raw, ok := m["tool_calls"].([]interface{}); ok {
-				if len(raw) != 1 {
-					t.Errorf("tool trace length = %d, want 1", len(raw))
-				}
-				return
-			}
-			t.Fatalf("tool_calls trace missing: %v", m)
-		}
-		if len(trace) != 1 || trace[0]["tool"] != "calc" {
-			t.Errorf("tool trace = %v", trace)
-		}
-	}
-}
-
-// calc 工具的四则运算求值器
-func TestTool_CalcExpression(t *testing.T) {
-	cases := map[string]float64{
-		"1+1":           2,
-		"(2+5)*2":       14,
-		"10/4":          2.5,
-		"-3+1":          -2,
-		"2*(3+(4-1))/3": 4,
-	}
-	for expr, want := range cases {
-		got, err := EvalExpression(expr)
-		if err != nil {
-			t.Errorf("eval %q failed: %v", expr, err)
-			continue
-		}
-		if got != want {
-			t.Errorf("eval %q = %v, want %v", expr, got, want)
-		}
-	}
-	if _, err := EvalExpression("1/0"); err == nil {
-		t.Error("division by zero should error")
-	}
-	if _, err := EvalExpression("1+"); err == nil {
-		t.Error("incomplete expression should error")
-	}
-}
-
-// 文本形态工具调用：模型不支持 tool_calls 字段，把调用写进 content（qwen2.5 的真实行为）
-func TestEngine_ToolCallingTextMode(t *testing.T) {
-	var callCount int
-	var sawToolResult bool
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		callCount++
-		for _, m := range req.Messages {
-			if m.Role == "user" && strings.Contains(m.Content, "工具 calc 的执行结果：\n14") {
-				sawToolResult = true
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		if callCount == 1 {
-			// 关键：tool_calls 缺失，调用被写进 content
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"{\"name\": \"calc\", \"arguments\": {\"expression\": \"(2+5)*2\"}}"},"finish_reason":"stop"}]}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"(2+5)*2 等于 14"},"finish_reason":"stop"}]}`))
-	}))
-	defer srv.Close()
-
-	e := newTestEngine()
-	e.llm = NewLLMService(srv.URL, "test-model")
-	e.http = NewHTTPService()
-
-	nodes := marshalNodes(t, []map[string]interface{}{
-		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "算一下 (2+5)*2"}},
-		{"id": "l1", "type": "llm", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"tools": []interface{}{"calc"}}},
-	})
-	edges := marshalEdges(t, []map[string]interface{}{
-		{"id": "a", "source": "s1", "target": "l1"},
-	})
-
-	states, err := e.Execute(nodes, edges)
-	if err != nil {
-		t.Fatalf("text-mode tool calling failed: %v", err)
-	}
-	if callCount != 2 {
-		t.Errorf("model called %d times, want 2", callCount)
-	}
-	if !sawToolResult {
-		t.Error("tool result was not fed back as a user message")
-	}
-
-	for _, n := range states {
-		if n.ID != "l1" {
-			continue
-		}
-		m := n.Output.(map[string]interface{})
-		if m["text"] != "(2+5)*2 等于 14" {
-			t.Errorf("final text = %v", m["text"])
-		}
-		raw, ok := m["tool_calls"].([]map[string]interface{})
-		if !ok || len(raw) != 1 {
-			t.Fatalf("tool trace = %v (type %T)", m["tool_calls"], m["tool_calls"])
-		}
-		rec := raw[0]
-		if rec["mode"] != "text" {
-			t.Errorf("trace mode = %v, want text", rec["mode"])
-		}
-		if rec["result"] != "14" {
-			t.Errorf("tool result = %v, want 14", rec["result"])
-		}
-	}
-}
-
-// 文本调用解析：多种书写形态都要识别，未知工具必须忽略
-func TestParseTextToolCalls(t *testing.T) {
-	specs := []ToolSpec{}
-	e := NewToolExecutor(nil, nil)
-	specs = e.Specs([]string{"calc", "now"})
-
-	cases := []struct {
-		content string
-		want    string
-	}{
-		{`{"name":"calc","arguments":{"expression":"1+1"}}`, "calc"},
-		{"我来计算：\n```json\n{\"name\": \"calc\", \"arguments\": {\"expression\": \"1+1\"}}\n```", "calc"},
-		{`好的 {"tool":"now","parameters":{}} 马上`, "now"},
-		{`{"function":{"name":"calc"},"arguments":{"expression":"2*3"}}`, "calc"},
-		{`{"name":"unknown_tool","arguments":{}}`, ""},
-		{`这只是一段普通回答`, ""},
-	}
-	for _, c := range cases {
-		got := parseTextToolCalls(c.content, specs)
-		if c.want == "" {
-			if len(got) != 0 {
-				t.Errorf("content %q should not parse, got %v", c.content, got)
-			}
-			continue
-		}
-		if len(got) != 1 || got[0].Function.Name != c.want {
-			t.Errorf("content %q parsed %v, want %s", c.content, got, c.want)
-		}
 	}
 }
 
@@ -1042,9 +714,9 @@ func TestEngine_VariablesAcrossBranches(t *testing.T) {
 
 	nodes := marshalNodes(t, []map[string]interface{}{
 		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
-		{"id": "t1", "type": "data_transform", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"template": "A"}},
-		{"id": "t2", "type": "data_transform", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"template": "B"}},
-		{"id": "m1", "type": "data_transform", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{"template": "{{t1.text}}-{{t2.text}}"}},
+		{"id": "t1", "type": "test_echo", "position": map[string]float64{"x": 1, "y": -1}, "data": map[string]interface{}{"value": "A"}},
+		{"id": "t2", "type": "test_echo", "position": map[string]float64{"x": 1, "y": 1}, "data": map[string]interface{}{"value": "B"}},
+		{"id": "m1", "type": "test_echo", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{"value": "{{t1.text}}-{{t2.text}}"}},
 		{"id": "e1", "type": "end", "position": map[string]float64{"x": 3, "y": 0}, "data": map[string]interface{}{}},
 	})
 	edges := marshalEdges(t, []map[string]interface{}{
@@ -1069,85 +741,4 @@ func TestEngine_VariablesAcrossBranches(t *testing.T) {
 		}
 	}
 	t.Fatal("merge node state missing")
-}
-
-// 节点缓存：相同配置 + 输入的第二次执行不应再打外部请求
-func TestEngine_NodeCache(t *testing.T) {
-	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		fmt.Fprint(w, "cached-body")
-	}))
-	defer srv.Close()
-
-	e := newTestEngine()
-	e.http = NewHTTPService()
-	cache := NewNodeCache(10)
-	e.SetCache(cache)
-
-	nodes := marshalNodes(t, []map[string]interface{}{
-		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
-		{"id": "h1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"method": "GET", "url": srv.URL, "cache": true}},
-		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
-	})
-	edges := marshalEdges(t, []map[string]interface{}{
-		{"id": "a", "source": "s1", "target": "h1"},
-		{"id": "b", "source": "h1", "target": "e1"},
-	})
-
-	states1, err := e.Execute(nodes, edges)
-	if err != nil {
-		t.Fatalf("first run failed: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("external calls after first run = %d, want 1", calls)
-	}
-
-	states2, err := e.Execute(nodes, edges)
-	if err != nil {
-		t.Fatalf("second run failed: %v", err)
-	}
-	if calls != 1 {
-		t.Errorf("cache miss: external calls = %d after second run, want 1", calls)
-	}
-
-	// 两次输出必须一致，说明命中后复用的是同一结果
-	var out1, out2 interface{}
-	for _, n := range states1 {
-		if n.ID == "h1" {
-			out1 = n.Output
-		}
-	}
-	for _, n := range states2 {
-		if n.ID == "h1" {
-			out2 = n.Output
-		}
-	}
-	if fmt.Sprintf("%v", out1) != fmt.Sprintf("%v", out2) {
-		t.Errorf("cached output differs: %v vs %v", out1, out2)
-	}
-
-	stats := cache.Stats()
-	if stats["hits"].(int) != 1 {
-		t.Errorf("cache hits = %v, want 1", stats["hits"])
-	}
-
-	// 没声明 cache 的节点不应被缓存
-	e2 := newTestEngine()
-	e2.http = NewHTTPService()
-	e2.SetCache(NewNodeCache(10))
-	before := calls
-	nodesNoCache := marshalNodes(t, []map[string]interface{}{
-		{"id": "s1", "type": "start", "position": map[string]float64{"x": 0, "y": 0}, "data": map[string]interface{}{"prompt": "seed"}},
-		{"id": "h1", "type": "http_request", "position": map[string]float64{"x": 1, "y": 0}, "data": map[string]interface{}{"method": "GET", "url": srv.URL}},
-		{"id": "e1", "type": "end", "position": map[string]float64{"x": 2, "y": 0}, "data": map[string]interface{}{}},
-	})
-	for i := 0; i < 2; i++ {
-		if _, err := e2.Execute(nodesNoCache, edges); err != nil {
-			t.Fatalf("no-cache run %d failed: %v", i+1, err)
-		}
-	}
-	if calls-before != 2 {
-		t.Errorf("node without cache flag made %d calls, want 2", calls-before)
-	}
 }

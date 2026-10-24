@@ -26,20 +26,17 @@ export const PALETTE: PaletteSection[] = [
       { type: 'end', label: '结束', icon: '■', tone: 'tone-control' },
       { type: 'if_else', label: '条件分支', icon: '⑂', tone: 'tone-warn' },
       { type: 'loop', label: '循环', icon: '⟳', tone: 'tone-warn' },
-      { type: 'sub_workflow', label: '子工作流', icon: '⧉', tone: 'tone-purple' },
-    ],
+  { type: 'quality_loop', label: '质量循环', icon: '↻', tone: 'tone-warn' },
+          ],
   },
   {
     label: 'AI 推理',
     items: [
       { type: 'llm', label: '大语言模型', icon: '✦', tone: 'tone-ai' },
-      { type: 'agent_task', label: '外部智能体', icon: '⇢', tone: 'tone-purple' },
-      // 外部 MCP 服务器的一个工具。选中后在右侧属性面板挑服务器与工具，
+            // 外部 MCP 服务器的一个工具。选中后在右侧属性面板挑服务器与工具，
       // 服务器清单来自工具台（自动扫 WorkBuddy / Cursor / Claude 等本机配置）。
-      { type: 'mcp_call', label: 'MCP 工具', icon: '⚒', tone: 'tone-purple' },
-      { type: 'text2image', label: '文生图', icon: '◈', tone: 'tone-ai' },
-      { type: 'rag_query', label: '知识库检索', icon: '⌕', tone: 'tone-ai' },
-    ],
+            { type: 'text2image', label: '文生图', icon: '◈', tone: 'tone-ai' },
+          ],
   },
   {
     label: '视频',
@@ -84,15 +81,10 @@ export const PALETTE: PaletteSection[] = [
   {
     label: '数据处理',
     items: [
-      { type: 'http_request', label: 'HTTP 请求', icon: '⇄', tone: 'tone-data' },
-      { type: 'code', label: '代码执行', icon: '{ }', tone: 'tone-data' },
-      // 本地命令：跑测试 / 构建 / 校验脚本。agent_task 的对偶——agent 改，它验。
-      { type: 'command', label: '本地命令', icon: '$_', tone: 'tone-data' },
-      { type: 'data_transform', label: '数据转换', icon: '⇋', tone: 'tone-muted' },
-      // 文本拆分：长文案按句/段/固定段数/字数切开。以前没有它，模型会编一个 split_text
+                  // 本地命令：跑测试 / 构建 / 校验脚本。agent_task 的对偶——agent 改，它验。
+                  // 文本拆分：长文案按句/段/固定段数/字数切开。以前没有它，模型会编一个 split_text
       { type: 'text_split', label: '文本拆分', icon: '⋮⋮', tone: 'tone-data' },
-      { type: 'aggregate', label: '变量聚合', icon: '⋃', tone: 'tone-muted' },
-      { type: 'quality_gate', label: '质检门', icon: '✓', tone: 'tone-warn' },
+            { type: 'quality_gate', label: '质检门', icon: '✓', tone: 'tone-warn' },
       // 一致性门：跨镜头接缝 / 场景漂移的数值门（另一个会话新增，这里补上入口，否则测试点不到）
       { type: 'consistency_gate', label: '一致性门', icon: '≋', tone: 'tone-warn' },
     ],
@@ -111,9 +103,9 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   // 四个端口互斥：实际只有 kind 对应的那一个键有值（其余不出现）
   input_source: ['kind', 'text', 'image', 'audio', 'video', 'path', 'bytes', 'source'],
   text_split: ['text', 'parts', 'count', 'chars', 'mode', 'merged_overflow'],
-  http_request: ['text', 'status_code'],
   if_else: ['text', 'branch'],
   loop: ['text', 'all', 'iterations', 'stopped_by'],
+  quality_loop: ['text', 'gate', 'score', 'rounds', 'best_round', 'path', 'checks', 'report', 'image', 'video', 'audio'],
   text2image: [
     'image', 'images', 'count', 'prompts', 'translated', 'translate_error',
     'scene_lock', 'scene_lock_injected', // P2 跨镜头一致性
@@ -121,10 +113,6 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   video_compose: ['video'],
   tts: ['audio', 'backend'],
   asr: ['text', 'model'],
-  rag_query: ['text', 'context', 'sources', 'hits'],
-  code: ['text', 'code_out'],
-  command: ['text', 'status_code', 'exit_code', 'stderr', 'elapsed_ms', 'truncated'],
-  aggregate: ['text', 'count', 'values', 'nodes', 'aggregate'],
   vision: ['text', 'model', 'images', 'tokens', 'reference'],
   select: ['image', 'score', 'passed', 'threshold', 'picked', 'candidates', 'note'],
   prompt_opt: ['text', 'original', 'mode', 'scene_lock'],
@@ -141,8 +129,6 @@ export const NODE_OUTPUT_FIELDS: Record<string, string[]> = {
   ],
   quality_gate: ['gate', 'checks', 'path', 'kind', 'width', 'height', 'frames', 'seconds', 'text'],
   consistency_gate: ['gate', 'segments', 'seams', 'drifts', 'anchors', 'worst', 'checks', 'thresholds', 'order', 'failures', 'text'],
-  agent_task: ['text', 'info', 'agent', 'agent_kind', 'exit_code', 'elapsed_ms', 'nondeterministic'],
-  mcp_call: ['text', 'json', 'is_error', 'server', 'tool', 'elapsed_ms'],
   subtitles: ['video', 'srt', 'lines', 'source'],
   post_production: ['video', 'aspect', 'width', 'height', 'bgm', 'duck', 'srt', 'lines', 'source'],
   comfy_workflow: ['files', 'count', 'image', 'images', 'video', 'videos', 'bindings_used'],
@@ -160,7 +146,6 @@ export const NODE_REQUIRES: Record<string, string> = {
   storyboard: 'llm', // 分镜规划：纯 LLM
   prompt_opt: 'llm', // 提示词优化：纯 LLM
   scene_grid: 'llm', // 场景九宫格：手填不花 LLM，从想法拆格才要
-  rag_query: 'llm', // 检索需要 Ollama 做 embedding
   text2image: 'image',
   image2image: 'image',
   inpaint: 'image',
@@ -176,6 +161,7 @@ export const NODE_REQUIRES: Record<string, string> = {
   consistency_gate: 'video', // 一致性门要抽帧，同样依赖 ffmpeg/ffprobe
   subtitles: 'video', // 烧字幕只需要 ffmpeg（带 libass）
   post_production: 'video', // 竖屏/BGM/字幕都走 ffmpeg
+  quality_loop: 'comfy', // 质量循环跑的是生成工作流
 }
 
 // 能力键 → 人话（标灰时的提示文案，避免把 'image' / 'comfy' 这种键名直接甩给用户）

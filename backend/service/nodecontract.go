@@ -175,7 +175,7 @@ var Modules = map[string]ModuleContract{
 	// 需要"按语义分幕"就先接一个 llm 节点改写文本，再来这里机械切分。
 	"text_split": {
 		Type: "text_split", Title: "文本拆分", Role: RoleTransform,
-		Inputs:  []Port{{"text", PortText, true, "待拆分的文本（参数留空时取上游）"}},
+		Inputs: []Port{{"text", PortText, true, "待拆分的文本（参数留空时取上游）"}},
 		Outputs: []Port{
 			{"text", PortText, true, "按分隔符拼回全文（下游可整体消费）"},
 			{"parts", PortJSON, true, "分段数组（纯文本，可直接给 loop 的 items）"},
@@ -239,66 +239,7 @@ var Modules = map[string]ModuleContract{
 			"要「逐段处理」请用 text_split 的 parts 接下游，或在节点数上限内顺序展开。",
 	},
 
-	"sub_workflow": {
-		Type: "sub_workflow", Title: "子工作流", Role: RoleControl,
-		Inputs:  []Port{{"any", PortAny, false, "传给子工作流的 vars"}},
-		Outputs: []Port{{"any", PortAny, true, "子工作流的最终输出"}},
-		KeyParams: []KeyParam{
-			{Key: "workflow_id", Label: "引用的工作流 id"},
-			{Key: "workflow_name", Label: "引用的工作流名"},
-		},
-		Agent: "把另一条已保存的工作流当模块调用。当前是黑盒引用：内部节点不出现在本任务书里，需要单独取它的 spec。",
-	},
-
 	// ---------------- 数据 / 检索 ----------------
-
-	"http_request": {
-		Type: "http_request", Title: "HTTP 请求", Role: RoleTransform,
-		Inputs:  []Port{{"text", PortText, false, "请求体文本（也可用 body 参数）"}},
-		Outputs: []Port{{"text", PortText, true, "响应文本"}, {"json", PortJSON, true, "响应 JSON"}, {"status_code", PortJSON, true, "状态码"}},
-		KeyParams: []KeyParam{
-			{Key: "method", Label: "方法", Options: []string{"GET", "POST", "PUT", "DELETE"}},
-			{Key: "url", Label: "地址"},
-			{Key: "credential", Label: "凭据名"},
-			{Key: "body", Label: "请求体"},
-		},
-		Agent: "调外部服务。离线优先的定位下只用于本机服务或内网接口，不要指望它替代 SaaS 连接器。",
-	},
-
-	"data_transform": {
-		Type: "data_transform", Title: "数据转换", Role: RoleTransform,
-		Inputs:  []Port{{"text", PortText, true, "待转换文本"}},
-		Outputs: []Port{{"text", PortText, true, "转换结果"}},
-		KeyParams: []KeyParam{
-			{Key: "mode", Label: "转换方式"},
-		},
-		Agent: "纯文本变换（截断/替换/格式化），不调模型、不吃显存。能用它解决的不要动 LLM。",
-	},
-
-	"rag_query": {
-		Type: "rag_query", Title: "知识库检索", Role: RoleTransform,
-		Inputs:  []Port{{"text", PortText, true, "查询语句"}},
-		Outputs: []Port{{"text", PortText, true, "拼接后的上下文"}, {"json", PortJSON, true, "命中片段与来源"}, {"hits", PortJSON, true, "命中数"}},
-		KeyParams: []KeyParam{
-			{Key: "query", Label: "查询（留空用上游文本）"},
-			{Key: "top_k", Label: "召回条数"},
-		},
-		Agent: "从本地知识库捞片段拼进上下文。它只负责「找材料」，不负责「写答案」。",
-	},
-
-	"aggregate": {
-		Type: "aggregate", Title: "变量聚合", Role: RoleTransform,
-		Inputs:  []Port{{"any", PortAny, true, "任意数量的上游产物"}},
-		Outputs: []Port{{"text", PortText, true, "拼接后的文本"}, {"json", PortJSON, true, "原始数组"}, {"count", PortJSON, true, "聚合条数"}},
-		KeyParams: []KeyParam{
-			{Key: "mode", Label: "聚合方式"},
-			{Key: "field", Label: "取哪个字段"},
-			{Key: "inputs", Label: "显式指定的输入"},
-			{Key: "separator", Label: "拼接分隔符"},
-			{Key: "include_empty", Label: "包含空值"},
-		},
-		Agent: "把多条并发分支收成一段。它是「并行跑完再合流」的标准做法，不要用循环硬凑。",
-	},
 
 	// ---------------- 语言侧（端口全是 text，与模态无关） ----------------
 
@@ -591,53 +532,7 @@ var Modules = map[string]ModuleContract{
 
 	// ---------------- 外部智能体 ----------------
 
-	"agent_task": {
-		Type: "agent_task", Title: "外部智能体", Role: RoleTransform,
-		Nondeterministic: true,
-		Inputs:           []Port{{"text", PortText, false, "任务描述（节点没写 prompt 时用它）"}},
-		Outputs: []Port{
-			{"text", PortText, true, "智能体的产出"},
-			{"info", PortJSON, true, "agent id / 退出码 / 耗时 / 是否截断"},
-		},
-		KeyParams: []KeyParam{
-			{Key: "agent_id", Label: "智能体", Help: "来自 data/agents.json 的名册；节点只能选 id，命令行只存在本机文件里"},
-			{Key: "prompt", Label: "任务描述", Help: "留空则用上游文本。CLI 会以参数或 stdin 传入"},
-			{Key: "skill_refs", Label: "技能包参考", Help: "逗号分隔的包名（如 ue5-ops,kaggle-ml-ops）。执行前把 SKILL.md 与参考文献的**路径**写进任务描述，让智能体自己去读——不复制内容，所以不会出现两份说法"},
-			{Key: "timeout_ms", Label: "超时", Unit: "ms"},
-			{Key: "workdir", Label: "工作目录", Help: "留空则每次执行用独立临时目录，避免并发互相覆盖文件"},
-			{Key: "allow_failure", Label: "失败也往下传", Help: "打开后非零退出不阻断，但 info.exit_code 会如实记录"},
-		},
-		Agent: "把需要判断的活儿（写文案/改代码/查资料/审片意见）交给外部智能体。" +
-			"**不承诺可复现**：同一输入两次结果可能不同，评测时须单独分组。" +
-			"出图/转写/合成/验收不要用它 —— 那些有确定性模块，更便宜也更稳。",
-	},
-
 	// ---------------- 外部工具（MCP） ----------------
-
-	// mcp_call：把外部 MCP 服务器的一个工具当成节点。
-	//
-	// 为什么也标非确定性：工具结果由外部系统决定（网页今天长什么样、库里有什么行），
-	// 同输入不同产出是常态，不该被评测当成可复现模块做配对比较。
-	"mcp_call": {
-		Type: "mcp_call", Title: "MCP 工具", Role: RoleTransform,
-		Nondeterministic: true,
-		Inputs:           []Port{{"text", PortText, false, "上游文本（args 里用 {{text}} 引用）"}},
-		Outputs: []Port{
-			{"text", PortText, true, "工具返回的文本（多个 content 文本块拼成一段）"},
-			{"json", PortJSON, false, "工具的原始返回值"},
-			{"info", PortJSON, true, "服务器 / 工具名 / is_error / 耗时"},
-		},
-		KeyParams: []KeyParam{
-			{Key: "server", Label: "MCP 服务器", Help: "来自工具台扫描到的 mcp.json（引擎自有 + WorkBuddy/Cursor/Claude 等本机配置）"},
-			{Key: "tool", Label: "工具", Help: "该服务器 tools/list 里的 name；在工具台展开服务器能看到全部工具与入参 schema"},
-			{Key: "args", Label: "参数 JSON", Help: "对象形式的 arguments。可写 {{text}} 占位替换上游文本；留空则把上游文本包成 {\"text\": \"…\"}"},
-			{Key: "timeout_ms", Label: "超时", Unit: "ms", Help: "默认 180 秒，上限 30 分钟"},
-			{Key: "allow_failure", Label: "失败也往下传", Help: "打开后 is_error 不阻断，但 info.is_error 如实记录"},
-		},
-		Agent: "外部 MCP 服务器提供的工具（浏览器抓取、数据库查询、平台 API…）。" +
-			"先在「工具台」确认服务器能通、工具名对得上，再写进图里。" +
-			"**不承诺可复现**：外部世界会变，评测时单独分组。",
-	},
 
 	// ---------------- 门 ----------------
 
@@ -686,29 +581,6 @@ var Modules = map[string]ModuleContract{
 
 	// ---------------- 代码 ----------------
 
-	"code": {
-		Type: "code", Title: "代码执行", Role: RoleTransform,
-		Inputs:  []Port{{"text", PortText, false, "输入文本"}, {"json", PortJSON, false, "输入数据"}},
-		Outputs: []Port{{"text", PortText, true, "标准输出"}, {"code_out", PortJSON, true, "结构化结果"}},
-		KeyParams: []KeyParam{
-			{Key: "code", Label: "代码"},
-			{Key: "timeout_ms", Label: "超时", Unit: "ms"},
-		},
-		Agent: "在本机跑脚本。它是「任意逻辑」的逃生口——但跑不进任务书的门，出了错也不会自动重试。",
-	},
-	"command": {
-		Type: "command", Title: "本地命令", Role: RoleTransform,
-		Inputs:  []Port{{"text", PortText, false, "作为 {{input}} 注入参数的上游文本"}},
-		Outputs: []Port{{"text", PortText, true, "标准输出"}, {"json", PortJSON, true, "退出码 / stderr / 耗时"}, {"status_code", PortJSON, true, "退出码（0 = 成功）"}},
-		KeyParams: []KeyParam{
-			{Key: "command", Label: "命令", Help: "可执行文件名或绝对路径；不经 shell，argv 逐个传参"},
-			{Key: "args", Label: "参数", Help: "JSON 数组优先，否则按空格分隔；支持 {{input}} 占位"},
-			{Key: "workdir", Label: "工作目录"},
-			{Key: "timeout_ms", Label: "超时", Unit: "ms"},
-			{Key: "fail_on_nonzero", Label: "非零退出即失败", Help: "关掉后非零退出仍往下传，但 exit_code 如实记录"},
-		},
-		Agent: "agent_task 的确定性对偶：把需要判断的活儿交给智能体（不可复现），把验收交给本地命令（必然可复现）。跑测试、跑构建、调校验脚本用它，不要用 agent 代跑——那会把确定性结论变成一次抽卡。",
-	},
 }
 
 // ModuleContractOf 查契约。未登记时返回一个**显式标记为未声明**的兜底契约，

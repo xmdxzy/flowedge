@@ -156,58 +156,6 @@ func TestModulesEndpointMatchesContract(t *testing.T) {
 	}
 }
 
-// 工作流卡指向不存在的工作流 / 指向自己：保存时就该拦。
-// 否则要到运行到那一节点才炸，而且是"跑了一半才炸"。
-func TestCreateRejectsBadWorkflowBinding(t *testing.T) {
-	r, db := specHandlerFixture(t)
-
-	body := func(bidnings string) string {
-		return `{"name":"坏卡","nodes":[{"id":"n","type":"llm","data":{"prompt":"x","bindings":` + bidnings + `}}],"edges":[]}`
-	}
-	r.POST("/api/workflows", NewWorkflowHandler(db, nil, nil).Create)
-
-	cases := []struct {
-		name string
-		json string
-		code string
-	}{
-		{"missing", body(`[{"kind":"workflow","id":"99999","stage":"replace"}]`), "binding_missing_workflow"},
-		{"bad id", body(`[{"kind":"workflow","id":"abc","stage":"replace"}]`), "binding_invalid"},
-		{"two body", body(`[{"kind":"agent","id":"prompt-engineer","stage":"body"},{"kind":"agent","id":"art-critic","stage":"body"}]`), "binding_invalid"},
-	}
-	for _, c := range cases {
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/api/workflows", strings.NewReader(c.json))
-		req.Header.Set("Content-Type", "application/json")
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("%s: 期望 400，实际 %d：%s", c.name, w.Code, w.Body.String())
-			continue
-		}
-		if !strings.Contains(w.Body.String(), c.code) {
-			t.Errorf("%s: 错误码应为 %s，实际 %s", c.name, c.code, w.Body.String())
-		}
-	}
-}
-
-// 子工作流节点再贴工作流卡 = 两套 workflow_id 打架：卡会覆盖节点自带的那条，
-// 用户以为是"再套一层"，实际是"换掉"。保存时拒掉。
-func TestRejectsWorkflowCardOnSubWorkflowNode(t *testing.T) {
-	r, db := specHandlerFixture(t)
-	r.POST("/api/workflows", NewWorkflowHandler(db, nil, nil).Create)
-
-	body := `{"name":"冲突","nodes":[{"id":"sub","type":"sub_workflow","data":{"workflow_id":1,
-		"bindings":[{"kind":"workflow","id":"1","stage":"replace"}]}}],"edges":[]}`
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/workflows", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "binding_conflict") {
-		t.Fatalf("应拒掉子工作流节点贴工作流卡，实际 %d：%s", w.Code, w.Body.String())
-	}
-}
-
 // 运行时要记录「谁在调」，并在与开始节点声明的入口不一致时给出提示（不阻断）。
 func TestRunRecordsInvokerAndWarnsMismatch(t *testing.T) {
 	r, db := specHandlerFixture(t)

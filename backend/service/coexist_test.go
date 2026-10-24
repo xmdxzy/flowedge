@@ -72,7 +72,7 @@ func coexistEngine(t *testing.T, comfy *mockComfy, ollamaURL, model string) *Eng
 	return NewEngineV2(
 		NewLLMService(ollamaURL, model),
 		NewText2ImageService(comfy.srv.URL, "flux1-schnell-fp8.safetensors"),
-		nil, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
 	)
 }
 
@@ -121,7 +121,7 @@ func TestCanCoexist_UnreachableComfyIsConservative(t *testing.T) {
 	e := NewEngineV2(
 		NewLLMService(ollama.URL, "qwen2.5vl:7b"),
 		NewText2ImageService(url, "ckpt"),
-		nil, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
 	)
 	if e.canCoexistWithLanguage("qwen2.5vl:7b") {
 		t.Fatal("查不到 ComfyUI 显存时必须保守判为不可共存")

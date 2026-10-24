@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 
-import { fetchProfiles, saveProfiles, type LLMProfile } from '../lib/cards'
+import { fetchProfiles, saveProfiles, type LLMProfile } from '../lib/llmProfiles'
 
 // 自定义模型端点编辑器（配置 · 模型 里的一块）。
 //

@@ -1,4 +1,4 @@
-// 预置工作流模板
+﻿// 预置工作流模板
 export interface WorkflowTemplate {
   id: string
   name: string
@@ -9,6 +9,34 @@ export interface WorkflowTemplate {
 }
 
 export const workflowTemplates: WorkflowTemplate[] = [
+  {
+    id: 'quality-loop',
+    name: '质量循环出片',
+    description: '跑一条生成工作流，不过门就按修复建议改参数重跑，最多 N 轮，取最好的一轮',
+    category: '质量控制',
+    nodes: [
+      { id: 'start-1', type: 'start', position: { x: 40, y: 200 }, data: { prompt: '一座悬浮在云海之上的中式楼阁，黄昏，电影感' } },
+      {
+        id: 'ql-1',
+        type: 'quality_loop',
+        position: { x: 320, y: 200 },
+        data: {
+          workflow_id: 0,
+          max_rounds: 3,
+          target_score: 100,
+          repair: 'auto',
+          min_frames: 96,
+          min_width: 720,
+          require_audio: true,
+        },
+      },
+      { id: 'end-1', type: 'end', position: { x: 620, y: 200 }, data: {} },
+    ],
+    edges: [
+      { id: 'e1-2', source: 'start-1', target: 'ql-1' },
+      { id: 'e2-3', source: 'ql-1', target: 'end-1' },
+    ],
+  },
   {
     id: 'text-summarize',
     name: '文本总结',
@@ -118,43 +146,6 @@ export const workflowTemplates: WorkflowTemplate[] = [
     ],
   },
   {
-    id: 'rag-qa',
-    name: 'RAG 知识库问答',
-    description: '基于知识库检索后回答问题',
-    category: 'AI 应用',
-    nodes: [
-      {
-        id: 'start-1',
-        type: 'start',
-        position: { x: 50, y: 200 },
-        data: { prompt: '请介绍一下 FlowEdge 的核心功能' },
-      },
-      {
-        id: 'rag-1',
-        type: 'rag_query',
-        position: { x: 320, y: 200 },
-        data: { query: '' },
-      },
-      {
-        id: 'llm-1',
-        type: 'llm',
-        position: { x: 600, y: 200 },
-        data: { model: 'qwen2.5-coder:32b', prompt: '仅根据以下参考资料回答问题；资料不足时明确说明，不要编造：' },
-      },
-      {
-        id: 'end-1',
-        type: 'end',
-        position: { x: 880, y: 200 },
-        data: {},
-      },
-    ],
-    edges: [
-      { id: 'e1-2', source: 'start-1', target: 'rag-1' },
-      { id: 'e2-3', source: 'rag-1', target: 'llm-1' },
-      { id: 'e3-4', source: 'llm-1', target: 'end-1' },
-    ],
-  },
-  {
     id: 'video-pipeline',
     name: '短视频生成流水线',
     description: '文案→分镜→生图→配音→合成视频',
@@ -204,48 +195,6 @@ export const workflowTemplates: WorkflowTemplate[] = [
       { id: 'e3a-4', source: 't2i-1', target: 'video-1' },
       { id: 'e3b-4', source: 'tts-1', target: 'video-1' },
       { id: 'e4-5', source: 'video-1', target: 'end-1' },
-    ],
-  },
-  {
-    id: 'http-api-chain',
-    name: 'API 链式调用',
-    description: 'HTTP 请求→数据处理→AI 分析',
-    category: '数据处理',
-    nodes: [
-      {
-        id: 'start-1',
-        type: 'start',
-        position: { x: 50, y: 200 },
-        data: { prompt: '' },
-      },
-      {
-        id: 'http-1',
-        type: 'http_request',
-        position: { x: 300, y: 200 },
-        data: {
-          method: 'GET',
-          url: 'https://api.example.com/data',
-          headers: { 'Content-Type': 'application/json' },
-          body: '',
-        },
-      },
-      {
-        id: 'llm-1',
-        type: 'llm',
-        position: { x: 580, y: 200 },
-        data: { model: 'qwen2.5-coder:32b', prompt: '分析以下API返回的数据，总结关键信息：' },
-      },
-      {
-        id: 'end-1',
-        type: 'end',
-        position: { x: 860, y: 200 },
-        data: {},
-      },
-    ],
-    edges: [
-      { id: 'e1-2', source: 'start-1', target: 'http-1' },
-      { id: 'e2-3', source: 'http-1', target: 'llm-1' },
-      { id: 'e3-4', source: 'llm-1', target: 'end-1' },
     ],
   },
   {
@@ -433,44 +382,6 @@ export const workflowTemplates: WorkflowTemplate[] = [
     ],
   },
   {
-    id: 'storyboard-video',
-    name: '分镜成片（全链路）',
-    description: 'LLM 拆分镜 → 两路文生图 → 变量聚合 → 语音合成 → 视频合成',
-    category: '多模态',
-    nodes: [
-      { id: 'start-1', type: 'start', position: { x: 40, y: 220 }, data: { prompt: '一座悬浮在云海之上的中式楼阁，黄昏，电影感' } },
-      {
-        id: 'llm-1',
-        type: 'llm',
-        position: { x: 280, y: 220 },
-        data: { model: '', prompt: '把主题拆成两个镜头描述，每行一个，不要编号，不要解释：' },
-      },
-      {
-        id: 'agg-1',
-        type: 'aggregate',
-        position: { x: 560, y: 60 },
-        data: { mode: 'list', field: 'text', inputs: '', separator: '\n' },
-      },
-      { id: 't2i-1', type: 'text2image', position: { x: 560, y: 200 }, data: { prompt: '', width: 1024, height: 1024 } },
-      { id: 't2i-2', type: 'text2image', position: { x: 560, y: 350 }, data: { prompt: '', width: 1024, height: 1024 } },
-      { id: 'tts-1', type: 'tts', position: { x: 560, y: 500 }, data: { text: '', voice: '', rate: -1 } },
-      { id: 'video-1', type: 'video_compose', position: { x: 850, y: 260 }, data: { image_duration: 3 } },
-      { id: 'end-1', type: 'end', position: { x: 1120, y: 260 }, data: {} },
-    ],
-    edges: [
-      { id: 'e1', source: 'start-1', target: 'llm-1' },
-      { id: 'e2', source: 'llm-1', target: 't2i-1' },
-      { id: 'e3', source: 'llm-1', target: 't2i-2' },
-      { id: 'e4', source: 'llm-1', target: 'tts-1' },
-      { id: 'e5', source: 't2i-1', target: 'agg-1' },
-      { id: 'e6', source: 't2i-2', target: 'agg-1' },
-      { id: 'e7', source: 't2i-1', target: 'video-1' },
-      { id: 'e8', source: 't2i-2', target: 'video-1' },
-      { id: 'e9', source: 'tts-1', target: 'video-1' },
-      { id: 'e10', source: 'video-1', target: 'end-1' },
-    ],
-  },
-  {
     id: 'transcribe-summarize',
     name: '录音转纪要',
     description: '语音转写 → LLM 整理成结构化纪要（需要 ASR 服务就绪）',
@@ -519,50 +430,6 @@ export const workflowTemplates: WorkflowTemplate[] = [
       { id: 'e1', source: 'start-1', target: 't2i-1' },
       { id: 'e2', source: 't2i-1', target: 'vision-1' },
       { id: 'e3', source: 'vision-1', target: 'end-1' },
-    ],
-  },
-  {
-    id: 'image-qc-batch',
-    name: '批量出图质检（三图对比）',
-    description: '同一主题出三张 → 变量聚合 → 一次 VLM 调用横向评比，挑出可用的一张',
-    category: '质检',
-    nodes: [
-      {
-        id: 'start-1',
-        type: 'start',
-        position: { x: 40, y: 260 },
-        data: { prompt: 'a lone white deer on a snowy mountain peak, chinese ink painting' },
-      },
-      { id: 't2i-1', type: 'text2image', position: { x: 320, y: 120 }, data: { prompt: '', width: 768, height: 768 } },
-      { id: 't2i-2', type: 'text2image', position: { x: 320, y: 300 }, data: { prompt: 'cinematic photo, soft dawn light, 85mm lens', width: 768, height: 768 } },
-      { id: 't2i-3', type: 'text2image', position: { x: 320, y: 480 }, data: { prompt: 'minimalist poster, large negative space, muted tones', width: 768, height: 768 } },
-      {
-        id: 'agg-1',
-        type: 'aggregate',
-        position: { x: 620, y: 300 },
-        data: { mode: 'list', field: 'image', inputs: '', separator: '\n', include_empty: false },
-      },
-      {
-        id: 'vision-1',
-        type: 'vision',
-        position: { x: 880, y: 300 },
-        data: {
-          prompt: '下面三张是同一主题的三种风格尝试（水墨 / 摄影 / 极简海报）。请逐张点评：画面实际内容、构图是否成立、有无文字水印、有无明显瑕疵；最后一行给出排序与首选（图1/图2/图3）。注意：对照每张实际画出来的东西评价，不要假设它符合某个未说明的设定。',
-          model: '',
-          image_path: '',
-        },
-      },
-      { id: 'end-1', type: 'end', position: { x: 1160, y: 300 }, data: {} },
-    ],
-    edges: [
-      { id: 'e1', source: 'start-1', target: 't2i-1' },
-      { id: 'e2', source: 'start-1', target: 't2i-2' },
-      { id: 'e3', source: 'start-1', target: 't2i-3' },
-      { id: 'e4', source: 't2i-1', target: 'agg-1' },
-      { id: 'e5', source: 't2i-2', target: 'agg-1' },
-      { id: 'e6', source: 't2i-3', target: 'agg-1' },
-      { id: 'e7', source: 'agg-1', target: 'vision-1' },
-      { id: 'e8', source: 'vision-1', target: 'end-1' },
     ],
   },
   {

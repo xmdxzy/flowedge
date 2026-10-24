@@ -351,39 +351,6 @@ func TestSpecResolvesPortsBySourceType(t *testing.T) {
 	}
 }
 
-// 任务书必须写明节点被哪些卡接管：智能体照着任务书干活时，
-// 不知道"这一步是短剧导演在拆镜"就会绕过卡片直接调模型。
-func TestSpecIncludesCardPipeline(t *testing.T) {
-	SetDefaultCards(LoadCards(t.TempDir() + "/cards.json"))
-	t.Cleanup(func() { SetDefaultCards(nil) })
-
-	nodes := []model.NodeInstance{
-		{ID: "l", Type: "llm", Data: map[string]interface{}{
-			"bindings": []interface{}{
-				map[string]interface{}{"kind": "skill", "id": "zh2en", "stage": "input"},
-				map[string]interface{}{"kind": "agent", "id": "story-director", "stage": "body"},
-				map[string]interface{}{"kind": "skill", "id": "json-extract", "stage": "output"},
-			},
-		}},
-	}
-	wf := &model.Workflow{ID: 9, Name: "带卡", Nodes: mustJSON(nodes), Edges: mustJSON([]model.EdgeInstance{})}
-	doc, err := CompileSpec(wf, "md")
-	if err != nil {
-		t.Fatalf("编译失败：%v", err)
-	}
-	if len(doc.Modules) != 1 || len(doc.Modules[0].Cards) != 3 {
-		t.Fatalf("任务书应带 3 张卡，实际 %+v", doc.Modules)
-	}
-	// 名字要能反查成人话，而不是只留个 id
-	names := []string{doc.Modules[0].Cards[0].Name, doc.Modules[0].Cards[1].Name, doc.Modules[0].Cards[2].Name}
-	if names[0] != "中译英" || names[1] != "短剧导演" || names[2] != "抽 JSON" {
-		t.Fatalf("卡片名字没反查对：%v", names)
-	}
-	if !strings.Contains(doc.Markdown, "处理链") || !strings.Contains(doc.Markdown, "短剧导演") {
-		t.Error("markdown 没有渲染处理链")
-	}
-}
-
 // 入口来源要进任务书：这条流水线是给 WorkBuddy 还是 DSH 调的，
 // 决定智能体拿到的上下文与职责边界，不能只活在 UI 里。
 func TestSpecRecordsEntrySource(t *testing.T) {

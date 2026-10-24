@@ -56,13 +56,6 @@ type streamChatRequest struct {
 	StreamOptions streamOptions `json:"stream_options"`
 }
 
-type streamMessagesRequest struct {
-	Model         string            `json:"model"`
-	Messages      []toolChatMessage `json:"messages"`
-	Stream        bool              `json:"stream"`
-	StreamOptions streamOptions     `json:"stream_options"`
-}
-
 type streamChatResponse struct {
 	Choices []struct {
 		Delta struct {
@@ -86,20 +79,6 @@ func (s *LLMStreamService) ChatStreamWithModel(prompt, model string) (<-chan Str
 	return s.streamRequest(streamChatRequest{
 		Model:         model,
 		Messages:      []chatMessage{{Role: "user", Content: prompt}},
-		Stream:        true,
-		StreamOptions: streamOptions{IncludeUsage: true},
-	})
-}
-
-// ChatStreamMessages 带完整消息历史（含工具调用/工具结果）的流式补全，
-// 用于工具调用循环的最终答案轮——前面几轮要拿到完整 tool_calls 所以走非流式
-func (s *LLMStreamService) ChatStreamMessages(messages []toolChatMessage, model string) (<-chan StreamChunk, error) {
-	if model == "" {
-		model = s.Model
-	}
-	return s.streamRequest(streamMessagesRequest{
-		Model:         model,
-		Messages:      messages,
 		Stream:        true,
 		StreamOptions: streamOptions{IncludeUsage: true},
 	})

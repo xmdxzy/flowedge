@@ -21,7 +21,7 @@ func TestNodeProgressHeartbeat(t *testing.T) {
 	hub := NewWSHub()
 	events := hub.Subscribe()
 
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, hub)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, hub)
 	e.RegisterNodeType("slow", func(_ context.Context, _ *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
 		time.Sleep(150 * time.Millisecond)
 		return map[string]interface{}{"text": "done"}, nil
@@ -79,7 +79,7 @@ func TestNodeProgressHeartbeat(t *testing.T) {
 
 // TestETAForUnknownTypeIsZero 没有历史样本时不该编造 ETA，前端据此隐藏预计时间。
 func TestETAForUnknownTypeIsZero(t *testing.T) {
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	if got := e.ETAFor("never_ran"); got != 0 {
 		t.Errorf("ETAFor(never_ran) = %d, want 0", got)
 	}

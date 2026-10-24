@@ -43,22 +43,20 @@ var NodeSpecs = map[string]NodeSpec{
 	// 文件源：只引用已有文件，不吃显存、不产新媒体（Media=false，不进血缘白名单）
 	"input_source": {Type: "input_source"},
 	// 文本拆分：纯字符串处理，不吃显存、不产媒体
-	"text_split":   {Type: "text_split"},
-	"end":          {Type: "end"},
-	"if_else":      {Type: "if_else"},
-	"loop": {Type: "loop", MaxTimeout: 8 * time.Hour}, // Goal/长循环：默认 3 分钟会把正常的多轮 agent 循环误杀
-	"sub_workflow": {Type: "sub_workflow"},
-	"aggregate":    {Type: "aggregate"},
-	"code":         {Type: "code"},
-	// 本地命令：跑外部程序（测试 / 构建 / 校验脚本），不吃显存、不产媒体。
-	// 超时按节点参数算，默认 2 分钟——它跑的是"应该很快"的确定性活，
-	// 真需要长跑的命令自己写 timeout_ms。
-	"command": {Type: "command", Timeout: commandTimeoutOf},
-
-	// ---- 数据/检索 ----
-	"http_request":   {Type: "http_request"},
-	"data_transform": {Type: "data_transform"},
-	"rag_query":      {Type: "rag_query"},
+	"text_split": {Type: "text_split"},
+	"end":        {Type: "end"},
+	"if_else":    {Type: "if_else"},
+	// 质量循环：门控不通过时按修复建议重跑到达标（最长 8 小时，
+	// 默认 3 分钟会把合法的多轮生成循环误杀）
+	"loop": {Type: "loop", MaxTimeout: 8 * time.Hour},
+	// 质量循环：每一轮都是完整生成，天然比单次生成贵 max_rounds 倍。
+	"quality_loop": {Type: "quality_loop", Timeout: func(n *model.NodeInstance) time.Duration {
+		rounds := 3
+		if v, ok := n.Data["max_rounds"].(float64); ok && v > 0 {
+			rounds = int(v)
+		}
+		return time.Duration(rounds) * 2 * time.Hour
+	}, MaxTimeout: 12 * time.Hour},
 
 	// ---- 语言侧：Ollama ----
 	"llm":        {Type: "llm", Side: sideLanguage, Timeout: nil},
@@ -113,40 +111,6 @@ var NodeSpecs = map[string]NodeSpec{
 		}
 		return time.Duration(60+segs*20) * time.Second
 	}},
-
-	// agent_task：外部智能体。
-	//
-	// Side 留空是刻意的：外部智能体的显存由它自己管（可能是远程端点、可能是别人
-	// 启动的本地服务），FlowEdge 既不采样也不仲裁。写 "language" 会让调度器
-	// 以为该卸载本机模型给它腾地方，那是假的 —— 与「逻辑换侧 ≠ 真实卸载」同一个坑。
-	// 代价：并发跑 agent 与出图时，显存冲突要人自己协调（准入闸只看本机压力）。
-	"agent_task": {
-		Type: "agent_task",
-		Timeout: func(n *model.NodeInstance) time.Duration {
-			if ms, ok := n.Data["timeout_ms"].(float64); ok && ms > 0 {
-				return time.Duration(ms) * time.Millisecond
-			}
-			return 5 * time.Minute
-		},
-		MaxTimeout: time.Hour,
-	},
-
-	// mcp_call：外部 MCP 服务器的一个工具。
-	//
-	// Side 留空同 agent_task：工具的耗材在它自己那边（本地进程可能是浏览器、
-	// 数据库、某平台 CLI），引擎既采样不到也不该替它腾显存。
-	// 超时默认 180s：多数工具是一次 HTTP 往返或一次查询；抓整站/跑批的
-	// 服务器可以自己在节点上把 timeout_ms 调大（上限 30 分钟）。
-	"mcp_call": {
-		Type: "mcp_call",
-		Timeout: func(n *model.NodeInstance) time.Duration {
-			if ms, ok := n.Data["timeout_ms"].(float64); ok && ms > 0 {
-				return time.Duration(ms) * time.Millisecond
-			}
-			return 180 * time.Second
-		},
-		MaxTimeout: 30 * time.Minute,
-	},
 }
 
 // NodeSpecOf 查节点元数据。未登记的类型返回零值 + false，

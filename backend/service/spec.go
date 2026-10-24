@@ -319,31 +319,6 @@ func buildSpecModule(step int, n *model.NodeInstance, layer int,
 		})
 	}
 
-	// 能力卡：直接读 bindings，名字从卡片仓库反查（查不到就显示 id，不编造）
-	if pipe := ParsePipeline(n.Data); len(pipe.Input)+len(pipe.Output) > 0 || pipe.Body != nil || pipe.Replace != nil {
-		add := func(stage, kind, id string) {
-			m.Cards = append(m.Cards, SpecCard{Stage: stage, Kind: kind, ID: id, Name: cardDisplayName(kind, id)})
-		}
-		for _, ref := range pipe.Input {
-			add(StageInput, ref.Kind, ref.ID)
-		}
-		if pipe.Body != nil {
-			add(StageBody, pipe.Body.Kind, pipe.Body.ID)
-		}
-		for _, ref := range pipe.Output {
-			add(StageOutput, ref.Kind, ref.ID)
-		}
-		if pipe.Replace != nil {
-			add(StageReplace, pipe.Replace.Kind, pipe.Replace.ID)
-			// 工作流卡：名字来自工作流表，不是卡片仓库
-			if wfID, ok := WorkflowIDOfBinding(Binding{Kind: pipe.Replace.Kind, ID: pipe.Replace.ID}); ok {
-				if name := workflowCardName(wfID); name != "" {
-					m.Cards[len(m.Cards)-1].Name = fmt.Sprintf("%s（#%d）", name, wfID)
-				}
-			}
-		}
-	}
-
 	// 参数：契约给标签，data 给真实值
 	labeled := map[string]bool{}
 	for _, kp := range c.KeyParams {
@@ -566,21 +541,6 @@ func specWarnings(nodes []model.NodeInstance, edges []model.EdgeInstance,
 		n := &nodes[i]
 		c, declared := ModuleContractOf(n.Type)
 
-		// 工作流卡会替换整个节点的执行：产物形态以那条工作流为准，
-		// 与节点自己声明的端口可能不一致。任务书必须把这条如实写出来，
-		// 否则智能体会按节点类型去理解产物，然后接错下游。
-		if pipe := ParsePipeline(n.Data); pipe.Replace != nil {
-			outs := []string{}
-			if declared {
-				for _, o := range c.Outputs {
-					outs = append(outs, string(o.Kind))
-				}
-			}
-			warns = append(warns, fmt.Sprintf(
-				"节点 `%s`（%s）贴了工作流卡：实际产物以该工作流为准，与节点声明的输出（%s）可能不一致",
-				n.ID, n.Type, strings.Join(outs, "/")))
-		}
-
 		if !declared {
 			warns = append(warns, fmt.Sprintf("节点 `%s`（%s）没有模块契约：任务书按通用变换处理，端口与参数语义未知", n.ID, n.Type))
 			continue
@@ -794,12 +754,6 @@ func renderSpecMarkdown(doc *SpecDoc) string {
 				outs = append(outs, fmt.Sprintf("%s(%s)", o.Name, o.Kind))
 			}
 			fmt.Fprintf(&b, "- 产物端口：%s\n", strings.Join(outs, ", "))
-		}
-		if len(m.Cards) > 0 {
-			b.WriteString("- 处理链：\n")
-			for _, c := range m.Cards {
-				fmt.Fprintf(&b, "  - %s：%s（%s `%s`）\n", StageLabel[c.Stage], c.Name, c.Kind, c.ID)
-			}
 		}
 		if len(m.Gates) > 0 {
 			fmt.Fprintf(&b, "- 承载门层：%s\n", strings.Join(m.Gates, " / "))

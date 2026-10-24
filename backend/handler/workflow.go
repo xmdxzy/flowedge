@@ -17,10 +17,9 @@ import (
 )
 
 type WorkflowHandler struct {
-	db      *gorm.DB
-	engine  *service.EngineV2
-	queue   *service.JobQueue     // nil 时退化为直接 goroutine 起跑（保持向后兼容）
-	lineage *service.LineageStore // nil 时跳过血缘记录
+	db     *gorm.DB
+	engine *service.EngineV2
+	queue  *service.JobQueue // nil 时退化为直接 goroutine 起跑（保持向后兼容）
 	// 预检依赖（SetPreflight 注入；nil 时跳过运行前依赖预检）
 	runs *service.RunService // 续跑编排（含单镜重跑），与 HTTP 无关
 
@@ -50,11 +49,6 @@ func NewWorkflowHandler(db *gorm.DB, engine *service.EngineV2, queue *service.Jo
 // 注意它的语义是 fail-open：问不到治理器就放行，只有治理器明确说不才拦。
 func (h *WorkflowHandler) SetGovernor(g *service.GovernorGate) {
 	h.governor = g
-}
-
-// SetLineage 注入血缘仓库（运行结束后记录产物来源）
-func (h *WorkflowHandler) SetLineage(l *service.LineageStore) {
-	h.lineage = l
 }
 
 // SetPreflight 注入运行前依赖预检所需的探测器与端点。
@@ -202,61 +196,6 @@ func validateNodeParams(nodes, edges json.RawMessage) (int, gin.H) {
 	return 0, nil
 }
 
-// validateBindings 保存期校验能力卡：结构合法 + 工作流卡引用的那条流水线真实存在。
-//
-// 为什么必须在保存时拦：工作流卡会**替换整个节点的执行**，
-// 贴错一张（不存在的 id / 贴到自己身上）要到运行时才炸，而且是"运行到一半炸"。
-func (h *WorkflowHandler) validateBindings(nodes json.RawMessage, selfID uint) (int, gin.H) {
-	ns, err := service.ParseNodeInstances(nodes)
-	if err != nil {
-		return http.StatusBadRequest, gin.H{"error": err.Error()}
-	}
-	for _, n := range ns {
-		if issues := service.ValidatePipeline(n.Data); len(issues) > 0 {
-			return http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("节点 %s 的能力卡配置有误：%s", n.ID, issues[0]),
-				"code":  "binding_invalid",
-			}
-		}
-		pipe := service.ParsePipeline(n.Data)
-		if pipe.Replace == nil {
-			continue
-		}
-		// 子工作流 / 循环节点本来就自带 workflow_id：再贴一张工作流卡，
-		// 卡会覆盖节点自身那条，用户以为是"再套一层"，实际是"换掉"。
-		// 这是最容易误解的一种叠加，保存时直接拒。
-		if n.Type == "sub_workflow" || n.Type == "loop" {
-			return http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("节点 %s 是「%s」，已经自带要执行的工作流；不要再贴工作流卡（要换就把节点里的 workflow_id 改掉）", n.ID, n.Type),
-				"code":  "binding_conflict",
-			}
-		}
-		wfID, ok := service.WorkflowIDOfBinding(service.Binding{Kind: pipe.Replace.Kind, ID: pipe.Replace.ID})
-		if !ok {
-			return http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("节点 %s 的工作流卡 id 不合法（%q）", n.ID, pipe.Replace.ID),
-				"code":  "binding_invalid",
-			}
-		}
-		if selfID != 0 && wfID == selfID {
-			return http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("节点 %s 把这条工作流自己贴成了工作流卡：会无限递归", n.ID),
-				"code":  "binding_self_reference",
-			}
-		}
-		if h.db != nil {
-			var cnt int64
-			if err := h.db.Model(&model.Workflow{}).Where("id = ?", wfID).Count(&cnt).Error; err == nil && cnt == 0 {
-				return http.StatusBadRequest, gin.H{
-					"error": fmt.Sprintf("节点 %s 贴的工作流卡 #%d 不存在（可能已被删除）", n.ID, wfID),
-					"code":  "binding_missing_workflow",
-				}
-			}
-		}
-	}
-	return 0, nil
-}
-
 // Create 创建工作流
 func (h *WorkflowHandler) Create(c *gin.Context) {
 	var wf model.Workflow
@@ -269,10 +208,6 @@ func (h *WorkflowHandler) Create(c *gin.Context) {
 		return
 	}
 	if code, body := validateNodeParams(wf.Nodes, wf.Edges); code != 0 {
-		c.JSON(code, body)
-		return
-	}
-	if code, body := h.validateBindings(wf.Nodes, 0); code != 0 {
 		c.JSON(code, body)
 		return
 	}
@@ -314,10 +249,6 @@ func (h *WorkflowHandler) Update(c *gin.Context) {
 		// 图结构必须成对提交：只改节点不改连线会得到一张自相矛盾的图
 		if len(updates.Nodes) == 0 || len(updates.Edges) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "nodes 与 edges 必须一起提交"})
-			return
-		}
-		if code, body := h.validateBindings(updates.Nodes, wf.ID); code != 0 {
-			c.JSON(code, body)
 			return
 		}
 		if code, body := validateGraph(updates.Nodes, updates.Edges); code != 0 {
@@ -396,8 +327,6 @@ func (h *WorkflowHandler) StartRunWith(wf *model.Workflow, opts RunOptions) *mod
 	if len(opts.Edges) > 0 {
 		edgesJSON = []byte(opts.Edges)
 	}
-	// 输入注入：在**预检之前**渲染，否则 {{key}} 这种占位会被当成真实参数去估依赖。
-	nodesJSON = renderNodeVars(nodesJSON, opts.Vars)
 
 	// 运行前依赖预检：服务没起时创建一条 failed 记录留痕，不进入执行。
 	// （手动入口 Run 直接 503 返回；cron/trigger 走这里，留痕才能追溯）
@@ -507,20 +436,6 @@ func (h *WorkflowHandler) StartRunWith(wf *model.Workflow, opts RunOptions) *mod
 		h.db.Save(run)
 		h.db.Save(&job)
 
-		// 产物血缘：运行结束（含暂停）都记一次，已产出的图/音/视频都能溯源
-		if h.lineage != nil {
-			var edges []model.EdgeInstance
-			_ = json.Unmarshal(edgesJSON, &edges)
-			h.lineage.RecordRun(wf.ID, run.ID, nodeStates, edges)
-		}
-
-		// 证据信封：外部评测器只读这一份，避免「谁记了耗时 / 失败算 0 分还是没测到」
-		// 各算各的账。旁路写入，失败只记日志，绝不反过来影响本次运行的结论。
-		// 版本号来自 run 自己（起跑时钉住的），不再读「当前最新版本」——
-		// 运行期间有人改图存版本时，后者会把旧图的成绩记到新版本上。
-		ev := service.BuildEvidence(
-			*run, nodeStates, h.engine.SideUnloadCount(), service.CountResumes(h.db, run.ID))
-		service.WriteEvidence(ev)
 	}
 
 	if h.queue != nil {
@@ -556,46 +471,7 @@ func (h *WorkflowHandler) newRun(workflowID uint, status string, opts RunOptions
 	}
 	run.Role = opts.Role
 	run.EvalBatch = opts.EvalBatch
-	run.WorkflowVersion = opts.WorkflowVersion
-	if run.WorkflowVersion == 0 {
-		run.WorkflowVersion = h.latestVersion(workflowID)
-		if run.WorkflowVersion == 0 {
-			// 这张图从没被快照过（新建后直接跑、或历史遗留图）。
-			//
-			// 不补这一条的话，证据里 workflowVersion 恒为 0（omitempty 时字段直接消失），
-			// 自进化的配对评测就只能靠 role 区分"改前/改后" —— 而 role 是评测层自己标的，
-			// 可以标错、也可以被标错之后没人发现。版本号是引擎的事实，不该缺。
-			//
-			// 并发安全：建完再以库里的最大值为准。两个 run 同时起跑时，后到的会拿到同一个号，
-			// 不会出现"两个 v1"或"版本号跳空"。
-			var wf model.Workflow
-			if err := h.db.First(&wf, workflowID).Error; err == nil {
-				h.snapshotBaseline(wf)
-			}
-			run.WorkflowVersion = h.latestVersion(workflowID)
-		}
-	}
 	return run
-}
-
-// snapshotBaseline 给"从没被快照过"的图存一个基线版本，返回版本号（失败返回 0）。
-//
-// 与 snapshotBefore 的区别：那个是"改图前留一手"，这个是"第一次跑之前先立个桩"。
-// 快照失败不阻断起跑 —— 宁可让这条 run 的版本号是 0（事实：没留下版本），
-// 也不要因为它没跑起来。
-func (h *WorkflowHandler) snapshotBaseline(wf model.Workflow) int {
-	ver := model.WorkflowVersion{
-		WorkflowID: wf.ID,
-		Version:    h.latestVersion(wf.ID) + 1,
-		Name:       wf.Name,
-		Nodes:      wf.Nodes,
-		Edges:      wf.Edges,
-		ChangeNote: "起跑时自动建立基线（此前该图没有可回滚的快照）",
-	}
-	if err := h.db.Create(&ver).Error; err != nil {
-		return 0
-	}
-	return ver.Version
 }
 
 // CancelRun 中止进行中的运行（已完成的节点保留，剩余标记为 skipped）

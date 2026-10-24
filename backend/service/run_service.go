@@ -180,9 +180,6 @@ func (s *RunService) Resume(runID uint, fromNode string, nodesOverride []byte) (
 			done.Error = err.Error()
 		}
 		s.db.Save(&done)
-
-		// 证据信封（与初始运行同一口径：同一份代码算出同一个结论）
-		WriteEvidence(BuildEvidence(run, nodeStates, s.engine.SideUnloadCount(), CountResumes(s.db, run.ID)))
 	})
 
 	return out, nil

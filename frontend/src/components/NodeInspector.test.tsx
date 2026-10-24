@@ -47,8 +47,6 @@ function renderPanel(
       onNotify={opts.onNotify}
       onErrorAction={opts.onErrorAction}
       savedWorkflows={opts.savedWorkflows}
-      agents={opts.agents}
-      onReloadAgents={opts.onReloadAgents}
     />,
   )
   return { ...utils, updates }
@@ -66,54 +64,8 @@ test('开始节点显示提示词输入，改值回调到上层', () => {
   assert.deepEqual(updates, [['prompt', '写一首关于秋天的诗']])
 })
 
-test('LLM 节点：模型是下拉、任务是预设、工具带说明', () => {
-  const { container } = renderPanel(
-    mk('llm', { model: 'qwen2.5:14b', prompt: '总结', tools: [] }),
-  )
-  const text = container.textContent ?? ''
-  assert.ok(text.includes('模型'), '缺模型字段标签')
-  assert.ok(text.includes('处理链'), '缺处理链（工具已并入本体段）')
-  // 模型从自由文本框改成下拉：能回显当前模型，且首项是"自动探测"
-  // 注：本 harness 的 getByDisplayValue 对 <select> 不生效，直接用 DOM 断言。
-  const models = container.querySelector('select') as HTMLSelectElement
-  assert.equal(models.value, 'qwen2.5:14b', '模型下拉没回显当前值')
-  assert.equal(models.options[0].value, '', '首项应为"自动探测"（空值）')
-  assert.ok(models.textContent?.includes('跟随引擎默认'), '下拉缺"跟随引擎默认"项')
-  // 工具并进处理链的本体段：默认折叠成一行计数，展开后每项都写清什么时候被调用
-  assert.ok(text.includes('工具 0/4'), '缺工具折叠入口')
-  const toolRow = Array.from(container.querySelectorAll('button')).find((b) =>
-    (b.textContent || '').includes('工具 0/4'),
-  )
-  assert.ok(toolRow, '找不到工具折叠按钮')
-  fire(() => toolRow!.click())
-  const expanded = container.textContent ?? ''
-  assert.ok(
-    expanded.includes('知识库检索') && expanded.includes('单位换算'),
-    '展开后应看到每个工具的调用时机',
-  )
-  // 预设：prompt 与预设不匹配时归到"自定义"，仍能看到自定义输入框
-  assert.ok(expanded.includes('最多轮数') && expanded.includes('工具失败即中止'), '缺工具轮数/严格开关')
-})
 
-test('节点面板有接线与三段处理链', () => {
-  const { container } = renderPanel(mk('llm', {}))
-  const text = container.textContent ?? ''
-  for (const want of ['接线', '处理链', '输入处理', '本体角色', '输出处理', '整节点替换']) {
-    assert.ok(text.includes(want), `缺「${want}」`)
-  }
-})
 
-test('开始节点只有接线与提示词，没有处理链', () => {
-  const { container } = renderPanel(mk('start', { prompt: '写个开场' }))
-  const text = container.textContent ?? ''
-  assert.ok(text.includes('接线'), '开始节点要有接线')
-  assert.ok(text.includes('手动运行'), '开始节点要有外部源选择')
-  assert.ok(text.includes('输入提示词'), '开始节点要有提示词')
-  // 处理链对开始节点没有落点：不该出现四段
-  for (const absent of ['处理链', '整节点替换', '本体角色']) {
-    assert.ok(!text.includes(absent), `开始节点不该出现「${absent}」`)
-  }
-})
 
 test('输出 Tab：无输出给说明，有输出渲染 JSON', () => {
   const empty = renderPanel(mk('text2image', {}), { tab: 'output' })
@@ -183,49 +135,8 @@ test('后期节点有响度归一选项，选了目标值会回传数字', () =>
 
 // ===== 外部智能体（agent_task）=====
 
-test('外部智能体节点：必须警示"不承诺可复现"，并列出名册', () => {
-  const { container, updates } = renderPanel(mk('agent_task', { agent_id: 'claude-code' }), {
-    agents: [
-      { id: 'claude-code', label: 'Claude Code', kind: 'cli', available: true, detail: 'C:/bin/claude.exe' },
-      { id: 'codex', label: 'Codex', kind: 'cli', enabled: false, available: false, detail: '已停用' },
-    ],
-  })
-  const text = container.textContent ?? ''
-  // 这条警告是功能性的：用户不知道它不可复现，就会拿它去做本该确定性的活儿
-  assert.ok(text.includes('不承诺可复现'), '缺非确定性警示')
-  assert.ok(text.includes('评测时本图要与确定性图分开统计'), '缺评测分组提示')
 
-  const select = Array.from(container.querySelectorAll('select')).find((el) =>
-    Array.from(el.options).some((o) => o.value === 'claude-code'),
-  ) as HTMLSelectElement | undefined
-  assert.ok(select, '没找到智能体下拉')
-  assert.equal(select.value, 'claude-code', '下拉没回显当前 agent_id')
-  assert.ok(select.textContent?.includes('可用'), '选项里要标出可用性')
 
-  // 停用的不该出现在下拉里（但已在节点上配好的仍要能显示状态）
-  assert.ok(!select.textContent?.includes('Codex'), '停用的智能体不该进下拉')
-  assert.ok(text.includes('C:/bin/claude.exe'), '选中项要显示探活详情（不只是"可用"两个字）')
-
-  typeInto(select, 'codex')
-  assert.deepEqual(updates, [['agent_id', 'codex']])
-})
-
-test('名册为空时给配置指引，而不是一个空下拉', () => {
-  const { container } = renderPanel(mk('agent_task', {}), { agents: [] })
-  const text = container.textContent ?? ''
-  assert.ok(text.includes('data/agents.json'), '要指出配置位置')
-  assert.ok(text.includes('停用'), '要说明内置示例默认停用（否则用户以为坏了）')
-})
-
-test('已配但不可用的智能体：显示真实原因，不假装可用', () => {
-  const { container } = renderPanel(mk('agent_task', { agent_id: 'ghost' }), {
-    agents: [
-      { id: 'ghost', label: 'Ghost', kind: 'cli', available: false, detail: 'PATH 里找不到命令 "ghost"' },
-    ],
-  })
-  const text = container.textContent ?? ''
-  assert.ok(text.includes('找不到命令'), '要把探活失败的原因摊开，而不是只标红')
-})
 
 // ===== 文件源（input_source）=====
 

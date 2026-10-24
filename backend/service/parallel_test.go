@@ -57,7 +57,7 @@ func fanoutGraph(t *testing.T, ids []string, nodeType string) ([]byte, []byte) {
 // 这是「并行分支执行」的最低验收：不重叠就说明退化成串行了。
 func TestParallelBranchesOverlap(t *testing.T) {
 	probe := &overlapProbe{}
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	e.RegisterNodeType("fan", func(_ context.Context, node *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
 		probe.enter(node.ID)
 		defer probe.leave()
@@ -79,7 +79,7 @@ func TestParallelBranchesOverlap(t *testing.T) {
 // 这条同时保护总闸本身：并发抖到 4 说明令牌没生效。
 func TestMaxParallelCapsConcurrency(t *testing.T) {
 	probe := &overlapProbe{}
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	e.SetMaxParallel(2)
 	e.RegisterNodeType("fan", func(_ context.Context, node *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
 		probe.enter(node.ID)
@@ -106,7 +106,7 @@ func TestMaxParallelCapsConcurrency(t *testing.T) {
 // 该测试不依赖真实 ComfyUI：enterSide 在 t2i/llm 为 nil 时同样会抢锁。
 func TestHeavyNodesSerializeOnVRAMArbiter(t *testing.T) {
 	probe := &overlapProbe{}
-	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	e := NewEngineV2(nil, nil, nil, nil, nil, nil, nil)
 	e.RegisterNodeType("heavy", func(_ context.Context, node *model.NodeInstance, _ map[string]interface{}) (interface{}, error) {
 		release := e.enterSide(sideDiffusion)
 		defer release()

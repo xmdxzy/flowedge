@@ -1,3 +1,18 @@
+## 2026-10-24 · 轻装化：FlowEdge Lite v1
+
+**只保留两件核心能力，其余全部删除。**（-34,531 / +368 行，165 个文件）
+
+- 删：自进化、证据聚合、工具链/MCP 客户端/插件、能力卡与技能包、KB/RAG、触发器、
+  凭据仓库、工作流版本、镜头作业、节点缓存、OpenAI 兼容出口、产物血缘。
+- 删节点：`agent_task`/`mcp_call`/`command`/`code`/`http_request`/`data_transform`/
+  `rag_query`/`aggregate`/`sub_workflow`；节点从 40 种收到 26 种，API 从 112 条收到 40 条。
+- 新增 **`quality_loop` 质量循环节点**：生成→验收打分→诊断→按修复建议改参数→重跑→择优，
+  有轮次上限、逐轮报告、未达标显式失败。闭环用 ffmpeg 合成视频做真跑验证
+  （R1 33 分 → R2 100 分）。
+- 前端从 38 个面板收到 13 个：画布 + 属性面板 + 运行记录 + 产物画廊 + 模板库 + 配置/环境。
+- 验证：backend `go test ./...` 全过；frontend `tsc` 0 错、73/73 用例通过；
+  exe 19.9MB 启动冒烟通过（`/api/health`、`/api/modules` 含 `quality_loop`）；MCP 9 个工具正常。
+
 # Changelog
 
 All notable changes to FlowEdge are documented here. The format is based on

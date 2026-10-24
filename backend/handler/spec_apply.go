@@ -47,21 +47,6 @@ func (h *WorkflowHandler) SpecApply(c *gin.Context) {
 		return
 	}
 
-	// 粗粒度乐观锁：调用方声明"我基于第 N 版改的"，若已经不是第 N 版就整体拒绝。
-	// 逐字段的 from 也能兜底，但版本号能挡住"整批基于过期任务书"这种情形。
-	if req.BaseVersion != nil {
-		cur := h.latestVersion(wf.ID)
-		if cur != *req.BaseVersion {
-			c.JSON(http.StatusConflict, gin.H{
-				"error":       "工作流版本已变化，请重新拉取任务书",
-				"code":        "version_changed",
-				"baseVersion": *req.BaseVersion,
-				"current":     cur,
-			})
-			return
-		}
-	}
-
 	var nodes []model.NodeInstance
 	if err := json.Unmarshal(wf.Nodes, &nodes); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "工作流节点数据损坏：" + err.Error()})
@@ -85,9 +70,6 @@ func (h *WorkflowHandler) SpecApply(c *gin.Context) {
 		return
 	}
 
-	// 先快照再改：旧图必须永远可回滚。顺序反了就会出现"改了但没版本可回"。
-	snapshotVersion := h.snapshotBefore(wf, len(applied))
-
 	nodesJSON, err := json.Marshal(next)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化失败：" + err.Error()})
@@ -100,40 +82,10 @@ func (h *WorkflowHandler) SpecApply(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"applied":         applied,
-		"count":           len(applied),
-		"snapshotVersion": snapshotVersion,
-		"dryRun":          false,
+		"applied": applied,
+		"count":   len(applied),
+		"dryRun":  false,
 	})
-}
-
-// latestVersion 当前最新快照版本号（没有快照时为 0）
-func (h *WorkflowHandler) latestVersion(workflowID uint) int {
-	var v int
-	h.db.Model(&model.WorkflowVersion{}).
-		Where("workflow_id = ?", workflowID).
-		Select("COALESCE(MAX(version), 0)").
-		Scan(&v)
-	return v
-}
-
-// snapshotBefore 把改动前的状态存成一个新版本，返回版本号。
-//
-// 快照失败不阻断改图（返回 0 让调用方知道"没留下版本"），
-// 但会把错误写进响应 —— 静默失败会让人以为随时能回滚，而其实回不去。
-func (h *WorkflowHandler) snapshotBefore(wf model.Workflow, editCount int) int {
-	ver := model.WorkflowVersion{
-		WorkflowID: wf.ID,
-		Version:    h.latestVersion(wf.ID) + 1,
-		Name:       wf.Name,
-		Nodes:      wf.Nodes,
-		Edges:      wf.Edges,
-		ChangeNote: "任务书回写前自动快照（本次改动 " + itoa(editCount) + " 项）",
-	}
-	if err := h.db.Create(&ver).Error; err != nil {
-		return 0
-	}
-	return ver.Version
 }
 
 func itoa(n int) string {
