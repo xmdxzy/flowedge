@@ -369,6 +369,11 @@ type RunOptions struct {
 	// AgentConcurrency 本次运行的 agent 并发上限；0 = 用引擎默认。
 	// 同一张图在不同机器上能扛的并发不同，所以它是运行参数而不是工作流参数。
 	AgentConcurrency int
+	// Vars 本次运行的输入注入：图里 data 字符串中的 {{key}} 会被替换。
+	//
+	// 评测的每个 case 靠它区分输入 —— 没有它，"跑 8 个 case"其实是同一个 prompt 跑 8 遍。
+	// 只影响这次 run 的内存图，不写库（见 vars.go）。
+	Vars map[string]interface{}
 }
 
 // StartRun 创建执行记录并异步跑完（触发器与手动运行共用同一条路径）。
@@ -391,6 +396,8 @@ func (h *WorkflowHandler) StartRunWith(wf *model.Workflow, opts RunOptions) *mod
 	if len(opts.Edges) > 0 {
 		edgesJSON = []byte(opts.Edges)
 	}
+	// 输入注入：在**预检之前**渲染，否则 {{key}} 这种占位会被当成真实参数去估依赖。
+	nodesJSON = renderNodeVars(nodesJSON, opts.Vars)
 
 	// 运行前依赖预检：服务没起时创建一条 failed 记录留痕，不进入执行。
 	// （手动入口 Run 直接 503 返回；cron/trigger 走这里，留痕才能追溯）
@@ -552,8 +559,43 @@ func (h *WorkflowHandler) newRun(workflowID uint, status string, opts RunOptions
 	run.WorkflowVersion = opts.WorkflowVersion
 	if run.WorkflowVersion == 0 {
 		run.WorkflowVersion = h.latestVersion(workflowID)
+		if run.WorkflowVersion == 0 {
+			// 这张图从没被快照过（新建后直接跑、或历史遗留图）。
+			//
+			// 不补这一条的话，证据里 workflowVersion 恒为 0（omitempty 时字段直接消失），
+			// 自进化的配对评测就只能靠 role 区分"改前/改后" —— 而 role 是评测层自己标的，
+			// 可以标错、也可以被标错之后没人发现。版本号是引擎的事实，不该缺。
+			//
+			// 并发安全：建完再以库里的最大值为准。两个 run 同时起跑时，后到的会拿到同一个号，
+			// 不会出现"两个 v1"或"版本号跳空"。
+			var wf model.Workflow
+			if err := h.db.First(&wf, workflowID).Error; err == nil {
+				h.snapshotBaseline(wf)
+			}
+			run.WorkflowVersion = h.latestVersion(workflowID)
+		}
 	}
 	return run
+}
+
+// snapshotBaseline 给"从没被快照过"的图存一个基线版本，返回版本号（失败返回 0）。
+//
+// 与 snapshotBefore 的区别：那个是"改图前留一手"，这个是"第一次跑之前先立个桩"。
+// 快照失败不阻断起跑 —— 宁可让这条 run 的版本号是 0（事实：没留下版本），
+// 也不要因为它没跑起来。
+func (h *WorkflowHandler) snapshotBaseline(wf model.Workflow) int {
+	ver := model.WorkflowVersion{
+		WorkflowID: wf.ID,
+		Version:    h.latestVersion(wf.ID) + 1,
+		Name:       wf.Name,
+		Nodes:      wf.Nodes,
+		Edges:      wf.Edges,
+		ChangeNote: "起跑时自动建立基线（此前该图没有可回滚的快照）",
+	}
+	if err := h.db.Create(&ver).Error; err != nil {
+		return 0
+	}
+	return ver.Version
 }
 
 // CancelRun 中止进行中的运行（已完成的节点保留，剩余标记为 skipped）
@@ -590,6 +632,8 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 		Category           string `json:"category"`
 		Role               string `json:"role"`
 		EvalBatch          string `json:"evalBatch"`
+		// Vars 评测 case 的输入：图里 {{key}} 会被替换（不起作用就留空）
+		Vars map[string]interface{} `json:"vars"`
 		// AgentConcurrency 本次运行的 agent 并发上限；不传/0 = 引擎默认。
 		AgentConcurrency int `json:"agent_concurrency"`
 	}
@@ -650,6 +694,7 @@ func (h *WorkflowHandler) Run(c *gin.Context) {
 	}
 	run := h.StartRunWith(&wf, RunOptions{
 		InvokedBy:          invokedBy,
+		Vars:               req.Vars,
 		CaseID:             strings.TrimSpace(req.CaseID),
 		DatasetFingerprint: strings.TrimSpace(req.DatasetFingerprint),
 		Category:           strings.TrimSpace(req.Category),

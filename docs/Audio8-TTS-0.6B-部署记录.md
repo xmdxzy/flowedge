@@ -135,13 +135,42 @@ TTS_BASE_URL=http://127.0.0.1:8103
 | 端点 | 用途 |
 |---|---|
 | `POST /tts {text, voice}` | 合成，返回 wav（44.1kHz 单声道 PCM16） |
+| `POST /tts {text, ref_audio, ref_text}` | 直接用参考音频克隆（不注册，逐节点指定） |
 | `GET /health` | 轻量探活（不加载模型，首次约 3s 因 import torch） |
 | `GET /health?deep=1` | 真合成一段，区分「跑着但坏了」 |
-| `POST /voices/register {name, text, audio_path}` | 零样本克隆注册（参考音频 0.5~30s） |
+| `POST /voices/register {name, text, audio_path}` | 零样本克隆注册（参考音频 0.5~30s，可复用） |
 | `POST /unload` | 释放显存 |
 
 `deps.go` 已扩展：`TTS_SCRIPT` 选脚本、`TTS_PYTHON` 指定解释器，并注入
 `AUDIO8_MODEL_DIR` / `AUDIO8_VOICES_DIR` / `AUDIO8_DTYPE` / `AUDIO8_IDLE_UNLOAD`（默认 0 = 常驻）。
+
+一键启动：`运行/5-启动 FlowEdge(接Audio8-TTS克隆).bat`（会先检查 8080 是否已被占用）。
+
+### 5.1 节点级克隆（2026-10-23 下午补齐）
+
+tts 节点新增两个参数，走完整链路 `node.Data → TTSOptions → POST /tts`：
+
+| 参数 | 含义 |
+|---|---|
+| `ref_audio` | 参考音频绝对路径。**非空即启用克隆，并让 `voice` 失效**（克隆看的是参考码本，音色名对它没意义） |
+| `ref_text` | 参考音频的逐字稿。参考音频非空时**必填**：空着直接报错，不降级 |
+
+两种克隆方式并存：节点直填参考音频（一次性、逐节点）或先注册音色再填 `voice`（可复用）。
+
+### 5.2 两个必须知道的坑（都已修，有测试钉住）
+
+**坑一：TTS 客户端超时写死 60 秒。**
+Audio8 克隆实测 RTF 18~32，58 字台词要 157s ⇒ 每次克隆都会超时 → 静默回退 SAPI →
+**用户拿到的是 Windows 系统音色，节点却报成功**。现在超时按工作量算：
+`60s + 每字 1.5s`，封顶 20 分钟（`synthesizeHTTP` 用 `context.WithTimeout` 精确控制，
+`http.Client.Timeout` 只做 20 分钟兜底）。
+
+**坑二：克隆失败会静默回退 SAPI。**
+回退本身是既有契约（服务没起时用系统语音兜底），但对克隆是错误行为——等于换了个人在说话。
+现在 `SynthesizeWith` 里判断：`RefAudio != ""` 时**不回退**，直接报错。
+
+两条都有回归测试：`backend/service/tts_clone_test.go`
+（`TestTTSRefAudioPassthrough` / `TestTTSCloneNeverFallsBackToSAPI` / `TestTTSNoRefStillAllowsFallback`）。
 
 ## 6. 限制与未验证
 
@@ -173,3 +202,159 @@ curl --noproxy '*' -X POST "http://127.0.0.1:8103/voices/register" \
 # 验收（项目硬要求）
 python scripts/verify-media.py out.wav --asr --frames .tmp/frames
 ```
+
+## 8. 引擎侧切换（2026-10-23 20:50 完成，已端到端验证）
+
+### 8.1 为什么改配置文件而不是环境变量
+
+引擎的 `TTS_BASE_URL` 原本只能来自环境变量（`getEnv`，无 `.env` 支持）。而引擎是由序策外壳
+（`node server/flowedge-station.js`，:30000）spawn 的，外壳那段代码是：
+
+```js
+spawn(exe, [], { cwd: path.dirname(exe), detached: true, stdio: "ignore", windowsHide: true })
+```
+
+**没有 `env` 参数** ⇒ 子进程继承外壳自己的环境。也就是说：`setx` 之后必须连外壳一起重启，
+而纯 `os.Getenv` 又让「改配置不重启」不可能。这条路太脆。
+
+所以补了配置层：`data/deps.json` 增加 `tts` 段，优先级 **环境变量 > deps.json > 按脚本名推导**。
+这样切后端只改一个 JSON，重启引擎即可（外壳不用动）。
+
+### 8.2 配置格式
+
+`运行/data/deps.json`：
+
+```json
+{
+  "tts": {
+    "script": "tts_audio8_pt_server.py",
+    "python": "D:/AI/envs/torch-cu124/Scripts/python.exe",
+    "port": "8103",
+    "base_url": "http://127.0.0.1:8103",
+    "autostart": false
+  }
+}
+```
+
+| 字段 | 作用 |
+|---|---|
+| `script` | tts 依赖启动哪个脚本（配合 `TTS_SCRIPT`） |
+| `python` | 用哪个解释器（Audio8 必须指向共享 CUDA 底座） |
+| `port` | 推导出的默认端口（旧逻辑是按脚本名猜 8102/8103） |
+| `base_url` | **引擎连哪个地址**（新增，之前只认环境变量） |
+| `autostart` | 引擎启动时是否自动拉起 TTS（**当前 false = 不常驻**，见 §8.6） |
+
+改的代码：`deps.go` 的 `depsFile` 加 TTS 段 + 导出 `TTSBaseURL()`；`main.go` 的 `ttsURL` 解析加配置回退。
+
+### 8.3 切回 Kokoro
+
+```json
+"tts": { "script": "tts_kokoro_server.py", "port": "8102",
+         "base_url": "http://127.0.0.1:8102", "autostart": false }
+```
+（删掉 `python` 字段，让它回落到 ASR 那个 venv。）然后重启引擎。
+
+### 8.4 切换过程与验证
+
+1. 构建：`python scripts/build-windows.py --skip-ui`（前端已单独 `npm run build` 过）
+2. 备份旧 exe：`运行/FlowEdge.exe.bak-20261023-2045`
+3. 停引擎（只杀 8080 上确认名为 `FlowEdge` 的进程，外壳不动）
+4. `cp dist/FlowEdge.exe 运行/`
+5. `python scripts/start-engine.py` → 外壳 spawn，**跨会话存活**（pid 39816，父进程 node.exe）
+
+`GET /api/deps` 结果：
+
+```json
+{"name":"tts","label":"TTS（audio8_pt）","running":true,"managed":true,"autostart":true,
+ "endpoint":"http://127.0.0.1:8103",
+ "command":"D:/AI/envs/torch-cu124/Scripts/python.exe ...\\tts_audio8_pt_server.py"}
+```
+
+引擎自动拉起了 TTS，8 秒内 `/health` 就绪。
+
+### 8.5 端到端验收（工作流 #122，可重复跑）
+
+`POST /api/workflows/122/run`，节点 `tts` 只填 `text` + `ref_audio` + `ref_text`（无 voice）：
+
+| 项 | 值 |
+|---|---|
+| run 状态 | **success**，`backend: "service"`（不是 `sapi-fallback`，证明真走了 Audio8） |
+| 耗时 | 84.5s 生成 5.29s 音频（**RTF 16.0**，克隆模式） |
+| 产出 | `运行/data/generated/tts-1792759849771422900.wav`，pcm_s16le 44100 mono |
+| ASR 回读 | 「这是Flow Edge引擎托管的Audio 8音色克龙端道端跑通了」 |
+| 判定 | ✅ 差异只有同音字（克龙/克隆、端道端/端到端） |
+
+工作流 #122 名 `tts-clone-smoke-20261023`，留着当这条链路的冒烟样板。
+
+## 9. 已知遗留
+
+- 测试工作流 #122 留在库里当样板，不需要可 `DELETE /api/workflows/122`。
+- `运行/` 下累积了 15 个 `FlowEdge.exe.bak-*`（历史备份），最新那个是本次切换前的版本。
+
+### 8.6 取消常驻（2026-10-23 20:58，用户要求）
+
+改成 `autostart: false` 并停掉当前实例。**这是三件事，缺一不成**：
+
+1. **改配置**：`deps.json` → `"autostart": false`（只影响引擎下次启动时的行为）
+2. **停当前进程**：`POST /api/deps/tts/stop`（配置改了不会自动停已在跑的）
+3. **重启引擎验证**：因为 `autostart` 只在 `NewSupervisor` 时读一次，不重启的话
+   `/api/deps` 还会显示一直缓存着的 `true`——**改了没验证等于没改**。
+   实测重启后：`running=false managed=false autostart=false pid=None`，8103 无响应，
+   显存不再被占。
+
+实测数据：
+
+| 时点 | 显存 |
+|---|---|
+| 停之前（模型已加载） | 14341 MiB |
+| 停之后 | 12197 MiB（**释放 2.1GB**） |
+| 引擎重启后（确认没自动起） | 12858 MiB |
+
+按需使用的两种方式：
+
+| 方式 | 行为 |
+|---|---|
+| 面板点启动 / `POST /api/deps/tts/start` | 202 → **6 秒**就绪（懒加载：进程起来了但**不占显存**，首次 `/tts` 才加载模型约 30s、占 1.8GB） |
+| 直接跑 tts 节点 | 不会自动起服务：没填 `ref_audio` 会回退 SAPI（音色变系统音），填了则直接报错 |
+
+> 懒加载是默认行为（`AUDIO8_PRELOAD` 不设即 0）。所以「进程在跑」不等于「显存被占」，
+> 真正的 1.8GB 只在第一次合成之后才付。
+
+## 9. 已知遗留
+
+- 测试工作流 #122 留在库里当样板，不需要可 `DELETE /api/workflows/122`。
+- `运行/` 下累积了 15 个 `FlowEdge.exe.bak-*`（历史备份），最新那个是本次切换前的版本。
+
+### 8.7 彻底解决「不常驻」与「不用记得点启动」（2026-10-23 21:15）
+
+§8.6 只是「不自动起」，还留了三个靠人记住的坑：跑节点前要记得点启动、用完要记得停、
+改配置要重启引擎。这三条现在都由代码兜住。
+
+| 机制 | 解决什么 | 实测 |
+|---|---|---|
+| **节点按需启动** | 忘了点启动 → 静默回退 SAPI（音色变系统音） | TTS 完全未运行时直接跑工作流 #122 → 自动拉起 → `success / backend=service`，80s 完成 |
+| **`idle_unload`** | 用过一次就一直占 1.8GB | 设 50s 测试：合成后 `loaded=True vram=1.79GB` → 50s 后 `loaded=False vram=0.15GB`，显存 14137 → **11935 MiB** |
+| **`POST /api/deps/reload`** | 改配置要重启引擎，且改了没生效也没人知道 | 改 `idle_unload 50→600` 后调它，返回 `{"tts.env.AUDIO8_IDLE_UNLOAD":"50 -> 600"}` |
+
+**按需启动的代码位置**：`engine_v2_nodes.go` 的 `execTTSNode`，在 `SynthesizeWith` 之前：
+
+```go
+if e.deps != nil && !e.deps.Healthy("tts") && e.deps.Startable("tts") {
+    if err := e.deps.Start("tts"); err == nil {
+        _ = e.deps.WaitReady("tts", 300*time.Second)
+    }
+}
+```
+用 6 秒起服务，换掉「产出错音色但报成功」，这笔账很划算。
+
+**`Reload` 的边界**（别误解它的能力）：
+- 覆盖：script / python / port / 参数 / autostart / **TTS 相关环境变量**（`TTS_` `AUDIO8_` `ARKTTS_` `KOKORO_` 前缀）
+- **不覆盖**：`base_url` —— TTSService 是独立对象，改地址仍需重启引擎，`changes` 里会标「需重启引擎才生效」
+- 已在跑的进程不受影响（`procs` / `started` / `lastErr` 都保留）
+
+> 坑中坑：`Reload` 一开始只比较 binary/args/autostart/endpoint，**没比 Env**，导致
+> 改 `idle_unload` 时返回 `changes: {}`（看起来没变化，实际 spec 已更新）。已补
+> `ttsEnvDigest` 只抽 TTS 相关前缀比较，避免把整份 `os.Environ` 的噪音算成变更。
+
+**最终常态**（`deps.json`）：`autostart: false` + `idle_unload: 600`
+——引擎启动不拉起；跑 tts 节点时自动起；闲置 10 分钟自动卸显存；进程留着下次懒加载。

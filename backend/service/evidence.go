@@ -37,8 +37,9 @@ import (
 // EvidenceSchemaVersion 信封 schema 版本。字段增删要 +1。
 //
 // v2（2026-10-23）：GateCheckEvidence 增加 nodeId（归因到具体门节点）。
-// 兼容性：只增字段且 omitempty，v1 信封原样可读，读到的 nodeId 为空串。
-const EvidenceSchemaVersion = 2
+// v3（2026-10-23）：GateCheckEvidence 增加 detail（实测值），否则信封无法自解释。
+// 兼容性：都是只增字段且 omitempty，旧信封原样可读，缺的字段为空串。
+const EvidenceSchemaVersion = 3
 
 // 证据判定结果（Result 字段取值）
 const (
@@ -62,6 +63,13 @@ type GateCheckEvidence struct {
 	// 是哪个 post_production 的问题，自进化只能给出"全局该调响度"这种无用建议。
 	// 加字段而不是新开一份结构，是为了让老信封照样能读（omitempty）。
 	NodeID string `json:"nodeId,omitempty"`
+	// Detail 这一项的实测值（"音画时长差 7.635s ≤ 0.500s"）。
+	//
+	// 以前刻意不留，理由是"评测只用得上三个字段"。但那样信封不能自解释：
+	// `av_drift ok=false` 看不出差 0.6s 还是 7.6s，想写报告得重跑一次 ffprobe。
+	// 证据的首要用途就是"外部只读这一份"，缺了实测值就不成立。
+	// 每项约 30 字、一张图最多十项，体积代价可以忽略。
+	Detail string `json:"detail,omitempty"`
 }
 
 // Evidence 一次运行的评测证据信封

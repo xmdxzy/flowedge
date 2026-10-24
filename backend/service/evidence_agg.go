@@ -266,7 +266,10 @@ func safeDiv(a, b float64) float64 {
 //
 // 排序即优先级：P0 在前，同级别按影响面。
 func diagnose(rep AggregateReport) []Diagnosis {
-	var out []Diagnosis
+	// 用 make 而不是 var：nil slice 序列化成 JSON 是 null，
+	// 前端 `report.diagnoses.map(...)` 会当场抛 null 错（面板白屏）。
+	// "没有问题"要表达成空数组，不是 null。
+	out := make([]Diagnosis, 0, 4)
 
 	// 规则 1：不可测占比过高 → 分数不可信（这是最容易被忽略、后果最严重的一条）
 	if rep.Overall.Runs >= 5 && rep.Overall.UnscoredRate > 0.2 {

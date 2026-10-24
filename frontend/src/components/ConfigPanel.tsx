@@ -201,7 +201,7 @@ export default function ConfigPanel({ onClose }: { onClose: () => void }) {
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
-              className={`px-2.5 py-1 rounded-lg text-[11px] border ${
+              className={`px-2.5 py-1 rounded-lg text-[11px] border whitespace-nowrap ${
                 tab === t.key
                   ? 'bg-primary/15 border-primary/50 text-primary'
                   : 'border-border text-gray-400 hover:text-gray-200'

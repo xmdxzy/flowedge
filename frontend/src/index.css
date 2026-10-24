@@ -88,14 +88,14 @@ body {
   border-radius: 12px !important;
   background: linear-gradient(180deg, var(--fe-node-a) 0%, var(--fe-node-b) 100%) !important;
   border: 1px solid var(--fe-line2) !important;
-  box-shadow: 0 4px 14px rgb(var(--fe-shadow) / 0.32), inset 0 1px 0 rgb(var(--fe-sheen) / 0.04) !important;
+  box-shadow: var(--fe-node-sh) !important;
   transition: box-shadow 0.2s ease, transform 0.2s ease, border-color 0.2s ease;
 }
 
 .react-flow__node > div:hover {
   transform: translateY(-1px);
   border-color: var(--fe-line3) !important;
-  box-shadow: 0 8px 22px rgb(var(--fe-shadow) / 0.42), inset 0 1px 0 rgb(var(--fe-sheen) / 0.06) !important;
+  box-shadow: var(--fe-node-sh-hi) !important;
 }
 
 .react-flow__node.selected > div {
@@ -284,8 +284,8 @@ body {
   /* —— 文字阶梯（强 → 弱）—— */
   --fe-text: #e9eef7;
   --fe-text2: #aeb9cb;
-  --fe-muted: #6d7c92;
-  --fe-muted2: #5b6982;
+  --fe-muted: #8494ab;
+  --fe-muted2: #7a89a1;
   --fe-on-accent: #ffffff;
 
   /* —— 边界阶梯（弱 → 强）—— */
@@ -329,6 +329,8 @@ body {
   --fe-rgb-hover: 26 36 50;
   --fe-rgb-line: 30 41 55;
   --fe-rgb-brand: 99 102 241;
+  /* 文字版主色：比实心底色亮一档，保证 on 暗底 ≥4.5:1 */
+  --fe-rgb-brand-ink: 129 140 248;
   --fe-rgb-cyan: 34 211 238;
   --fe-rgb-ok: 52 209 165;
   --fe-rgb-warn: 240 180 90;
@@ -353,6 +355,12 @@ body {
   --fe-scroll-hover: #3a4560;
   --fe-ring: rgb(129 140 248 / 0.65);
   --fe-input-bg: #0a0e14;
+  /* 运行中扫描光带：浅色底上必须更淡，否则糊住卡片文字 */
+  --fe-scan-1: rgb(34 211 238 / 0.16);
+  --fe-scan-2: rgb(34 211 238 / 0.34);
+  /* 节点卡片投影：浅色下要轻，重投影会让整块画布发灰 */
+  --fe-node-sh: 0 4px 14px rgb(0 0 0 / 0.32), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --fe-node-sh-hi: 0 8px 22px rgb(0 0 0 / 0.42), inset 0 1px 0 rgb(255 255 255 / 0.06);
 
   /* —— 形状 / 排版 / 动效 —— */
   --fe-r-xs: 5px;
@@ -379,8 +387,8 @@ body {
 
   --fe-text: #101827;
   --fe-text2: #41506a;
-  --fe-muted: #67768c;
-  --fe-muted2: #8b98a9;
+  --fe-muted: #5c6b81;
+  --fe-muted2: #626f85;
   --fe-on-accent: #ffffff;
 
   --fe-line: #e4eaf3;
@@ -420,6 +428,7 @@ body {
   --fe-rgb-hover: 238 242 249;
   --fe-rgb-line: 228 234 243;
   --fe-rgb-brand: 79 70 229;
+  --fe-rgb-brand-ink: 67 56 202;
   --fe-rgb-cyan: 14 116 144;
   --fe-rgb-ok: 15 118 110;
   --fe-rgb-warn: 161 98 7;
@@ -443,6 +452,10 @@ body {
   --fe-scroll-hover: #a9b8ce;
   --fe-ring: rgb(79 70 229 / 0.45);
   --fe-input-bg: #ffffff;
+  --fe-scan-1: rgb(14 116 144 / 0.09);
+  --fe-scan-2: rgb(14 116 144 / 0.18);
+  --fe-node-sh: 0 1px 2px rgb(var(--fe-shadow) / 0.04), 0 2px 8px rgb(var(--fe-shadow) / 0.08), inset 0 1px 0 #ffffff;
+  --fe-node-sh-hi: 0 2px 4px rgb(var(--fe-shadow) / 0.06), 0 8px 20px rgb(var(--fe-shadow) / 0.12), inset 0 1px 0 #ffffff;
 }
 
 body {
@@ -452,15 +465,23 @@ body {
 
 /* —— Tailwind 工具类 → 令牌 的桥 ——
    组件里历史遗留的 text-white / text-gray-* 表达的是「主/次/弱文字」，
-   这里一次性映射到文字阶梯，避免 80+ 处逐个改写引入回归。 */
+   这里一次性映射到文字阶梯，避免 200+ 处逐个改写引入回归。
+   灰阶**不分主题**：深色下原生的 gray-500/600 实测只有 3.8/2.4:1，本身就不过 AA。
+   用类选择器（不是 [class*=]）是为了不误伤 hover: 变体。 */
+.text-gray-100,
+.text-gray-200,
+.text-gray-300,
+.text-gray-400 { color: var(--fe-text2); }
+.text-gray-500,
+.text-gray-600 { color: var(--fe-muted); }
+.text-gray-700,
+.text-gray-800,
+.text-gray-900 { color: var(--fe-muted2); }
+/* text-primary 走"文字版主色"：bg-primary 仍是实心底色，两者不再互相拖累 */
+.text-primary { color: rgb(var(--fe-rgb-brand-ink)); }
+
+/* 浅色专属：深色主题下 text-white 就是对的，浅色下必须换成主文字色 */
 [data-theme='light'] .text-white { color: var(--fe-text) !important; }
-[data-theme='light'] .text-gray-100 { color: var(--fe-text) !important; }
-[data-theme='light'] .text-gray-200 { color: var(--fe-text) !important; }
-[data-theme='light'] .text-gray-300 { color: var(--fe-text2) !important; }
-[data-theme='light'] .text-gray-400 { color: var(--fe-text2) !important; }
-[data-theme='light'] .text-gray-500 { color: var(--fe-muted) !important; }
-[data-theme='light'] .text-gray-600 { color: var(--fe-muted) !important; }
-[data-theme='light'] .text-gray-700 { color: var(--fe-muted2) !important; }
 [data-theme='light'] .text-black { color: #0b1220 !important; }
 [data-theme='light'] .bg-\[\#0D121C\],
 [data-theme='light'] .bg-\[\#0D111B\],
@@ -480,6 +501,27 @@ body {
   background-color: var(--fe-panel);
   color: var(--fe-text);
 }
+
+/* —— Tailwind 调色板 → 令牌 的桥（第二类"写死的颜色"）——
+   组件里大量 text-amber-300 / text-indigo-300 / text-cyan-300 是为**深色底**挑的浅色调，
+   放到浅色白底上对比度只剩 1.1:1（自动审计抓到的实际值）。
+   这里按色相映射到语义色的 ink/fg 档，深色主题不受影响。
+   用 [class*=] 是为了连 /80、/90 这类透明度变体一起覆盖。 */
+[data-theme='light'] [class*='text-amber-'],
+[data-theme='light'] [class*='text-yellow-'],
+[data-theme='light'] [class*='text-orange-'] { color: var(--fe-warn-fg) !important; }
+[data-theme='light'] [class*='text-indigo-'],
+[data-theme='light'] [class*='text-violet-'],
+[data-theme='light'] [class*='text-purple-'] { color: var(--fe-brand-ink) !important; }
+[data-theme='light'] [class*='text-cyan-'],
+[data-theme='light'] [class*='text-sky-'],
+[data-theme='light'] [class*='text-blue-'] { color: var(--fe-cyan-ink) !important; }
+[data-theme='light'] [class*='text-teal-'],
+[data-theme='light'] [class*='text-emerald-'],
+[data-theme='light'] [class*='text-green-'] { color: var(--fe-ok-fg) !important; }
+[data-theme='light'] [class*='text-rose-'],
+[data-theme='light'] [class*='text-red-'],
+[data-theme='light'] [class*='text-pink-'] { color: var(--fe-danger-fg) !important; }
 
 /* ============ 断点 / 单步暂停标记 ============ */
 .react-flow__node.has-breakpoint::before {
@@ -570,6 +612,26 @@ body {
 .fe-topbar button,
 .fe-topbar label { white-space: nowrap; flex-shrink: 0; }
 .fe-topbar input { min-width: 0; flex-shrink: 1; }
+
+/* 窄屏：顶栏入口已有 12 个，1280 宽时「运行」会被挤出视口。
+   这里逐级压缩（缩间距 → 缩字号 → 缩工作流名输入框），不隐藏任何功能。
+   —— 不能给 .fe-topbar 加 overflow，否则「更多」下拉会被裁掉。 */
+@media (max-width: 1440px) {
+  .fe-topbar { gap: 3px; padding-left: 10px; padding-right: 10px; }
+  .fe-topbar .fe-tb { padding: 6px 7px; font-size: 11.5px; }
+  .fe-topbar input { width: 8rem; }
+  .fe-topbar .fe-vsep { margin: 0 1px; }
+}
+@media (max-width: 1320px) {
+  .fe-topbar { gap: 2px; padding-left: 8px; padding-right: 8px; }
+  .fe-topbar .fe-tb { padding: 6px 6px; font-size: 11px; }
+  .fe-topbar input { width: 6.5rem; padding-left: 6px; padding-right: 6px; }
+  .fe-topbar .fe-seg__item { width: 24px; }
+}
+
+/* 12 个入口在 ≤1320 宽物理上装不下（实测需 985px，可用 752px）。
+   取舍：低频 5 个在窄屏改从「⋯」进 —— 由 App 里的 useMediaQuery 条件渲染，
+   不用 CSS 隐藏（实测 @media 命中但 display 不生效，无法断言）。 */
 
 .fe-topbar::after {
   background: linear-gradient(
@@ -938,7 +1000,12 @@ body {
   border: 1px solid transparent;
 }
 .fe-card-tab:hover { color: var(--fe-text2); }
-.fe-card-tab[data-on='1'] { color: var(--fe-text); background: var(--fe-card-hi); border-color: var(--fe-line2); }
+.fe-card-tab[data-on='1'] {
+  color: var(--fe-brand);
+  background: var(--fe-brand-soft);
+  border-color: var(--fe-brand-line);
+  font-weight: 600;
+}
 
 .fe-card-item {
   position: relative;
@@ -1236,9 +1303,9 @@ body {
   background: linear-gradient(
     180deg,
     transparent 0%,
-    rgba(34, 211, 238, 0.16) 45%,
-    rgba(34, 211, 238, 0.34) 50%,
-    rgba(34, 211, 238, 0.16) 55%,
+    var(--fe-scan-1) 45%,
+    var(--fe-scan-2) 50%,
+    var(--fe-scan-1) 55%,
     transparent 100%
   );
   animation: fe-scan 2.1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
@@ -1256,8 +1323,8 @@ body {
 
 /* 失败态：左侧红条 + 静态描边（不闪，闪烁会让人焦虑） */
 .react-flow__node > div.node-failed {
-  border-color: rgba(248, 113, 113, 0.55) !important;
-  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.35), 0 8px 22px rgb(var(--fe-shadow) / 0.4) !important;
+  border-color: var(--fe-danger) !important;
+  box-shadow: 0 0 0 1px var(--fe-danger-line), var(--fe-node-sh) !important;
 }
 
 /* ---------- 选中态：四角光标式描边（平台工具感） ---------- */

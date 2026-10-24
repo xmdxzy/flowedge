@@ -112,6 +112,13 @@ func main() {
 	asrURL := getEnv("ASR_BASE_URL", "")
 	ttsURL := getEnv("TTS_BASE_URL", "")
 
+	// 环境变量为空时先看 data/deps.json 的 tts.base_url。
+	// 只认环境变量的话，切换 TTS 后端就必须重启外壳（外壳 spawn 引擎不带 env），
+	// 而配置文件在引擎重启后立即生效——这是可运维与不可运维的分界。
+	if ttsURL == "" {
+		ttsURL = service.TTSBaseURL()
+	}
+
 	// 本地 ASR 服务目录存在时，默认端点指向它（asr_server.py 固定监听 8101）。
 	// 否则会出现「引擎把服务拉起来了、能力面板却显示未启用、ASR 节点仍报 config_missing」
 	// 这种自相矛盾的状态——配置为空的语义应该是「用本地默认」，不是「不可用」。
@@ -727,6 +734,7 @@ func main() {
 		// 依赖进程托管（ComfyUI / ASR 一键启停）
 		depHandler := handler.NewDepHandler(depSupervisor)
 		api.GET("/deps", depHandler.List)
+		api.POST("/deps/reload", depHandler.Reload)
 		api.POST("/deps/:name/start", depHandler.Start)
 		api.POST("/deps/:name/stop", depHandler.Stop)
 		api.GET("/deps/:name/wait", depHandler.Wait)

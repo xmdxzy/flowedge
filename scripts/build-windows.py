@@ -55,6 +55,28 @@ def which(name):
     return shutil.which(name) or shutil.which(name + ".cmd") or shutil.which(name + ".exe")
 
 
+def find_go():
+    """找 go 工具链。先看 PATH，再按常见安装位置兜底。
+
+    兜底不是多余：agent 的 shell 常常继承不到用户后来设置的 PATH（2026-10-23 实测，
+    同样一条命令在交互终端里能跑、在工具调用里就报「未找到 go 工具链」）。
+    """
+    go = which("go")
+    if go:
+        return go
+    candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Go", "bin", "go.exe"),
+        r"C:\Program Files\Go\bin\go.exe",
+        r"C:\Go\bin\go.exe",
+        "/usr/local/go/bin/go",
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            log("PATH 里没有 go，改用 %s" % cand)
+            return cand
+    return None
+
+
 def run(cmd, cwd=None, env=None):
     log("$ " + " ".join(cmd))
     proc = subprocess.run(cmd, cwd=cwd, env=env)
@@ -121,7 +143,7 @@ def embed_services():
 
 
 def build_backend(version):
-    go = which("go")
+    go = find_go()
     if not go:
         fail("未找到 go 工具链。请安装 Go 1.25+ 或把 go 所在目录加入 PATH")
 

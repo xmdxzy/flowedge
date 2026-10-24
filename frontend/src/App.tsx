@@ -52,6 +52,7 @@ import StatusBar from './components/StatusBar'
 import NodePalette from './components/NodePalette'
 import { bumpNodeUsage, readNodeUsage, type NodeUsageMap } from './lib/nodeUsage'
 import { useHotkeys } from './hooks/useHotkeys'
+import { useMediaQuery, NARROW_QUERY } from './hooks/useMediaQuery'
 import { useWebSocket, type WSEvent } from './hooks/useWebSocket'
 import ExecutionPanel from './components/ExecutionPanel'
 import ContextMenu from './components/ContextMenu'
@@ -283,6 +284,8 @@ function FlowEditor() {
   const [kbOpen, setKbOpen] = useState(false)
   const [diagOpen, setDiagOpen] = useState(false)
   const [evoOpen, setEvoOpen] = useState(false)
+  // 窄屏（≤1320）顶栏放不下 12 个入口：低频 5 个改从「⋯」进，宽屏保持快捷入口
+  const narrow = useMediaQuery(NARROW_QUERY)
   const [composeOpen, setComposeOpen] = useState(false)
   const [envOpen, setEnvOpen] = useState(false)
   const [triggerOpen, setTriggerOpen] = useState(false)
@@ -1393,9 +1396,9 @@ function FlowEditor() {
       <ToastHost />
       <div className="flex flex-1 min-h-0">
       {/* 左侧节点库 */}
-      <div className="w-60 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
+      <div className="w-60 shrink-0 border-r border-border bg-surface p-4 flex flex-col gap-2 overflow-y-auto">
         <div className="flex items-center justify-between mb-2">
-          <h3 className="text-sm font-semibold text-gray-300">节点库</h3>
+          <h3 className="text-sm font-semibold text-gray-300 whitespace-nowrap">节点库</h3>
           <button
             onClick={() => setCmdOpen(true)}
             title="命令面板（Ctrl/Cmd + K）"
@@ -1557,9 +1560,11 @@ function FlowEditor() {
             >
               工具
             </button>
-            <button
-              onClick={() => setComposeOpen(true)}
-              className="fe-tb"
+            {!narrow && (
+              <>
+                <button
+                  onClick={() => setComposeOpen(true)}
+                  className="fe-tb"
               title="说一句要做什么，生成工作流与任务书（只生成，不执行）"
             >
               构图
@@ -1585,13 +1590,15 @@ function FlowEditor() {
             >
               进化
             </button>
-            <button
-              onClick={() => setGalleryOpen(true)}
-              className="fe-tb"
-              title="浏览生成的图片 / 视频 / 音频"
-            >
-              产物
-            </button>
+                <button
+                  onClick={() => setGalleryOpen(true)}
+                  className="fe-tb"
+                  title="浏览生成的图片 / 视频 / 音频"
+                >
+                  产物
+                </button>
+              </>
+            )}
 
             <div className="fe-vsep" />
 
@@ -1613,6 +1620,51 @@ function FlowEditor() {
                   <div className="fixed inset-0 z-[55]" onClick={() => setMoreOpen(false)} />
                   <div className="fe-menu" role="menu">
                     <div className="mi-group">内容</div>
+                    {/* 窄屏专用：顶栏收起这五项后从这里进；宽屏不渲染，避免重复入口 */}
+                    {narrow && (
+                      <>
+                    <button
+                      onClick={() => {
+                        setComposeOpen(true); setMoreOpen(false)
+                      }}
+                    >
+                      构图 · 一句话生成
+                    </button>
+                    <button
+                      
+                      onClick={() => {
+                        setKbOpen(true); setMoreOpen(false)
+                      }}
+                    >
+                      知识库
+                    </button>
+                    <button
+                      
+                      onClick={() => {
+                        setDiagOpen(true); setMoreOpen(false)
+                      }}
+                    >
+                      运行诊断
+                    </button>
+                    <button
+                      
+                      onClick={() => {
+                        setEvoOpen(true); setMoreOpen(false)
+                      }}
+                    >
+                      自进化
+                    </button>
+                    <button
+                      
+                      onClick={() => {
+                        setGalleryOpen(true); setMoreOpen(false)
+                      }}
+                    >
+                      产物画廊
+                    </button>
+                    <div className="mi-sep" />
+                      </>
+                    )}
                     <button
                       onClick={() => {
                         setTplLibOpen(true); setMoreOpen(false)
@@ -1827,6 +1879,8 @@ function FlowEditor() {
               <MiniMap
                 pannable
                 zoomable
+                /* 缩到 168×112：原来 200×150 的白盒子在浅色画布上太抢眼 */
+                style={{ width: 168, height: 112 }}
                 bgColor={CANVAS_THEME[theme].minimapBg}
                 nodeColor={CANVAS_THEME[theme].minimapNode}
                 maskColor={CANVAS_THEME[theme].minimapMask}

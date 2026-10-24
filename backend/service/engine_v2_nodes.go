@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -702,11 +704,38 @@ func (e *EngineV2) execTTSNode(node *model.NodeInstance, upstream map[string]int
 	if v, ok := node.Data["rate"].(float64); ok {
 		rate = int(v)
 	}
+	// 零样本克隆（Audio8 专用）：参考音频 + 逐字稿。给了参考音频就不看 voice，
+	// 因为克隆走的是 prompt 里的参考码本，voice 名对它没有意义。
+	refAudio, _ := node.Data["ref_audio"].(string)
+	refText, _ := node.Data["ref_text"].(string)
+	if refAudio != "" {
+		if refText == "" {
+			return nil, fmt.Errorf("tts 节点指定了参考音频但没填参考音频文本：克隆需要「与录音逐字一致」的文本，空着会明显掉音质")
+		}
+		if _, statErr := os.Stat(refAudio); statErr != nil {
+			return nil, fmt.Errorf("tts 参考音频不存在：%s（%v）", refAudio, statErr)
+		}
+		voice = ""
+	}
 
 	release := e.enterSide(sideAudio)
 	defer release()
 
-	backend, err := e.tts.SynthesizeWith(text, outputPath, TTSOptions{Voice: voice, Rate: rate})
+	// TTS 依赖没起时按需拉起。
+	// `autostart=false` 的语义是「不常驻、不白占显存」，不是「必须手动点启动」——
+	// 不自动起的话，节点会静默回退 Windows SAPI：产出的是系统音色，用户还以为是
+	// Audio8 的结果（2026-10-23 实测踩到）。宁可多花 6 秒起服务，也不能给出错音色。
+	if e.deps != nil && !e.deps.Healthy("tts") && e.deps.Startable("tts") {
+		if startErr := e.deps.Start("tts"); startErr != nil {
+			log.Printf("[tts] 按需启动失败（继续尝试，可能回退 SAPI）：%v", startErr)
+		} else if waitErr := e.deps.WaitReady("tts", 300*time.Second); waitErr != nil {
+			log.Printf("[tts] 依赖已启动但未就绪：%v", waitErr)
+		}
+	}
+
+	backend, err := e.tts.SynthesizeWith(text, outputPath, TTSOptions{
+		Voice: voice, Rate: rate, RefAudio: refAudio, RefText: refText,
+	})
 	if err != nil {
 		return nil, err
 	}

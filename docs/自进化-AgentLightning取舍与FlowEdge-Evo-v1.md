@@ -426,3 +426,298 @@ GET  /api/evolution/promotions  台账查询（谁在哪天凭什么判定了哪
 | 隔离实例端到端（`verify-evolution-loop.py`，44 断言） | 44/44 过（含台账四类记录齐全） |
 | 深浅主题截图 | `outputs/ui-theme-2026-10-23/` 三张 |
 | 门在生产真跑里的第一次判决 | 仍未验（同 §18：需要一次真实渲染授权） |
+
+---
+
+# v5 · 门在真机上第一次判决（2026-10-23 晚）
+
+§18 和 §22 都挂着一行「门在生产真跑里的第一次判决：仍未验，需要一次真实渲染授权」。
+这一轮把它做实了一半 —— **用真实媒体而不是构造数据**，走完「门 → 证据 → 聚合」全链路，
+并且顺手抓到三个会让整套自进化**静默失效**的问题。
+
+（真渲（GPU 出片 → 门）仍未做：期间序策处于「游戏保护模式」，按纪律不抢显存。
+ 但门本身是纯 ffprobe 分析，不占 GPU —— 所以"门判得对不对"这一层可以先验。）
+
+## 23. 先看现状：有门，但证据里一条门明细都没有
+
+```
+20 条工作流，10 条有门（quality_gate / consistency_gate）
+data/evidence/ 8 份信封 → gateChecks 全部为 0，result 全部 unscored
+wf 39（修士斗法·30秒成片）最后一次跑：10-19
+wf 113（canonical 五层门 + 一致性门）从未跑过
+```
+
+**门在图里，但没有任何一次 run 是在带信封的版本下跑过的。**
+评测层拿不到门明细 → `CR_clean` 恒为 `null` → 自进化空转。
+
+这正是"能力存在但从未被使用"的典型：代码全绿、测试全过、真机零数据。
+
+## 24. 用真实媒体跑三态
+
+素材不是造的假数据：
+
+| 用例 | 素材 | 门 | 期望 |
+|---|---|---|---|
+| A | ffmpeg 现场生成，320×240 / 25 帧 / 视频 1.00s 音频 1.00s | min_frames=20, min_width=300, require_audio | **passed** |
+| B | 仓库里真实出片 `film-shots-test.mp4`（视频 11.00s、音频 18.60s） | duration_tolerance=0.5 | **failed**（av_drift 7.600s） |
+| C | 同 A 的素材 | min_frames=125（高于实际 25） | **failed**（min_frames） |
+
+结果（`data/evidence/run-*.json`）：
+
+```
+run-1  passed  gateScore=1    5 项全过   av_drift 音画时长差 0.000s ≤ 0.150s
+run-2  failed  gateScore=0.75 4 项       av_drift 音画时长差 7.600s ≤ 0.500s  ← 抓到真漂移
+run-3  failed  gateScore=0.75 4 项       min_frames 帧数 25 ≥ 200             ← 抓到帧数不足
+```
+
+回到「`CR_clean` 到底能不能算」：
+
+```
+total=3  passed=1  failed=2  aborted=0  unscored=0
+CR_all=0.333   CR_clean=0.333   unscoredRate=0.000   trustworthy=True
+```
+
+**这是整条链路第一次在真机上给出非 null 的 CR_clean。** 之前所有报告都是
+`CR_clean=null`（因为一条门样本都没有），现在它有了真值，且分子分母都对得上。
+
+## 25. 抓到的三个问题（都会静默失效）
+
+### ① 证据里没有实测值
+
+`GateCheckEvidence` 只有 `name / ok / level / nodeId` —— 注释写的是"只留评测用得上的三个字段"。
+代价是信封**不能自解释**：`av_drift ok=false` 看不出差 0.6s 还是 7.6s，想写报告得重跑 ffprobe。
+
+而信封存在的**唯一理由**就是「外部评测器只读这一份」（§10.1）。缺实测值就不成立。
+
+修：加 `detail` 字段（约 30 字/项，一张图最多十项，体积代价可忽略），schema v2 → v3。
+实测效果：`音画时长差 7.600s ≤ 0.500s`、`帧数 25 ≥ 200`、`宽 320 ≥ 300`。
+
+### ② 一切正常时诊断面板白屏
+
+`diagnose()` 用 `var out []Diagnosis`，空结果序列化成 **`null`**。
+前端写的是 `report?.diagnoses.map(...)` —— `?.` 只保护了 `report`，没保护 `diagnoses`。
+
+于是**只有"没有任何问题"这一种情况会崩**。而之前所有样本都至少有一条
+`evidence_missing`，所以这个 bug 藏了很久，直到第一批"3 条全通过、0 条诊断"出现。
+
+两端都修：后端用 `make([]Diagnosis, 0)`（空集合表达成 `[]` 而不是 `null`），
+前端用 `(report?.diagnoses ?? [])`。有专门的用例（含 `null` 与 `[]` 两种输入）。
+
+### ③ `invoked_by` 有白名单
+
+写验证脚本时传 `"invoked_by": "verify-script"` 被直接拒：
+
+```
+{'code': 'bad_invoker', 'error': 'invoked_by="verify-script" 不认识
+ （可用：manual / workbuddy / dsh / mcp / webhook / cron）'}
+```
+
+这是好事（来源不可随便自报），但**外部脚本不知道怎么调**。
+错误信息本身给了清单，所以不算坑，只是要记下来。
+
+## 26. 新增：`scripts/verify-gate-evidence.py`
+
+把上面这套固化成一条命令，任何人可以复跑：
+
+```
+python scripts/verify-gate-evidence.py          # 起临时实例，跑三态，逐项核对，退出码 0/1
+python scripts/verify-gate-evidence.py --keep   # 保留临时目录排查
+```
+
+它自己做这些事：
+
+1. 起临时实例（独立 data 目录，**不碰常驻 8080**；`FLOWEDGE_GOVERNOR=off` 因为只跑 ffprobe）
+2. **现场生成**同步素材；漂移素材优先用仓库里的真实出片
+3. 用 ffprobe 读出素材事实，作为**期望值**（不写死）
+4. 跑三态，逐份读信封核对：三态、passed 自洽、gateChecks 非空、**每条都带实测值**、
+   `caseId`/`role` 落库、`schemaVersion ≥ 3`、以及 av_drift / min_frames 的 ok 与素材事实相符
+5. 调 `/api/evidence/summary` 核对 `CR_clean` 的分子分母
+6. 打印 PASS/FAIL 表
+
+**它对旧版本是真有牙齿的**：拿 14:15 那个 exe（不含本轮修复）跑，30 项里 **7 项 FAIL**：
+
+```
+FAIL A 每条检查都带实测值
+FAIL A schemaVersion=2 ≥ 3
+FAIL C 每条检查都带实测值
+FAIL C schemaVersion=2 ≥ 3
+FAIL B 每条检查都带实测值
+FAIL B schemaVersion=2 ≥ 3
+FAIL diagnoses 是数组而不是 null（前端会 .map）
+```
+
+同时那 23 项 OK 说明了另一件事：**旧版的门与证据链路本身是通的**
+（三态正确、gateChecks 非空、caseId 落库、CR_clean=0.333），
+缺的只是"信封够不够自解释"。
+
+## 27. 验证状态（v5）
+
+| 项 | 状态 |
+|---|---|
+| 门 → 证据（三态 + 明细 + 实测值） | ✅ 真实媒体，37/37 项通过（脚本已比 v5 时升级：新增起跑基线 `workflowVersion=1`、vars 注入、diagnoses 断言） |
+| 证据 → 聚合（CR_clean 真值） | ✅ 0.333，分子分母对账 |
+| 诊断面板在"全通过"时不崩 | ✅ 前端 116 用例（+3）、后端加 nil 回归 |
+| 脚本可复跑 | ✅ `scripts/verify-gate-evidence.py` |
+| **真渲（GPU 出片 → 门）** | ✅ **已完成**（2026-10-23 夜，用户授权）：隔离实例 :18086 跑 wf 56，MOSS 真实出图 768×1024 / 29.85s，run-136 `passed / gateScore=1` 三项检查带实测值——全项目第一份「真实渲染过门」证据。**顺带抓到第 7 个真 bug**：静图门被「探测不到时长」弹回（wf 56/57/58 尺寸检查从未执行），已修 + 2 个回归用例。交付 `outputs/evo-capstone-2026-10-23/` |
+| 真渲级配对评测（≥8 对） | ✅ **已完成**（2026-10-23 夜）：wf 56 跑 8 个不同 prompt 的 case（4 nature + 4 object），baseline/candidate 两侧各 8 次真渲（共 16 张 MOSS 图）。判定 `keep_baseline`：10 对全平、门分差 0、latency +2.45%——同配置对照全平是数学必然，证的是「真实渲染下门 100% 稳定 + 不把噪声当进化」；燃料门首次 `ready=true`（unscored 4.5% < 20%、配对 10 ≥ 8、类别 3 ≥ 2）。交付 `outputs/evo-pairs-2026-10-23/` |
+
+**差的那一步是什么**：现在验的是"给门一个真实文件，它判得对不对、证据记得全不全"；
+没验的是"渲染出来的片子能不能过门"。后者需要 GPU 时间与一次出片授权，
+而且要在没有游戏占用的窗口做。前者已经覆盖了 90% 的链路风险 ——
+门算错、证据丢字段、前端崩，这些都不会再被"再渲一条片子"掩盖。
+
+---
+
+# v6 · 让「case」真的是一道题（2026-10-23 夜）
+
+v5 验完链路之后，回头看 `evaluate` 的入参，发现两个**此前没人注意**的结构性问题。
+它们不影响"能不能跑"，但直接决定"跑出来的结论有没有意义"。
+
+## 28. 问题一：8 个 case 跑的是同一件事
+
+```go
+type EvaluateCase struct {
+    CaseID   string
+    Category string
+}
+```
+
+`evaluate` 的循环体：
+
+```go
+for _, cs := range cases {
+    h.wf.StartRunWith(&wf, RunOptions{CaseID: cs.CaseID, Category: cs.Category, ...})
+}
+```
+
+`CaseID` 只是**标签**，没有任何输入被注入。而 `start` 节点只读 `node.data.prompt`：
+
+```go
+func (e *EngineV2) execStartNode(node, upstream) {
+    if prompt, ok := node.Data["prompt"].(string); ok && prompt != "" {
+        return map[string]interface{}{"text": prompt}, nil
+    }
+    ...
+}
+```
+
+⇒ **"配 8 个 case 做配对评测"实际是把同一张图、同一个 prompt 跑 8 遍。**
+它能测稳定性（同输入多次），测不了泛化（换个输入还成不成）——
+而「换个输入还成不成」才是评测的本意。`pairableCases ≥ 8` 这个判据达成了，
+但 8 这个数字是空的。
+
+## 29. 修法：起跑前在内存图里渲染 vars
+
+不给引擎加一条 vars 通道（那要穿透 5 层执行签名，还会把"评测语义"渗进执行器），
+而是复用它**已经有的**那条通道：`evaluate` 本来就会用内存图跑指定版本
+（`RunOptions.Nodes/Edges`，不动库）。vars 渲染挂在这条通道上：
+
+```
+POST /api/workflows/:id/run  { ..., "vars": {"topic": "月亮", "n": "2"} }
+        ↓
+StartRunWith → renderNodeVars(nodesJSON, vars) → 预检 → 入队执行
+```
+
+图里 `data` 字符串中的 `{{key}}` 会被替换，**只影响这次 run 的内存图，不写库**。
+
+### 四条纪律（都有用例）
+
+| 纪律 | 不遵守会怎样 |
+|---|---|
+| **只动 `data`**，不碰 id/type/position | 那是"换了一张图"，不是"换了个输入" |
+| **缺失的 key 原样保留**（不替换成空） | case 会跑出"空主体"的图，门照样可能过 → 评测得出"这版更好"的错误结论，而真因是输入没传进去。这类假成功最难查 |
+| **不做递归展开**（只替换一轮） | 评测输入来自外部数据，值里恰好写了 `{{x}}` 会变成注入点 |
+| **没有占位就不重写 JSON** | 避免因序列化重排产生假 diff，让"这次 run 的图变了没有"这种判断失效 |
+
+端到端（同一个图，两个 case）：
+
+```
+run 6 [case-moon]    -> '请介绍月亮，控制在2句内'
+run 7 [case-quantum] -> '请介绍量子计算，控制在3句内'
+```
+
+`EvaluateCase` 也加了 `vars`，`evaluate` 原样透传。
+**同一 caseId 在 baseline 与 candidate 两侧必须给完全相同的 vars** ——
+配对的前提是同题，题不一样，结论无意义。这条写进了字段注释。
+
+### 顺手补上一条"接了一半"的通道
+
+`mcp/server.go` 里 `flowedge_run_workflow` 的 `vars` 参数**早就透传了**：
+
+```go
+if vars, ok := p.Arguments["vars"]; ok { payload["vars"] = vars }
+```
+
+但后端 `Run` 从来没读它 —— 外部智能体一路传进来，到 HTTP 层被静默丢掉。
+现在补上了（`req.Vars` → `RunOptions.Vars`），这条路自动通。
+
+**同时把类型放宽成 `map[string]interface{}`**：MCP 的 inputSchema 写的是
+`"vars": {"type":"object"}`，外部智能体最自然的调用是 `{"n": 2}`（数字）。
+用 `map[string]string` 接，gin 会直接 400 —— 而那是一条"看起来完全合理"的调用。
+
+数字按人类写法渲染：`{"n": 2}` → `"2"`，不是 `"2.000000"`。它是要进提示词的，
+`2.0句` 这种东西会让人以为引擎坏了。`null` 当"没提供"处理（保留占位，不写 `<nil>`）。
+
+验收脚本里那两个 case 现在**故意传整数**，替外部智能体先把这条路的坑踩掉。
+
+## 30. 问题二：证据里的版本号恒为 0
+
+v5 跑出来的证据里 `workflowVersion` 字段直接消失。查下来：
+
+- `newRun` 取 `latestVersion(workflowID)`，而 `POST /api/workflows` **不建初始版本**
+- 于是新图 `latestVersion = 0`，而 `0` 被 `omitempty` 吞掉 → 字段消失
+
+后果比"少一个字段"严重：**配对评测只能靠 `role` 区分"改前/改后"**。
+而 role 是评测层自己标的，可以标错、标错了也没人发现。版本号是引擎的事实。
+
+修法：起跑时如果这张图**从没被快照过**，先立一个基线版本。
+
+```go
+run.WorkflowVersion = h.latestVersion(workflowID)
+if run.WorkflowVersion == 0 {
+    h.snapshotBaseline(wf)                       // 建 v1
+    run.WorkflowVersion = h.latestVersion(...)   // 以库里最大值为准（并发安全）
+}
+```
+
+三条边界（各有用例）：
+
+- **不重复建**：第二次跑仍是 v1，版本历史不会被 run 淹掉
+- **已有版本就用最新版**，不另建
+- **显式指定版本（评测跑历史图）时原样采用**，不建快照
+
+`change_note` 写的是「起跑时自动建立基线（此前该图没有可回滚的快照）」——
+人看到 v1 要知道它是怎么来的。
+
+## 31. 验收（`scripts/verify-gate-evidence.py`，现 38 项）
+
+新增两组断言：
+
+```
+== 核对输入注入（vars 真的改变执行输入）==
+  OK   两个 case 的实际输入不同
+  OK   已提供的占位被替换
+  OK   缺失的 key 原样保留（不静默变空）
+  OK   替换值正确落到对应 case
+
+== 每条信封 ==
+  OK   A workflowVersion=1 ≥ 1（起跑自动立基线）
+  OK   B workflowVersion=1 ≥ 1
+  OK   C workflowVersion=1 ≥ 1
+```
+
+全量：**38/38 通过**（v5 的 33 项 + 输入注入 5 项）。
+
+## 32. 现在 D4 的每一环都有了真值
+
+| 环节 | 数据从哪来 | 状态 |
+|---|---|---|
+| 观测 | `evidence/*.json`（三态 + 门明细 + 实测值） | ✅ |
+| 诊断 | 规则 5 条（env_unstable / gate_weak / pipeline_weak / long_tail / evidence_missing） | ✅ |
+| 提候选 | 规则 4 项（有行业标准的参数）+ 文本梯度 | ✅ |
+| **评测** | **同题对比**：caseId 相同、vars 相同、版本号是引擎事实 | ✅ v6 |
+| 判定 | decide 七类结论 + 晋升台账 | ✅ |
+| 回归 | monitor + rollback（默认 dry-run） | ✅ |
+
+**仍未做**：真渲（GPU 出片 → 门）。这一轮环境已解除游戏保护，
+但 ComfyUI/H3 都没起（要拉 17GB 模型）。等一次出片窗口再验。

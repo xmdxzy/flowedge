@@ -128,6 +128,14 @@ func (h *EvolutionHandler) Instrument(c *gin.Context) {
 type EvaluateCase struct {
 	CaseID   string `json:"caseId"`
 	Category string `json:"category"`
+	// Vars 这个 case 的输入：图里 data 字符串中的 {{key}} 会被替换。
+	//
+	// 没有它，"跑 8 个 case"就是把同一张图、同一个 prompt 跑 8 遍 ——
+	// 只能测稳定性，测不出"换个输入还成不成"。而后者才是评测的本意。
+	//
+	// 同一个 caseId 在 baseline 与 candidate 两侧必须给**完全相同**的 Vars，
+	// 否则比的是两份不同的输入，结论无效（配对的前提就是同题）。
+	Vars map[string]interface{} `json:"vars,omitempty"`
 }
 
 // Evaluate POST /api/evolution/evaluate
@@ -217,6 +225,7 @@ func (h *EvolutionHandler) Evaluate(c *gin.Context) {
 		for _, cs := range cases {
 			h.wf.StartRunWith(&wf, RunOptions{
 				InvokedBy:          "evaluate",
+				Vars:               cs.Vars,
 				CaseID:             cs.CaseID,
 				Category:           cs.Category,
 				DatasetFingerprint: fingerprint,

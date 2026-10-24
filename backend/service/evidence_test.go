@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -291,5 +292,51 @@ func TestEvidence_CarriesEvalSemanticsFromRun(t *testing.T) {
 	}
 	if ev.InvokedBy != "evaluate" {
 		t.Fatalf("invokedBy 应记 evaluate，实得 %q", ev.InvokedBy)
+	}
+}
+
+// 门检查项的**实测值**必须进证据。
+//
+// 2026-10-23 实测发现的漏洞：GateCheckEvidence 只有 name/ok/level，
+// 门执行器输出的 detail（"音画时长差 7.635s ≤ 0.500s"）在反序列化时被丢掉。
+// 后果：证据里只有 av_drift=false，看不出差 0.6s 还是 7.6s —— 想写报告得重跑 ffprobe，
+// 而"外部评测器只读这一份"正是信封存在的理由。
+func TestEvidence_GateCheckKeepsDetail(t *testing.T) {
+	// 用门执行器真实的输出形态（quality_gate.go 的 gateCheck 结构，JSON 同名字段）
+	out := map[string]interface{}{
+		"gate": "fail",
+		"checks": []map[string]interface{}{
+			{"name": "av_drift", "ok": false, "level": "fail",
+				"detail": "音画时长差 7.635s ≤ 0.500s", "fix": "重算 xfade offset"},
+			{"name": "min_frames", "ok": true, "level": "fail",
+				"detail": "帧数 264 ≥ 200"},
+		},
+	}
+	states := []model.NodeInstance{
+		{ID: "q", Type: "quality_gate", Status: "failed", Output: out},
+	}
+	_, checks, nodes, blocked, crashed := gateFacts(states)
+
+	if len(checks) != 2 {
+		t.Fatalf("应解析出 2 项检查，实际 %d", len(checks))
+	}
+	if checks[0].Detail == "" {
+		t.Fatal("实测值丢了 —— 信封不能自解释")
+	}
+	if !strings.Contains(checks[0].Detail, "7.635") {
+		t.Fatalf("实测值要带具体数字：%q", checks[0].Detail)
+	}
+	// 通过的项也要有实测值（人对比"改前 264 帧 / 改后 124 帧"要靠它）
+	if checks[1].Detail == "" {
+		t.Fatal("通过的项也该带实测值")
+	}
+	if checks[0].NodeID != "q" {
+		t.Fatalf("要归因到门节点：%q", checks[0].NodeID)
+	}
+	if !blocked || crashed {
+		t.Fatalf("门有 check 且判不过 = blocked（不是 crashed）：blocked=%v crashed=%v", blocked, crashed)
+	}
+	if len(nodes) != 1 || nodes[0] != "q" {
+		t.Fatalf("门节点清单不对：%v", nodes)
 	}
 }

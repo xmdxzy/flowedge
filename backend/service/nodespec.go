@@ -46,7 +46,7 @@ var NodeSpecs = map[string]NodeSpec{
 	"text_split":   {Type: "text_split"},
 	"end":          {Type: "end"},
 	"if_else":      {Type: "if_else"},
-	"loop":         {Type: "loop"},
+	"loop": {Type: "loop", MaxTimeout: 8 * time.Hour}, // Goal/长循环：默认 3 分钟会把正常的多轮 agent 循环误杀
 	"sub_workflow": {Type: "sub_workflow"},
 	"aggregate":    {Type: "aggregate"},
 	"code":         {Type: "code"},

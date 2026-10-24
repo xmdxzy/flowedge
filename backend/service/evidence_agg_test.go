@@ -258,3 +258,22 @@ func TestAggregate_CRCleanPresentWithGateSamples(t *testing.T) {
 		t.Fatalf("CR_clean 应为 2/3（aborted 不进这个分母），实际 %.3f", got)
 	}
 }
+
+// 没有诊断时必须是空数组，不能是 nil。
+//
+// nil slice 序列化成 JSON 是 null，前端 `report.diagnoses.map(...)` 会当场抛错白屏。
+// 这个坑只有"一切正常"的数据才会触发 —— 之前两年（夸张说法）的所有样本都至少有一条
+// evidence_missing，所以一直没暴露。2026-10-23 第一次跑出"3 条全通过、0 条诊断"才现形。
+func TestAggregate_DiagnosesNeverNil(t *testing.T) {
+	recs := []RunRecord{
+		rec(1, 1, EvidencePassed, 100),
+		rec(2, 1, EvidencePassed, 120),
+	}
+	rep := AggregateRuns(recs)
+	if rep.Diagnoses == nil {
+		t.Fatal("诊断为空时要给空数组，不能给 nil（前端会崩）")
+	}
+	if len(rep.Diagnoses) != 0 {
+		t.Fatalf("全部通过时不该有诊断，实际 %d 条", len(rep.Diagnoses))
+	}
+}

@@ -38,7 +38,7 @@ export default function DebugPanel({
     return (
       <button
         onClick={onStartDebug}
-        className="px-3 py-1.5 rounded-lg bg-warning/20 hover:bg-warning/30 text-warning text-sm transition-all"
+        className="px-3 py-1.5 rounded-lg bg-warning/15 hover:bg-warning/25 text-warning text-sm border border-warning/40 transition-colors"
         title="开启调试模式：运行到断点会停下，可单步执行"
       >
         🐞 调试{breakpointCount > 0 ? ` (${breakpointCount})` : ''}

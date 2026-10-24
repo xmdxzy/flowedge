@@ -256,10 +256,11 @@ export default function DiagnosticsPanel({
 
         {/* 诊断列表 */}
         <div className="px-4 py-3 flex flex-col gap-2">
-          {report && report.diagnoses.length === 0 && (
+          {report && (report.diagnoses?.length ?? 0) === 0 && (
             <p className="text-[11px] text-gray-500">没有发现明显问题。跑更多任务后这里会有结论。</p>
           )}
-          {report?.diagnoses.map((d, i) => (
+          {/* ?? [] 不是多余的：老接口（和任何返回 null 的实现）会让 .map 抛错白屏 */}
+          {(report?.diagnoses ?? []).map((d, i) => (
             <div key={i} className={`rounded-lg p-2.5 ${SEV_STYLE[d.severity] || 'bg-white/[0.03]'}`}>
               <div className="flex items-center gap-2">
                 <span className="text-[9px] font-mono text-gray-500">{d.severity}</span>

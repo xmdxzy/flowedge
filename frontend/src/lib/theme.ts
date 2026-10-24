@@ -84,14 +84,14 @@ export const CANVAS_THEME: Record<
     bg: '#0a0e14',
     dot: '#1c2436',
     minimapBg: '#0d111b',
-    minimapMask: 'rgba(10, 14, 20, 0.72)',
+    minimapMask: 'rgba(10, 14, 20, 0.78)',
     minimapNode: '#818cf8',
   },
   light: {
     bg: '#f4f6fb',
     dot: '#cfd9e8',
-    minimapBg: '#ffffff',
-    minimapMask: 'rgba(244, 246, 251, 0.72)',
+    minimapBg: '#f8fafd',
+    minimapMask: 'rgba(240, 244, 250, 0.82)',
     minimapNode: '#4f46e5',
   },
 }

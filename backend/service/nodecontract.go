@@ -222,14 +222,20 @@ var Modules = map[string]ModuleContract{
 			// 于是面板上填不了、compose 也不知道它需要 —— 画出来的 loop 必然跑不起来。
 			{Key: "workflow_id", Label: "要循环的工作流 id",
 				Help: "必填。必须是已保存的工作流；构图阶段还没有这个 id，所以那时不能用 loop"},
-			{Key: "mode", Label: "循环方式", Options: []string{"count", "while", "foreach"}},
+			{Key: "mode", Label: "循环方式", Options: []string{"count", "foreach", "until"}},
 			{Key: "iterations", Label: "次数"},
 			{Key: "max_iterations", Label: "最大次数（防死循环）"},
 			{Key: "separator", Label: "拼接分隔符"},
+			{Key: "condition_type", Label: "停止条件",
+				Options: []string{"not_empty", "contains", "not_contains", "equals"},
+				Help:    "mode=until 时生效：用内层工作流最后一轮的输出文本判断"},
+			{Key: "compare_value", Label: "比较值", Help: "contains / not_contains / equals 时使用"},
 		},
 		Agent: "对同一段子图重复执行。all 端口给的是数组，下游可以用 aggregate 收成一段文本。" +
 			"**必须先在 workflow_id 里指定一条已存的工作流** —— 它引用子流程，不是内联子图。" +
 			"所以构图（生成新图）阶段用不了它：那时还没有可引用的 id，画出来会成环。" +
+			"mode=until 时每轮把内层最后一轮输出当作下一轮输入，直到命中 condition_type/compare_value；" +
+			"达到 max_iterations 仍未命中时 stopped_by=max_iterations，外层必须据此判定失败，不能当成完成。" +
 			"要「逐段处理」请用 text_split 的 parts 接下游，或在节点数上限内顺序展开。",
 	},
 
@@ -532,6 +538,8 @@ var Modules = map[string]ModuleContract{
 		KeyParams: []KeyParam{
 			{Key: "text", Label: "文本（留空取上游）"},
 			{Key: "voice", Label: "音色（Kokoro 音色名 / Audio8 已注册音色）"},
+			{Key: "ref_audio", Label: "参考音频路径（Audio8 克隆；非空则忽略音色）"},
+			{Key: "ref_text", Label: "参考音频逐字稿（克隆必填）"},
 			{Key: "rate", Label: "语速（仅 Kokoro 生效）"},
 			{Key: "device", Label: "设备", Options: []string{"cpu", "cuda"}},
 		},

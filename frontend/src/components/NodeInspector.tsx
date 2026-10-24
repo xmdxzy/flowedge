@@ -137,7 +137,7 @@ export default function NodeInspector({
   })()
 
   return (
-    <div className="w-72 border-l border-border bg-surface p-4 overflow-y-auto">
+    <div className="w-72 shrink-0 border-l border-border bg-surface p-4 overflow-y-auto">
     {/* Tab 切换：此前三个按钮都没有 onClick，「输出」「日志」实际是死按钮 */}
     <div className="flex border-b border-border mb-4">
       {(
@@ -149,7 +149,7 @@ export default function NodeInspector({
         <button
           key={key}
           onClick={() => onTabChange(key)}
-          className={`px-3 py-2 text-xs font-medium border-b-2 transition-colors ${
+          className={`px-3 py-2 text-xs font-medium border-b-2 transition-colors whitespace-nowrap ${
             tab === key
               ? 'text-primary border-primary'
               : 'text-gray-500 hover:text-gray-300 border-transparent'
@@ -1001,6 +1001,30 @@ export default function NodeInspector({
               />
             </div>
             <div>
+              <label className="text-xs text-gray-400 block mb-1">参考音频路径（Audio8 克隆，可选）</label>
+              <input
+                value={(node.data.ref_audio as string) || ''}
+                onChange={(e) => onUpdate('ref_audio', e.target.value)}
+                placeholder="D:/AI/refs/narrator.wav（填了就忽略上面的语音名）"
+                className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs"
+              />
+            </div>
+            {Boolean(node.data.ref_audio) && (
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">参考音频逐字稿（克隆必填）</label>
+                <textarea
+                  rows={2}
+                  value={(node.data.ref_text as string) || ''}
+                  onChange={(e) => onUpdate('ref_text', e.target.value)}
+                  placeholder="与参考音频里说的话逐字一致，对不上会明显掉音质"
+                  className="w-full px-2 py-1.5 rounded-lg bg-canvas border border-border text-xs resize-y"
+                />
+                {!node.data.ref_text && (
+                  <p className="text-[10px] text-warning mt-1">缺逐字稿会直接报错，不会悄悄降级</p>
+                )}
+              </div>
+            )}
+            <div>
               <label className="text-xs text-gray-400 block mb-1">语速（-10 ~ 10，仅 Kokoro 生效）</label>
               <input
                 type="number"
@@ -1012,9 +1036,10 @@ export default function NodeInspector({
               />
             </div>
             <p className="text-[10px] text-gray-500">
-              后端由服务端 TTS_BASE_URL 决定：默认 Kokoro-82M（10 种固定音色、可调语速）；
-              切到 Audio8-TTS 0.1B（:8103）后支持零样本音色克隆、44.1kHz，但没有语速参数。
-              Audio8 的音色需先调 <code>POST /voices/register</code> 注册。
+              后端由服务端 TTS_BASE_URL 决定：默认 Kokoro-82M（固定音色 + 可调语速）；
+              切到 Audio8-TTS 0.6B（:8103）后可零样本克隆、44.1kHz，但没有语速参数。
+              克隆两种方式：填参考音频路径（逐个节点直接用），或先 <code>POST /voices/register</code>
+              注册再填音色名（可复用）。克隆模式实测 RTF 18~32，排期要留余量。
             </p>
           </div>
         )}

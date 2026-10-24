@@ -18,6 +18,24 @@ func NewDepHandler(sup *service.Supervisor) *DepHandler {
 	return &DepHandler{sup: sup}
 }
 
+// Reload 重新读取 data/deps.json 并重建启动规格（不重启引擎、不动已跑的进程）
+//
+// 返回 changes：字段级差异，空对象表示「配置没变」。
+// endpoint 变更会标注「需重启引擎」，因为它不在本结构可控范围内。
+func (h *DepHandler) Reload(c *gin.Context) {
+	if h.sup == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "依赖管理器未初始化"})
+		return
+	}
+	changes := h.sup.Reload()
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"changes": changes,
+		"count":   len(changes),
+		"items":   h.sup.Status(),
+	})
+}
+
 // List 依赖状态列表
 func (h *DepHandler) List(c *gin.Context) {
 	if h.sup == nil {

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +81,37 @@ type depsFile struct {
 		Python    string `json:"python"`
 		Autostart bool   `json:"autostart"`
 	} `json:"asr"`
+	TTS struct {
+		Home      string `json:"home"`
+		Script    string `json:"script"`
+		Python    string `json:"python"`
+		Port      string `json:"port"`
+		BaseURL   string `json:"base_url"`
+		Autostart bool   `json:"autostart"`
+		// IdleUnload 空闲多少秒后释放模型显存（0 = 不释放）。
+		// 「引擎启动不拉起」只解决开机那段，真正吃显存的是「用过一次之后一直挂着」——
+		// 这个值让服务自己把显存还回去，不用人去点停止。
+		IdleUnload int `json:"idle_unload"`
+	} `json:"tts"`
+}
+
+// depsJSONPath 依赖配置文件的相对路径（引擎启动后会 chdir 到部署目录）
+const depsJSONPath = "data/deps.json"
+
+// LoadDepsFile 读 data/deps.json（不存在或损坏时返回零值，不报错）
+func LoadDepsFile() depsFile {
+	var conf depsFile
+	if raw, err := os.ReadFile(depsJSONPath); err == nil {
+		_ = json.Unmarshal(raw, &conf)
+	}
+	return conf
+}
+
+// TTSBaseURL 从配置里取 TTS 服务地址。
+// 供 main.go 解析 TTS_BASE_URL 用：只靠环境变量的话，切换后端就必须重启外壳
+// （外壳 spawn 引擎时不传 env，纯 os.Getenv 也没有 .env 支持），太脆。
+func TTSBaseURL() string {
+	return strings.TrimSpace(LoadDepsFile().TTS.BaseURL)
 }
 
 // NewSupervisor 依据配置构造依赖规格；comfyBase/asrBase 用于推导端口
@@ -92,10 +124,7 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		client:  &http.Client{Timeout: 1500 * time.Millisecond},
 	}
 
-	var conf depsFile
-	if raw, err := os.ReadFile(filepath.Join("data", "deps.json")); err == nil {
-		_ = json.Unmarshal(raw, &conf)
-	}
+	var conf = LoadDepsFile()
 
 	// ---- ComfyUI ----
 	comfyHome := firstNonEmpty(os.Getenv("COMFYUI_HOME"), conf.ComfyUI.Home, detectComfyHome())
@@ -273,16 +302,23 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 	//   TTS_PORT=8103 TTS_BASE_URL=http://127.0.0.1:8103
 	// Kokoro 有固定音色 + 语速；Audio8 支持零样本克隆 + 44.1kHz，但没有语速。
 	// Audio8 有两个后端：0.1B ONNX（CPU，本机实测产出无效语音）与 0.6B PyTorch（CUDA，可用）。
-	ttsHome := firstNonEmpty(os.Getenv("TTS_HOME"), asrHome)
-	ttsScriptName := firstNonEmpty(os.Getenv("TTS_SCRIPT"), "tts_kokoro_server.py")
-	ttsScript := filepath.Join(ttsHome, ttsScriptName)
-	ttsPython := firstNonEmpty(os.Getenv("TTS_PYTHON"), detectVenvPython(ttsHome))
-	ttsAutostart := os.Getenv("TTS_AUTOSTART") == "1"
+	ttsHome := firstNonEmpty(os.Getenv("TTS_HOME"), conf.TTS.Home, asrHome)
+	ttsScriptName := firstNonEmpty(os.Getenv("TTS_SCRIPT"), conf.TTS.Script, "tts_kokoro_server.py")
+	ttsScript := ttsScriptName
+	if !filepath.IsAbs(ttsScriptName) {
+		ttsScript = filepath.Join(ttsHome, ttsScriptName)
+	}
+	ttsPython := firstNonEmpty(os.Getenv("TTS_PYTHON"), conf.TTS.Python, detectVenvPython(ttsHome))
+	ttsAutostart := conf.TTS.Autostart || os.Getenv("TTS_AUTOSTART") == "1"
 	ttsLabel := "TTS（Kokoro-82M）"
 	defaultTtsPort := "8102"
 	if ttsScriptName != "tts_kokoro_server.py" {
 		ttsLabel = "TTS（" + strings.TrimSuffix(strings.TrimPrefix(ttsScriptName, "tts_"), "_server.py") + "）"
 		defaultTtsPort = "8103"
+	}
+	// data/deps.json 的 tts.port 优先于按脚本名推的默认端口
+	if p := strings.TrimSpace(conf.TTS.Port); p != "" {
+		defaultTtsPort = p
 	}
 	ttsHint := ""
 	if _, err := os.Stat(ttsScript); err != nil {
@@ -301,8 +337,9 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		"AUDIO8_MODEL_DIR="+firstNonEmpty(os.Getenv("AUDIO8_MODEL_DIR"), "D:/AI/Models/audio8_tts_0_6b"),
 		"AUDIO8_VOICES_DIR="+firstNonEmpty(os.Getenv("AUDIO8_VOICES_DIR"), filepath.Join(ttsHome, "voices-audio8-pt")),
 		"AUDIO8_DTYPE="+firstNonEmpty(os.Getenv("AUDIO8_DTYPE"), "bfloat16"),
-		// 0 = 常驻不自动卸载；FlowEdge 换侧前会走 /unload 显式释放
-		"AUDIO8_IDLE_UNLOAD="+firstNonEmpty(os.Getenv("AUDIO8_IDLE_UNLOAD"), "0"),
+		// 空闲卸载：0 = 常驻不释放；>0 = 闲置这么久后自动把模型从显存卸掉（进程留着，
+		// 下次合成再懒加载）。这是「取消常驻」的完整解法——不用人记得点停止。
+		"AUDIO8_IDLE_UNLOAD="+firstNonEmpty(os.Getenv("AUDIO8_IDLE_UNLOAD"), strconv.Itoa(conf.TTS.IdleUnload)),
 	)
 	if os.Getenv("HF_ENDPOINT") == "" && os.Getenv("FLOWEDGE_HF_MIRROR") != "0" {
 		ttsEnv = append(ttsEnv, "HF_ENDPOINT=https://hf-mirror.com")
@@ -529,6 +566,78 @@ func (s *Supervisor) Spec(name string) (DepSpec, bool) {
 		return DepSpec{}, false
 	}
 	return *sp, true
+}
+
+// ttsEnvDigest 抽出与 TTS 相关的环境变量子集（用于比较差异）。
+// idle_unload / dtype / 模型目录这些都是靠 Env 注入的，不比较 Env 就会漏报
+// ——2026-10-23 实测：把 idle_unload 从 600 改成 30，Reload 返回的 changes 是空对象。
+func ttsEnvDigest(env []string) map[string]string {
+	out := map[string]string{}
+	for _, kv := range env {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		for _, prefix := range []string{"TTS_", "AUDIO8_", "ARKTTS_", "KOKORO_"} {
+			if strings.HasPrefix(k, prefix) {
+				out[k] = v
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Reload 重新读 data/deps.json 重建启动规格，返回变更清单。
+//
+// 为什么需要它：autostart / idle_unload 这类字段只在 NewSupervisor 时读一次。
+// 改完配置不重启引擎的话，面板会一直显示旧值 —— 改了没生效、也没人知道。
+// 2026-10-23 就踩过：把 autostart 改成 false 后 /api/deps 还报 true，只能靠重启引擎兜回来。
+//
+// 边界：只重建「启动方式」类字段（脚本/解释器/端口/参数/autostart/idle_unload）。
+// **base_url 改了仍需重启引擎**——TTSService 等是独立的对象，不归本结构管，
+// 这里会在变更清单里把它标出来，避免「改了地址却连老地址」的静默错配。
+// 已在跑的进程不受影响（procs/started/lastErr 都保留）。
+func (s *Supervisor) Reload() map[string]string {
+	s.mu.Lock()
+	prev := make(map[string]DepSpec, len(s.specs))
+	baseline := make(map[string]string, len(s.specs))
+	for k, v := range s.specs {
+		prev[k] = *v
+		baseline[k] = v.Endpoint
+	}
+	s.mu.Unlock()
+
+	fresh := NewSupervisor(baseline["comfyui"], baseline["asr"], baseline["tts"])
+
+	changes := map[string]string{}
+	s.mu.Lock()
+	for k, v := range fresh.specs {
+		if p, ok := prev[k]; ok {
+			if p.Binary != v.Binary {
+				changes[k+".binary"] = p.Binary + " -> " + v.Binary
+			}
+			if got, want := strings.Join(p.Args, " "), strings.Join(v.Args, " "); got != want {
+				changes[k+".args"] = got + " -> " + want
+			}
+			if p.Autostart != v.Autostart {
+				changes[k+".autostart"] = fmt.Sprintf("%v -> %v", p.Autostart, v.Autostart)
+			}
+			if p.Endpoint != v.Endpoint {
+				changes[k+".endpoint"] = p.Endpoint + " -> " + v.Endpoint + "（需重启引擎才生效）"
+			}
+			// Env 差异：只看 TTS 相关前缀，避免把整份 os.Environ 的噪音算成变更
+			pe, ve := ttsEnvDigest(p.Env), ttsEnvDigest(v.Env)
+			for key, want := range ve {
+				if got, ok := pe[key]; !ok || got != want {
+					changes[k+".env."+key] = got + " -> " + want
+				}
+			}
+		}
+		s.specs[k] = v
+	}
+	s.mu.Unlock()
+	return changes
 }
 
 // ===== 探测辅助 =====

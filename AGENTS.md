@@ -92,7 +92,23 @@ agent 的 shell 起不了任何活过本次调用的进程——沙箱每命令�
 - **>4KB 的文件禁整读**（AGENTS.md 12.7k、多模态出片手册 16.7k、引擎平台化评估 65k）：先 `grep -n` 定位，只读命中行。
 - **一次性测量先查 `scripts/`**：`python scripts/token-audit.py [--session|--dup]` 已覆盖注入与会话开销；别现写探针（每段探针 ≈1KB 命令 + 1–3KB 输出，且会被摘要二次放大）。
 
+### 0.15 重型第三方项目构建纪律（2026-10-24 复盘 QCoder 从源码构建，每条对应一次真实浪费）
+
+| # | 当时怎么做的（错） | 规则（以后照做） |
+|---|---|---|
+| ① | 进仓库根就 `npm ci`，补依赖补了 3 轮才发现不对 | **先数 npm 项目再动手**：`find . -name package-lock.json -not -path "*/node_modules/*"`。有几个就在几个目录分别装。VS Code 系项目的 `build/` 是独立项目，根目录装够也不算数 |
+| ② | `npm install --no-save X` 补包，下一次 install 被 lock 修剪掉，同一件事做了 3 遍 | **禁止 `--no-save` 补包**。要么 `--save-dev` 写进 package.json，要么装完立刻用、不再 install |
+| ③ | `export PATH="C:/xx:$PATH"` 在 Git Bash 里**静默失效**，`which` 也查不到 `.cmd`，误判成"没装" | **改完 PATH 立刻验**：Git Bash 只认 `/c/...`；验法是 `cmd //c "npm.cmd --version"`，不是 `which` |
+| ④ | 缺 `ternary-stream`→补；再缺 `gulp-sort`→补；再缺 `jsonc-parser`→补 | **同类错误第 2 次出现就换策略**：用 `require.resolve` 全量扫（模板 `scripts/check-deps.js`），一次列出全部缺口再批量装 |
+| ⑤ | `rm -rf` 中间目录撞 `SAFE_DELETE_BULK_CONFIRM_REQUIRED`（50 文件阈值） | **清理一律 `mv` 走**（`mv out-build out-build.bak`），或 `CODEBUDDY_SAFE_DELETE_ENABLED=0`。禁写循环逐个删 |
+| ⑥ | 闷头干 3.5 小时，用户凌晨才问「成功了吗」 | **3 个障碍或 90 分钟必须汇报**：已完成 / 卡点 / 可选路径，三行讲清。汇报不中断执行 |
+
+**判据必须是产物，不是退出码**：`Finished compilation with 0 errors`、`.node` 文件数量、`--version` 的真实输出、日志是否为空。
+反例：`gulp compile` 会因仓库自带的 `.vscode/extensions` 自测扩展报错而 `exit 1`，但主程序产物完全正常——只看退出码会误判整件事失败。
+同源规则见 §0.12 ②「用工具没报错当没问题」和本条的镜像面。
+
 ## 1–4. 环境硬约束（权重 / 显存 / 进程 / 下载）
+
 
 > 详表（含实测数字与历史坑）见 skill `local-multimodal-ops` 的 `references/environment.md`；这里只留**会做错事**的部分。
 

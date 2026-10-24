@@ -511,16 +511,21 @@ func NewTTSService(baseURL string) *TTSService {
 	return &TTSService{
 		BaseURL: baseURL,
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			// 这里只是兜底上限，真正的超时由 synthesizeHTTP 按工作量算（见该函数注释）。
+			// 旧值写死 60s，而 Audio8-TTS 0.6B 克隆模式实测 RTF 18~32（58 字台词 ≈157s），
+			// 每次克隆都会超时 → 静默回退 SAPI → 用户拿到的是系统音色还以为成功了。
+			Timeout: 20 * time.Minute,
 		},
 	}
 }
 
-// TTSOptions 语音合成参数（当前仅内置 SAPI 后端使用；HTTP 服务端可选支持）
+// TTSOptions 语音合成参数
 type TTSOptions struct {
-	Voice string  // 语音名片段，如 "Huihui"；空则用系统默认
-	Rate  int     // 语速 -10..10（SAPI 语义）
-	Speed float64 // 语速倍率（Kokoro /tts 的 speed 语义；>0 时才发给服务端）
+	Voice    string  // 音色：SAPI 语音名片段 / Kokoro 音色名 / Audio8 已注册音色名
+	Rate     int     // 语速 -10..10（SAPI 语义）
+	Speed    float64 // 语速倍率（Kokoro /tts 的 speed 语义；>0 时才发给服务端）
+	RefAudio string  // 参考音频路径：非空即启用零样本克隆（Audio8 专用）
+	RefText  string  // 参考音频的逐字稿：克隆必需，与实际内容对不上会明显掉音质
 }
 
 // Synthesize 文字转语音（兼容旧调用）
@@ -543,6 +548,10 @@ func (s *TTSService) SynthesizeWith(text string, outputPath string, opt TTSOptio
 	if s.BaseURL != "" {
 		if err := s.synthesizeHTTP(text, outputPath, opt); err == nil {
 			return "service", nil
+		} else if opt.RefAudio != "" {
+			// 克隆请求绝不回退 SAPI：换后端等于换了个人在说话，产出的音色与参考
+			// 音频毫无关系，而节点会报「成功」。宁可显式失败，也不伪造结果。
+			return "", fmt.Errorf("TTS 克隆合成失败（已指定参考音频 %s，不回退 SAPI 以免音色被悄悄换掉）：%w", opt.RefAudio, err)
 		} else if SAPIAvailable() {
 			if sapiErr := synthesizeSAPI(text, outputPath, opt.Voice, opt.Rate); sapiErr == nil {
 				log.Printf("[tts] 服务 %s 不可用（%v），已回退 Windows 内置 SAPI（产出的是真音频）", s.BaseURL, err)
@@ -564,6 +573,10 @@ func (s *TTSService) SynthesizeWith(text string, outputPath string, opt TTSOptio
 }
 
 // synthesizeHTTP 走本地 / 远程 TTS 服务
+//
+// 超时按工作量估，不用魔法常数：Audio8-TTS 0.6B 在本机实测 RTF 7.9（默认音色）/
+// 18~32（克隆音色），即 1 秒音频要 8~32 秒算。所以预算 = 60s 固定（模型加载 + 首帧）
+// + 每字 1.5s，封顶 20 分钟。60 字台词 ⇒ 约 150s，够覆盖克隆模式的最坏情况。
 func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptions) error {
 	reqBody := map[string]interface{}{
 		"text": text,
@@ -579,11 +592,30 @@ func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptio
 	if opt.Speed > 0 {
 		reqBody["speed"] = opt.Speed
 	}
+	// Audio8 专用：给了参考音频就走零样本克隆，优先级高于 voice
+	if opt.RefAudio != "" {
+		reqBody["ref_audio"] = opt.RefAudio
+		if opt.RefText != "" {
+			reqBody["ref_text"] = opt.RefText
+		}
+	}
 	jsonBody, _ := json.Marshal(reqBody)
 
-	resp, err := s.client.Post(s.BaseURL+"/tts", "application/json", bytes.NewBuffer(jsonBody))
+	budget := 60*time.Second + time.Duration(len([]rune(text)))*1500*time.Millisecond
+	if budget > 20*time.Minute {
+		budget = 20 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.BaseURL+"/tts", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("tts 请求失败（预算 %s）：%w", budget, err)
 	}
 	defer resp.Body.Close()
 
