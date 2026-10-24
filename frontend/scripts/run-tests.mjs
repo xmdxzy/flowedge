@@ -72,8 +72,17 @@ await build({
   // 打包后 import.meta.url 指向 .test-build，测试里找仓库根要靠 cwd 上溯，
   // 见 src/config/graph.test.ts 的 findRepoRoot()。
   banner: { js: '// bundled by scripts/run-tests.mjs' },
+  // NODE_ENV 必须钉死成 test：
+  //   - 外层 shell 若带 NODE_ENV=production（本机就是），React 会解析到生产版，
+  //     react-test-renderer 的 act() 直接抛错 → 73 个用例**全部**假红；
+  //   - 这跟被测代码无关，是跑批器的环境泄漏，所以在跑批器里钉死，不指望人记得。
+  define: { 'process.env.NODE_ENV': '"test"' },
 })
 
 console.log(`[test] ${files.length} 个测试文件 → ${path.relative(ROOT, outfile)}`)
-const res = spawnSync(process.execPath, [outfile], { stdio: 'inherit', cwd: ROOT })
+const res = spawnSync(process.execPath, [outfile], {
+  stdio: 'inherit',
+  cwd: ROOT,
+  env: { ...process.env, NODE_ENV: 'test' },
+})
 process.exit(res.status ?? 1)

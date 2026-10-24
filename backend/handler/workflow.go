@@ -328,6 +328,9 @@ func (h *WorkflowHandler) StartRunWith(wf *model.Workflow, opts RunOptions) *mod
 		edgesJSON = []byte(opts.Edges)
 	}
 
+	// 输入注入：在**预检之前**渲染，否则 {{key}} 这种占位会被当成真实参数去估依赖。
+	nodesJSON = renderNodeVars(nodesJSON, opts.Vars)
+
 	// 运行前依赖预检：服务没起时创建一条 failed 记录留痕，不进入执行。
 	// （手动入口 Run 直接 503 返回；cron/trigger 走这里，留痕才能追溯）
 	if missing := h.preflight(nodesJSON, edgesJSON); len(missing) > 0 {

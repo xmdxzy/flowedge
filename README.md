@@ -1,5 +1,13 @@
 # FlowEdge
 
+> **2026-10-24 · FlowEdge Lite** —— this build keeps exactly two capabilities:
+> ① local multimodal generation workflows (image / video / audio), ② a quality-gate loop
+> (generate → score → diagnose → repair → rerun → keep best).
+> Everything else — self-evolution, toolchain / MCP client / plugins, capability cards &
+> skill packs, KB / RAG, triggers, credentials, workflow versions, the OpenAI-compatible
+> `/v1` surface — has been **removed**. 44 API routes, 27 node types, one exe.
+> Details & cut list: `docs/轻装化-FlowEdge-Lite-v1.md`.
+
 **A private, single-binary multimodal workflow engine for one consumer GPU.**
 
 Chain local LLM, text-to-image, video, ASR, TTS and RAG nodes on one canvas — then run the whole pipeline with one click. Everything stays on your machine. No Docker, no Node, no Python, no cloud account.

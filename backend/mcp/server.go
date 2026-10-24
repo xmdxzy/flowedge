@@ -292,9 +292,6 @@ func (s *Server) callTool(raw json.RawMessage) (map[string]interface{}, error) {
 		if v, ok := p.Arguments["dry_run"].(bool); ok {
 			payload["dryRun"] = v
 		}
-		if v, ok := p.Arguments["base_version"]; ok && v != nil {
-			payload["baseVersion"] = v
-		}
 		body, err := s.request(http.MethodPost, fmt.Sprintf("/api/workflows/%d/spec/apply", id), payload)
 		if err != nil {
 			return nil, err
@@ -380,7 +377,7 @@ func toolDefs() []interface{} {
 	return []interface{}{
 		map[string]interface{}{
 			"name":        "flowedge_list_workflows",
-			"description": "列出本机 FlowEdge 里已保存的工作流（含 id、名称、触发配置）。当用户问「我有哪些工作流」或需要拿到 workflow_id 时使用。",
+			"description": "列出本机 FlowEdge 里已保存的工作流（含 id、名称、节点数）。当用户问「我有哪些工作流」或需要拿到 workflow_id 时使用。",
 			"inputSchema": map[string]interface{}{
 				"type":       "object",
 				"properties": map[string]interface{}{},
@@ -388,7 +385,7 @@ func toolDefs() []interface{} {
 		},
 		map[string]interface{}{
 			"name":        "flowedge_run_workflow",
-			"description": "提交一个工作流运行（异步，立即返回 run_id）。当用户要出图、出视频、或跑一条本地多模态流水线时使用。返回后可用 flowedge_run_status 查进度。",
+			"description": "提交一个工作流运行（异步，立即返回 run_id）。当用户要出图、出视频、或跑一条本地多模态流水线时使用；图里带 quality_loop 节点时，它会自动完成「生成→验收→修复→重跑→择优」。返回后可用 flowedge_run_status 查进度。",
 			"inputSchema": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -474,8 +471,7 @@ func toolDefs() []interface{} {
 					},
 					"allow_gate_change": map[string]interface{}{"type": "boolean", "description": "允许改动门层参数（放宽验收）。默认 false"},
 					"dry_run":           map[string]interface{}{"type": "boolean", "description": "只校验不落盘，返回将改什么"},
-					"base_version":      map[string]interface{}{"type": "integer", "description": "可选：取任务书时的版本号，用于粗粒度乐观锁"},
-				},
+						},
 				"required": []string{"workflow_id", "edits"},
 			},
 		},
