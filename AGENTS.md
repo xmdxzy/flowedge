@@ -139,6 +139,18 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**，
   预检与参数校验在**包壳之前**对原始图做（对壳做等于没查）。
 - **节点缓存已删**：故意。缓存命中会让"重跑一轮"变成假重跑。
 - **前端测试必须 `NODE_ENV=test`**：这个 shell 里 `NODE_ENV=production`，`act()` 会整体抛错。
+- **Ollama 也是托管依赖**（`data/deps.json` 的 `ollama` 段，`autostart` 默认 true）：
+  `video`(optimize)、`image_batch`、`film` 都要它。以前只能"另开终端跑 ollama serve"，
+  现在 `POST /api/deps/ollama/start` 一键起；已装桌面版时只探活复用。
+  `Startable` 曾把 `serve` 当成脚本路径 → 进程根本不派生且不留错（已修 + 回归测试）。
+- **单镜实测 ≈6.6 分钟**（608×352×124 帧 @12 步，含 H3 冷加载，2026-10-25 本机）：
+  film 2 镜 shotlist 13.2 分钟。旧笔记里的"120s/段"是别的参数/实例下的数字，
+  **别拿它估时**；估时按"镜数 × 6–7 分钟 + LLM + 装配"报区间。
+- **引擎日志在 `<exe目录>/logs/engine.log`**：常驻时 stdout 被外壳（工作站/bat）收走，
+  出事只能看这个文件。8MB 滚一份 `.1`。
+- **一致性门有两层**：`shotlist` 开机前审 plan（轴线/光比/锁句，FAIL 拦下）；
+  出片后量各镜 U/V 均值，相邻两镜漂移 >6 报 `plan.color_shift`（WARN）。
+  实测抓到过"plan 两镜都写冷色、生成一暖一冷"——那是生成侧漂移，plan 门管不到。
 - **部署必须带上 `data/pipelines.json`**（exe 同目录）：缺它引擎 `log.Fatalf` 不启动。
   `build-windows.py` 会复制到 `dist/data/`，`3-应用更新并重启.bat` 会同步到 `运行/data/`；
   手动换 exe 时别忘了这一步。

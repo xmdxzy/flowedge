@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """提交前一键全检：把 5 条命令压成 1 条，输出压成 4 行。
 
 为什么要有它

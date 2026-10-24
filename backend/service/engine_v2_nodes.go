@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 // 本文件只放「节点执行体」：每个节点的业务逻辑。
 // 引擎内核（DAG 调度 / 超时 / 事件 / 取消 / 注册表）留在 engine_v2.go。

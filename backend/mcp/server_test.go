@@ -1,4 +1,4 @@
-﻿package mcp
+package mcp
 
 import (
 	"bytes"
@@ -140,6 +140,7 @@ func TestProduceRequiresPipeline(t *testing.T) {
 		t.Errorf("should name the missing param: %s", text)
 	}
 }
+
 // TestNotificationIgnored notification（无 id）不能产生响应
 func TestNotificationIgnored(t *testing.T) {
 	var out bytes.Buffer
@@ -164,4 +165,3 @@ func TestParseErrorIsProtocolError(t *testing.T) {
 		t.Errorf("code = %v, want -32700", errObj["code"])
 	}
 }
-

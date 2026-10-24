@@ -110,10 +110,10 @@ func (p *Producer) Produce(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{
-		"run_id":    run.ID,
-		"pipeline":  run.PipelineID,
-		"status":    run.Status,
-		"params":    json.RawMessage(run.Params),
+		"run_id":     run.ID,
+		"pipeline":   run.PipelineID,
+		"status":     run.Status,
+		"params":     json.RawMessage(run.Params),
 		"created_at": run.CreatedAt,
 	})
 }

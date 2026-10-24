@@ -443,6 +443,17 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	}
 
 	// 装配：cut=1 帧、continue=2 帧、dissolve=0.3 秒的交叉淡化
+	//
+	// 装配前先量各镜色度：plan 层管不到"生成侧色温漂移"（表里两镜都写冷色，
+	// 出来却一暖一冷，实测发生过）。这是唯一能在烧完全部 GPU 之后、交付之前
+	// 抓住接缝观感跳变的地方。
+	if colorIssues := AuditClipChroma(clips); len(colorIssues) > 0 {
+		for _, it := range colorIssues {
+			log.Printf("[shotlist] 一致性告警 %s: %s", it.Code, it.Msg)
+		}
+		consistencyIssues = append(consistencyIssues, colorIssues...)
+	}
+
 	final := filepath.Join(outDir, fmt.Sprintf("film-%d-shots.mp4", time.Now().UnixNano()))
 	if err := assembleShots(clips, transitions, final); err != nil {
 		return nil, err

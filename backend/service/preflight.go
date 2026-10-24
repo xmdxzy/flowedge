@@ -47,7 +47,10 @@ func depFix(dep string) (fixDep string, fixable bool, fix string) {
 	case "comfy_h3":
 		return "comfy_h3", true, "点「一键修复」启动 ComfyUI-H3；注意它与默认实例互斥，会自动切实例"
 	case "ollama":
-		return "", false, "引擎不托管 Ollama：另开终端跑 `ollama serve`（或启动 Ollama 桌面版）后重试"
+		// 语言模型现在也是可托管依赖（video 的提示词优化、拆镜、分镜规划都要它）。
+		// 以前只能让用户"另开终端跑 ollama serve"——在双击 exe 的交付形态里等于
+		// 把最后一步退化成手工操作。已装桌面版时 Start 只会探活复用，不会拉第二个。
+		return "ollama", true, "点「一键修复」启动 Ollama（ollama serve）；若本机没装，装 Ollama 桌面版后重试"
 	case "vision":
 		return "", false, "先 `ollama pull qwen2.5vl:7b` 拉一个视觉模型，再在视觉节点里填上模型名"
 	}
@@ -128,6 +131,14 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 			if c, ok := capabilityOf(dep, caps); ok {
 				addComfy(n, profile, label, c)
 			}
+			// H3 默认先过一遍提示词优化（node.data.prompt_opt，缺省 true），
+			// 那是语言侧调用：Ollama 没起的话会在节点里炸，而不是在入口说清楚。
+			// 显式 prompt_opt=false 的调用方不想用 LLM，就不该被拦。
+			if profile == "h3" && promptOptEnabled(n) {
+				if c, ok := capabilityOf("ollama", caps); ok {
+					add(n, "ollama", "提示词优化（Ollama）", c)
+				}
+			}
 		case "llm", "prompt_opt", "storyboard":
 			if c, ok := capabilityOf("ollama", caps); ok {
 				add(n, "ollama", "语言模型（Ollama）", c)
@@ -171,4 +182,16 @@ func capabilityOf(dep string, caps Capabilities) (Capability, bool) {
 		return caps.FFmpeg, true
 	}
 	return Capability{}, false
+}
+
+// promptOptEnabled text2video 是否会在跑之前先调 LLM 优化提示词。
+// 与执行体保持同一套缺省：只有显式 false 才算关闭（H3 默认开）。
+func promptOptEnabled(n *model.NodeInstance) bool {
+	if n == nil {
+		return true
+	}
+	if v, ok := n.Data["prompt_opt"].(bool); ok {
+		return v
+	}
+	return true
 }

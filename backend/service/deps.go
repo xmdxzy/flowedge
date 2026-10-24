@@ -81,6 +81,14 @@ type depsFile struct {
 		Python    string `json:"python"`
 		Autostart bool   `json:"autostart"`
 	} `json:"asr"`
+	// Ollama 段：视频提示词优化、拆镜、分镜规划都要它。
+	// 不给配置时按常见安装位置自动探测（见 defaultOllamaBinary）。
+	Ollama struct {
+		Binary    string   `json:"binary"`
+		Args      []string `json:"args"`
+		BaseURL   string   `json:"base_url"`
+		Autostart bool     `json:"autostart"`
+	} `json:"ollama"`
 	TTS struct {
 		Home      string `json:"home"`
 		Script    string `json:"script"`
@@ -357,7 +365,48 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		Hint:       ttsHint,
 	}
 
+	// ---- Ollama（语言侧）----
+	//
+	// 为什么把它也收进托管：video 的提示词优化、image_batch 的拆镜、film 的分镜规划
+	// 都要语言模型。此前引擎不管它，用户看到的是"依赖未就绪 → 另开终端跑 ollama serve"，
+	// 在"双击 exe"的交付形态里等于让用户去开终端——三步里最容易卡住的一步。
+	// 已在外跑（桌面版/系统服务）时只探活复用，不会拉起第二个实例。
+	if ollamaBin := firstNonEmpty(os.Getenv("OLLAMA_BINARY"), conf.Ollama.Binary, defaultOllamaBinary()); ollamaBin != "" {
+		args := conf.Ollama.Args
+		if len(args) == 0 {
+			args = []string{"serve"}
+		}
+		s.specs["ollama"] = &DepSpec{
+			Name:       "ollama",
+			Label:      "语言模型（Ollama）",
+			Binary:     ollamaBin,
+			Args:       args,
+			Endpoint:   normalBase(firstNonEmpty(os.Getenv("OLLAMA_BASE_URL"), conf.Ollama.BaseURL, "http://127.0.0.1:11434")),
+			HealthPath: "/api/tags",
+			Autostart:  conf.Ollama.Autostart,
+			Hint:       "托管 Ollama（ollama serve）；若要它开机自起，把 data/deps.json 的 ollama.autostart 设 true",
+		}
+	}
+
 	return s
+}
+
+// defaultOllamaBinary 常见安装位置兜底（PATH 里没有也能找到）。
+func defaultOllamaBinary() string {
+	if p, err := exec.LookPath("ollama"); err == nil {
+		return p
+	}
+	candidates := []string{
+		filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Ollama", "ollama.exe"),
+		`C:\Program Files\Ollama\ollama.exe`,
+		"/usr/local/bin/ollama",
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 // AutoStartAll 拉起标记为 autostart 且具备启动条件的依赖
@@ -375,17 +424,55 @@ func (s *Supervisor) AutoStartAll() {
 
 // Startable 是否具备启动条件（二进制与脚本都在）
 func (s *Supervisor) Startable(name string) bool {
+	return s.unstartableReason(name) == ""
+}
+
+// unstartableReason 说不清"缺什么"的 Startable 会让一键修复变成静默失败：
+// 用户点了启动、界面 202、什么也没发生，也没有 last_error。
+// 这里把每种不满足的原因写成人话，Start 会写进 last_error 并在响应里说清楚。
+func (s *Supervisor) unstartableReason(name string) string {
 	spec, ok := s.specs[name]
-	if !ok || spec.Binary == "" || len(spec.Args) == 0 {
-		return false
+	if !ok {
+		return "未知依赖：" + name
+	}
+	if spec.Binary == "" || len(spec.Args) == 0 {
+		return "启动条件不满足：没有配置可执行文件或参数"
 	}
 	if _, err := os.Stat(spec.Binary); err != nil {
+		return "启动条件不满足：找不到可执行文件 " + spec.Binary
+	}
+	// 参数不一定是脚本文件：ollama 的 `serve` 是子命令，不是路径。
+	// 只有"看起来像路径"的那个参数才需要存在性检查——以前一律 os.Stat(Args[0])，
+	// 结果 `ollama serve` 被判成"脚本不存在"，进程根本不派生，还一句错都不报。
+	if arg0 := spec.Args[0]; looksLikeScriptPath(arg0) {
+		cand := arg0
+		if !filepath.IsAbs(cand) && spec.WorkDir != "" {
+			cand = filepath.Join(spec.WorkDir, cand)
+		}
+		if _, err := os.Stat(cand); err != nil {
+			return "启动条件不满足：找不到脚本 " + cand
+		}
+	}
+	return ""
+}
+
+// looksLikeScriptPath 参数是不是一个文件路径（而不是子命令/开关）。
+func looksLikeScriptPath(arg string) bool {
+	if arg == "" {
 		return false
 	}
-	if _, err := os.Stat(spec.Args[0]); err != nil {
-		return false
+	if strings.HasPrefix(arg, "-") {
+		return false // 开关
 	}
-	return true
+	if strings.ContainsAny(arg, `/\\`) {
+		return true // 带路径分隔符
+	}
+	for _, ext := range []string{".py", ".js", ".mjs", ".cjs", ".bat", ".cmd", ".ps1"} {
+		if strings.HasSuffix(strings.ToLower(arg), ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // Start 启动依赖（已就绪则直接返回）
@@ -397,12 +484,11 @@ func (s *Supervisor) Start(name string) error {
 	if s.Healthy(name) {
 		return nil
 	}
-	if !s.Startable(name) {
-		hint := spec.Hint
-		if hint == "" {
-			hint = "启动条件不满足：找不到可执行文件或脚本"
-		}
-		return fmt.Errorf("%s", hint)
+	if reason := s.unstartableReason(name); reason != "" {
+		s.mu.Lock()
+		s.lastErr[name] = reason
+		s.mu.Unlock()
+		return fmt.Errorf("%s", reason)
 	}
 
 	if spec.Exclusive != "" && s.Healthy(spec.Exclusive) {

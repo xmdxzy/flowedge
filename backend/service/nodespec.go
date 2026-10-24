@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"strings"
@@ -52,7 +52,7 @@ var NodeSpecs = map[string]NodeSpec{
 	}, MaxTimeout: 12 * time.Hour},
 
 	// ---- 语言侧：Ollama（规划与提示词优化，不产媒体）----
-	"llm":        {Type: "llm", Side: sideLanguage},
+	"llm": {Type: "llm", Side: sideLanguage},
 	"storyboard": {Type: "storyboard", Side: sideLanguage, Timeout: func(*model.NodeInstance) time.Duration {
 		return 5 * time.Minute // LLM 规划 + JSON 校验
 	}},

@@ -1,4 +1,4 @@
-﻿// FlowEdge Lite —— 本地多模态生成引擎
+// FlowEdge Lite —— 本地多模态生成引擎
 //
 // 只做两件事：
 //  1. 本地多模态（图片 / 视频 / 音频）的高质量生成工作流；
@@ -10,6 +10,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -49,6 +50,12 @@ func main() {
 			log.Printf("工作目录切换到 %s（数据保存在此目录下的 data/）", baseDir)
 		}
 	}
+
+	// 日志同时落盘。常驻引擎多由外壳（序策工作站 / 启动 bat）拉起，
+	// stdout 进了父进程的管道；出事后 agent 与人**读不到任何一行**，只能猜。
+	// 落一份到 <exe目录>/logs/engine.log，才有事后可查的证据。
+	closeLog := setupLogFile(baseDir)
+	defer closeLog()
 
 	// 子命令：把内嵌的语音服务脚本导出到 exe 旁的 local-services/
 	if len(os.Args) > 1 && (os.Args[1] == "--export-services" || os.Args[1] == "-export-services") {
@@ -101,6 +108,15 @@ func main() {
 			log.Printf("提示：未检测到本地 Ollama 模型，暂用 %s", llmModel)
 		}
 	}
+
+	// 配置的模型必须真的存在：不然后面每个 LLM 节点都会以「404 model not found」
+	// 的形式失败，而人会先去怀疑端口/代理。这里提前一次说清（但**不**替用户换模型，
+	// 静默换模型等于悄悄改了创作质量）。
+	if missing, available, err := service.CheckOllamaModel(cfg.OllamaBaseURL, llmModel); err == nil && missing {
+		log.Printf("⚠️  OLLAMA_MODEL=%q 不在本机 Ollama 里；响应里会报 404。可用的：%s", llmModel, available)
+		log.Printf("    修法：setx OLLAMA_MODEL <上面某个> 后重启，或把运行/data/llm-profiles.json 的 default 改成它")
+	}
+	log.Printf("语言模型：%s（%s）", llmModel, cfg.OllamaBaseURL)
 
 	llmService := service.NewLLMService(cfg.OllamaBaseURL, llmModel)
 
@@ -578,4 +594,29 @@ func checkpointsFromBundles(store *service.BundleStore) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// setupLogFile 把日志同时写到 <baseDir>/logs/engine.log。
+//
+// 为什么必须落盘：引擎常驻时由外壳（序策工作站 / 1-启动 bat）拉起，stdout 被
+// 父进程的管道吃掉了。于是"跑挂了/跑得慢"的时候，agent 和人手里一行日志都没有，
+// 只能靠猜——这正是 §0.2「报错字符串不是根因」最容易踩空的地方。
+//
+// 大小上限 8MB，超了滚一份 .1（不引入轮转库：一个文件足够定位问题）。
+func setupLogFile(baseDir string) func() {
+	dir := filepath.Join(baseDir, "logs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return func() {}
+	}
+	path := filepath.Join(dir, "engine.log")
+	if st, err := os.Stat(path); err == nil && st.Size() > 8<<20 {
+		_ = os.Rename(path, path+".1")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return func() {}
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	log.Printf("=== FlowEdge %s 启动，日志写入 %s ===", version, path)
+	return func() { _ = f.Close() }
 }

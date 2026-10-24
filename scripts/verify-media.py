@@ -200,7 +200,14 @@ def verify(path: str, want_asr: bool, frames_dir: str | None, expect: str = "",
     info["size_mb"] = round(int(fmt.get("size") or 0) / 1048576, 2)
 
     # 1) 流存在性
-    if not v:
+    #
+    # 纯音频产物（配音 / 音效）不是缺陷：voice 流水线的成品就是 wav。
+    # 以前一律报 no_video → FAIL，等于让「文案转配音」永远无法通过验收。
+    audio_exts = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+    audio_only = (not v) and bool(a) and os.path.splitext(path)[1].lower() in audio_exts
+    if audio_only:
+        issues.append((OK, "audio_only", "纯音频产物（配音/音效）。检测到人声通常是预期；要核对语句请加 --expect '原句'"))
+    elif not v:
         issues.append((FAIL, "no_video", "没有视频流（纯音频，常见于 -map 漏写）"))
     if not a:
         issues.append((WARN, "no_audio", "没有音频流（无声片；若本应有声则是 -map/编码问题）"))
@@ -404,3 +411,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

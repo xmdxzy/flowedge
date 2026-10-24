@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """FlowEdge Windows 原生构建：前端 → 内嵌 → 单个 FlowEdge.exe
 

@@ -33,6 +33,8 @@ type LLMService struct {
 	// 这样老的 NewLLMService 调用路径不用改。见 llm_provider.go。
 	Backend string
 	client  *http.Client
+	// retriedDefault 已经因「默认模型不存在」重新挑过一次，避免失败时无限重试。
+	retriedDefault bool
 }
 
 // defaultLLMHTTPClient LLM 兜底客户端（长上下文/慢生成需要比默认更宽的窗口）。
@@ -105,6 +107,9 @@ func (s *LLMService) ChatWithTemperature(prompt, model string, temp float64) (st
 }
 
 func (s *LLMService) chatWithOptions(prompt, model string, temp *float64) (string, LLMUsage, error) {
+	// explicit=false 表示调用方用的是"引擎默认模型"——这种才允许在发现模型不存在时
+	// 重新挑一次；调用方点名要某个模型时绝不替换（换了等于悄悄改了创作质量）。
+	explicit := model != ""
 	if model == "" {
 		model = s.Model
 	}
@@ -131,7 +136,28 @@ func (s *LLMService) chatWithOptions(prompt, model string, temp *float64) (strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", LLMUsage{}, fmt.Errorf("%s 返回 %d（%s）", s.BackendLabel(), resp.StatusCode, url)
+		// 必须把模型名和响应体带上：只报「Ollama 返回 404」时，
+		// 人会去怀疑端口/代理/服务没起，而真实原因往往是"这个模型本机没有"。
+		rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<10))
+		detail := strings.TrimSpace(string(rawBody))
+		if resp.StatusCode == http.StatusNotFound && strings.Contains(strings.ToLower(detail), "not found") {
+			// 自愈：引擎启动时 Ollama 可能还没起来（PickDefaultModel 探不到就用了兜底名），
+			// 等它起来后这里重新挑一次本机真实存在的模型再试一次。
+			// 只对"默认模型"生效：调用方点名要的模型不能被我悄悄换掉。
+			if !explicit && !s.retriedDefault {
+				if picked := PickDefaultModel(s.BaseURL); picked != "" && picked != model {
+					s.Model = picked
+					s.retriedDefault = true
+					return s.chatWithOptions(prompt, "", temp)
+				}
+			}
+			return "", LLMUsage{}, fmt.Errorf(
+				"%s 上没有模型 %q（%s）。修法：`ollama pull %s`，或把 data/llm-profiles.json 的 default / "+
+					"环境变量 OLLAMA_MODEL 改成本机已有的模型。引擎原始响应：%s",
+				s.BackendLabel(), model, url, model, detail)
+		}
+		return "", LLMUsage{}, fmt.Errorf("%s 返回 %d（%s，模型 %q）：%s",
+			s.BackendLabel(), resp.StatusCode, url, model, detail)
 	}
 
 	var chatResp chatResponse

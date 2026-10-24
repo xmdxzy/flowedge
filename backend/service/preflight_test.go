@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"testing"
@@ -77,13 +77,38 @@ func TestPreflightDeps_VideoBackendSwitchesDependency(t *testing.T) {
 	caps := Capabilities{}
 	h3 := []model.NodeInstance{{ID: "v", Type: "text2video", Data: map[string]interface{}{"backend": "h3"}}}
 	got := PreflightDeps(h3, caps, &Supervisor{specs: map[string]*DepSpec{}})
-	if len(got) != 1 || got[0].Dep != "comfy_h3" {
+	if !hasDep(got, "comfy_h3") {
 		t.Fatalf("h3 后端应要求 comfy_h3，got %+v", got)
+	}
+	// H3 默认先做提示词优化（语言侧）——Ollama 没起也要在入口说清，别等节点里炸。
+	if !hasDep(got, "ollama") {
+		t.Fatalf("h3 默认开提示词优化时应要求 ollama，got %+v", got)
+	}
+
+	// 显式关掉优化就不该被 Ollama 拦（调用方明确不想用 LLM）。
+	noOpt := []model.NodeInstance{{ID: "v", Type: "text2video", Data: map[string]interface{}{
+		"backend": "h3", "prompt_opt": false,
+	}}}
+	got = PreflightDeps(noOpt, caps, &Supervisor{specs: map[string]*DepSpec{}})
+	if hasDep(got, "ollama") {
+		t.Fatalf("prompt_opt=false 时不该要求 ollama，got %+v", got)
+	}
+	if !hasDep(got, "comfy_h3") {
+		t.Fatalf("关掉优化仍应要求 comfy_h3，got %+v", got)
 	}
 
 	wan := []model.NodeInstance{{ID: "v", Type: "text2video", Data: map[string]interface{}{"backend": "wan"}}}
 	got = PreflightDeps(wan, caps, &Supervisor{specs: map[string]*DepSpec{}})
 	if len(got) != 1 || got[0].Dep != "comfyui" {
-		t.Fatalf("wan 后端应要求 comfyui，got %+v", got)
+		t.Fatalf("wan 后端应只要求 comfyui，got %+v", got)
 	}
+}
+
+func hasDep(list []DepRequirement, dep string) bool {
+	for _, m := range list {
+		if m.Dep == dep {
+			return true
+		}
+	}
+	return false
 }

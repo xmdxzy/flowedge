@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"testing"
@@ -26,7 +26,6 @@ func TestNodeSpecsCoverRegisteredTypes(t *testing.T) {
 		}
 	}
 }
-
 
 // 超时算法从 switch 搬进 NodeSpecs 后，逐类核对一次，防止搬运时改错系数。
 func TestNodeTimeoutBudgetPerType(t *testing.T) {
@@ -85,4 +84,3 @@ func TestMediaProducerDerivedFromSpecs(t *testing.T) {
 		}
 	}
 }
-

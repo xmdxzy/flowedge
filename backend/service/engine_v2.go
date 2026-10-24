@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"context"
@@ -725,7 +725,6 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 
 		// runNode 单节点执行体：输入快照 → 执行 → 缓存 → 事件上报
 		runNode := func(nid string) {
-
 
 			mu.Lock()
 			node := nodeMap[nid]

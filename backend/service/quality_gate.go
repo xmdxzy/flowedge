@@ -1,10 +1,11 @@
-﻿package service
+package service
 
 import (
 	"context"
 	"fmt"
 	"math"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -166,6 +167,12 @@ func probeGateMedia(path string) (*gateMediaInfo, error) {
 		info.hasVideo = true
 		info.kind = "video"
 		info.width, info.height = parseSize(chk.Size)
+	}
+	// 静态图在 ffprobe 眼里也是"一个视频流（1 帧）"，于是 kind 会被判成 video，
+	// 质量循环就把图片产物挂在 "video" 键上交给下游——需要图片的节点找不到它。
+	// 出图流水线开了 qc 必现，所以按扩展名纠正回来。
+	if isStillImagePath(path) {
+		info.kind = "image"
 	}
 	info.frames = chk.Frames
 	info.fps = chk.FPS
@@ -416,4 +423,16 @@ func gateSummary(checks []gateCheck) string {
 		}
 	}
 	return fmt.Sprintf("质检 %d 项：通过 %d，失败 %d，警告 %d", len(checks), pass, fail, warn)
+}
+
+// isStillImagePath 静态图扩展名判定。
+//
+// 为什么不看 ffprobe 的帧数：单帧视频（1 帧 mp4）是合法产物，
+// 而 png 永远是图。按扩展名判既不会误伤视频，也简单到不用解释。
+func isStillImagePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff":
+		return true
+	}
+	return false
 }

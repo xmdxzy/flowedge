@@ -1,11 +1,10 @@
-﻿package service
+package service
 
 import (
 	"context"
 	"fmt"
 	"regexp"
 	"strings"
-
 )
 
 // H3 提示词优化
@@ -863,9 +862,9 @@ func (e *EngineV2) SplitPromptIntoBeats(prompt string, n int) ([]string, error) 
 		return []string{prompt}, nil
 	}
 	user := fmt.Sprintf("拆成 %d 段。镜头总指令：%s", n, prompt)
-// beatSplitInstruction 分镜拆解指令：长片（segments>1）必备。
-// 关键要求：段间首尾衔接 + 逐段重复角色外貌（H3 没有角色记忆，一致性只能靠文本+首帧引导）。
-const beatSplitInstruction = `你是分镜师。把下面这条镜头总指令拆成 N 段（每段约 5 秒），规则：
+	// beatSplitInstruction 分镜拆解指令：长片（segments>1）必备。
+	// 关键要求：段间首尾衔接 + 逐段重复角色外貌（H3 没有角色记忆，一致性只能靠文本+首帧引导）。
+	const beatSplitInstruction = `你是分镜师。把下面这条镜头总指令拆成 N 段（每段约 5 秒），规则：
 
 1. 每段是一条独立的 H3 提示词，可直接执行；段与段之间动作首尾衔接（下一段的开头承接上一段结尾的画面状态）
 2. 每段完整重复角色外貌与衣着描述，不要用「他/她」指代；武器、法术光效的颜色每段保持一致

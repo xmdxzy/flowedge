@@ -166,8 +166,14 @@ def cmd_artifacts(args) -> int:
 
 
 def wait_run(run_id, timeout: int):
-    """轮询到结束。返回详情；超时返回 None（超时 ≠ 失败）。"""
+    """轮询到结束。返回详情；超时返回 None（超时 ≠ 失败）。
+
+    进度打到 stderr：40 分钟的片子如果一行输出都没有，人和 agent 都会以为卡死。
+    stdout 仍只有一行 JSON（可解析），互不污染。
+    """
     deadline = time.time() + timeout
+    started = time.time()
+    last_tag, last_beat = "", 0.0
     while time.time() < deadline:
         time.sleep(5)
         try:
@@ -176,24 +182,45 @@ def wait_run(run_id, timeout: int):
             continue
         if info.get("status") != "running":
             return info
+        nodes = info.get("node_states") or []
+        running = [n for n in nodes if n.get("status") == "running"]
+        tag = running[0].get("type") if running else "排队中"
+        elapsed = time.time() - started
+        if tag != last_tag or elapsed - last_beat >= 60:
+            done = sum(1 for n in nodes if n.get("status") in ("success", "failed", "skipped"))
+            print("[wait] %4.0fs  %-12s  已完成 %d/%d" % (elapsed, tag, done, len(nodes)),
+                  file=sys.stderr, flush=True)
+            last_tag, last_beat = tag, elapsed
     return None
 
 
 def artifacts_of(run: dict) -> list:
-    """从节点终态里挑出产物路径（image/video/audio 键）。"""
+    """从节点终态里挑出产物路径（image/video/audio 键），按路径去重。
+
+    去重是必须的：end 节点会把上游的产物再透传一遍，同一条路径出现两次
+    会让人以为"出了两个文件"。
+    """
     out = []
+    seen = set()
     for node in run.get("node_states") or []:
         output = node.get("output")
         if not isinstance(output, dict):
             continue
-        for key in ("image", "video", "audio", "path", "report"):
+        def add(key, value):
+            if not isinstance(value, str) or not value:
+                return
+            if value in seen:
+                return
+            seen.add(value)
+            out.append({"node": node.get("id"), "type": node.get("type"), "key": key, "path": value})
+
+        for key in ("image", "video", "audio", "path"):
             v = output.get(key)
-            if isinstance(v, str) and v:
-                out.append({"node": node.get("id"), "type": node.get("type"), "key": key, "path": v})
-            elif isinstance(v, list):
+            if isinstance(v, list):
                 for item in v:
-                    if isinstance(item, str) and item:
-                        out.append({"node": node.get("id"), "type": node.get("type"), "key": key, "path": item})
+                    add(key, item)
+            else:
+                add(key, v)
     return out
 
 
