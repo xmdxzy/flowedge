@@ -103,8 +103,8 @@ test('上游变量可点击复制引用写法（{{id.field}}）', () => {
   assert.ok(text.includes('{{up.image}}'), `没有生成引用写法：${text}`)
 })
 
-test('子工作流节点列出已保存的工作流', () => {
-  const { container } = renderPanel(mk('sub_workflow', {}), {
+test('循环节点列出可引用的工作流', () => {
+  const { container } = renderPanel(mk('loop', {}), {
     savedWorkflows: [{ id: 7, name: '出片流水线' }],
   })
   const text = container.textContent ?? ''
@@ -221,4 +221,29 @@ test('文本拆分：改方式会回写 mode', () => {
   assert.ok(select, '没找到拆分方式下拉')
   typeInto(select, 'by_paragraph')
   assert.deepEqual(updates, [['mode', 'by_paragraph']])
+})
+
+// 质量循环：第二件核心能力的入口必须在面板上看得见、改得动。
+// 缺了这块，用户只能去 JSON 里手写 max_rounds/target_score——等于核心能力不可用。
+test('质量循环：轮次/目标分/修复策略可配，且改值回传', () => {
+  const { container, getByText, updates } = renderPanel(
+    mk('quality_loop', { workflow_id: 3, max_rounds: 3, target_score: 100, repair: 'auto' }),
+    { savedWorkflows: [{ id: 3, name: '出片主链' }] },
+  )
+  const text = container.textContent ?? ''
+  assert.ok(text.includes('最多轮次'), '缺「最多轮次」')
+  assert.ok(text.includes('目标分'), '缺「目标分」')
+  assert.ok(text.includes('修复策略'), '缺修复策略选择')
+  assert.ok(text.includes('达到目标分即停'), '没有解释循环何时停')
+
+  // 目标分输入：改成 80 要回传数字（不是字符串）
+  const nums = Array.from(container.querySelectorAll('input[type=number]')) as HTMLInputElement[]
+  const target = nums.find((n) => n.value === '100')
+  assert.ok(target, '找不到目标分输入')
+  typeInto(target!, '80')
+  assert.ok(
+    updates.some(([k, v]) => k === 'target_score' && v === 80),
+    `target_score 未回传数字：${JSON.stringify(updates)}`,
+  )
+  void getByText
 })

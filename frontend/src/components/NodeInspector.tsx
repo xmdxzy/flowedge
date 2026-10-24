@@ -656,7 +656,7 @@ export default function NodeInspector({
           </div>
         )}
 
-        {(node.type === 'sub_workflow' || node.type === 'loop') && (
+        {(node.type === 'loop' || node.type === 'quality_loop') && (
           <>
             <div>
               <label className="text-xs text-gray-400 block mb-1">引用工作流</label>
@@ -680,7 +680,11 @@ export default function NodeInspector({
                   ))}
               </select>
               {!node.data.workflow_id && (
-                <p className="text-[10px] text-warning mt-1">需先保存目标工作流，再回到此处选择</p>
+                <p className="text-[10px] text-warning mt-1">
+                  {node.type === 'quality_loop'
+                    ? '选一条已保存的「生成」工作流：它会按轮次被反复重跑'
+                    : '需先保存目标工作流，再回到此处选择'}
+                </p>
               )}
             </div>
 
@@ -960,6 +964,98 @@ export default function NodeInspector({
             <p className="text-[10px] text-gray-500 leading-relaxed">
               输出结构化分镜表：景别 / 角度 / 轴线 / 运镜 / 动作 / 声音 / 台词 / 衔接方式。
               时长按内容给（3–8 秒，自动吸附 H3 的 17k+5 帧网格），不强制均分。
+            </p>
+          </div>
+        )}
+
+        {node.type === 'quality_loop' && (
+          <div className="flex flex-col gap-3">
+            <p className="text-[10px] text-gray-500 leading-relaxed">
+              生成 → 验收打分 → 诊断 → 按修复建议改参数 → 重跑 → 取最好的一轮。
+              只做<span className="text-gray-300">有确定解</span>的修复（帧数/宽高/时长下限/音轨/禁人声）；
+              画面语义类问题走重采样。达到目标分即停，未达标会显式失败并带逐轮报告。
+            </p>
+            <div className="grid grid-cols-3 gap-2">
+              <div>
+                <label className="text-[10px] text-gray-500 block mb-1">最多轮次</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={Number(node.data.max_rounds ?? 3)}
+                  onChange={(e) => onUpdate('max_rounds', Number(e.target.value) || 3)}
+                  className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-gray-500 block mb-1">目标分</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={Number(node.data.target_score ?? 100)}
+                  onChange={(e) => onUpdate('target_score', Number(e.target.value) || 100)}
+                  className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-gray-500 block mb-1">修复策略</label>
+                <select
+                  value={(node.data.repair as string) || 'auto'}
+                  onChange={(e) => onUpdate('repair', e.target.value)}
+                  className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                >
+                  <option value="auto">auto · 改参数 + 重采样</option>
+                  <option value="resample">resample · 只重采样</option>
+                  <option value="off">off · 只跑不修</option>
+                </select>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {([['min_frames', '最少帧数'], ['min_width', '最小宽'], ['min_height', '最小高']] as const).map(([k, label]) => (
+                <div key={k}>
+                  <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                  <input
+                    type="number"
+                    value={Number(node.data[k] ?? 0)}
+                    onChange={(e) => onUpdate(k, Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {([['duration_min', '最短时长(s)'], ['max_silence_gap', '最长静音(s)']] as const).map(([k, label]) => (
+                <div key={k}>
+                  <label className="text-[10px] text-gray-500 block mb-1">{label}</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={Number(node.data[k] ?? 0)}
+                    onChange={(e) => onUpdate(k, Number(e.target.value) || 0)}
+                    className="w-full px-2 py-1 rounded-lg bg-canvas border border-border text-xs"
+                  />
+                </div>
+              ))}
+            </div>
+            <label className="flex items-center gap-2 text-[11px] text-gray-400">
+              <input
+                type="checkbox"
+                checked={node.data.require_audio !== false}
+                onChange={(e) => onUpdate('require_audio', e.target.checked)}
+              />
+              必须有音轨
+            </label>
+            <label className="flex items-center gap-2 text-[11px] text-gray-400">
+              <input
+                type="checkbox"
+                checked={node.data.forbid_speech === true}
+                onChange={(e) => onUpdate('forbid_speech', e.target.checked)}
+              />
+              禁止人声（纯环境音）
+            </label>
+            <p className="text-[10px] text-gray-600 leading-relaxed">
+              参数改在<span className="font-mono">被循环的工作流</span>里，这里只下「目标」与「修复策略」；
+              目标节点留空时自动挑 shotlist / text2video / text2image。
             </p>
           </div>
         )}

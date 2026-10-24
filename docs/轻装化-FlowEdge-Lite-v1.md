@@ -110,16 +110,17 @@ GET  /api/mcp/config | GET /api/ws
 |---|---|---|
 | 后端编译 | `cd backend && go build ./...` | 通过 |
 | 后端测试 | `cd backend && go test ./...` | 4 包全过 |
+| 一键全检 | `python scripts/check-all.py` | **ALL-PASS**（build + test + tsc + 前端契约） |
 | 质量循环闭环 | `go test ./service -run TestQualityLoop` | **R1 320×240/16 帧 33 分 → 补丁 → R2 720×240/48 帧 100 分** |
 | 质量循环失败语义 | `TestQualityLoop_FailsWhenTargetUnreachable` | 修不动时显式报错并带报告 |
 | 前端类型 | `cd frontend && npx tsc --noEmit` | 0 错误 |
-| 前端测试 | `cd frontend && NODE_ENV=test npm test` | **73/73 通过** |
+| 前端测试 | `cd frontend && npm test`（跑批器已钉 `NODE_ENV=test`） | **74/74 通过** |
 | 打包 | `python scripts/build-windows.py` | 19.9 MB 单文件 |
 | 启动冒烟 | 临时目录跑 exe，`/api/health` + `/api/modules` | `{"status":"ok"}`；模块 27 个，含 `quality_loop` |
 | MCP | `FlowEdge.exe --mcp` + `tools/list` | 9 个工具正常返回 |
 
-> **注意**：`NODE_ENV=production` 会让 `react-test-renderer` 的 `act()` 直接抛错，
-> 前端测试必须 `NODE_ENV=test`（或空）。这不是代码问题，是这个 shell 的环境变量。
+> **已修**：本机 shell 带 `NODE_ENV=production`，曾让 73 个前端用例全部假红。
+> 现在 `scripts/run-tests.mjs` 自己钉死 `NODE_ENV=test`（define + 子进程 env），不再依赖外部环境。
 
 ## 五、没做的 / 已知限制（诚实清单）
 
