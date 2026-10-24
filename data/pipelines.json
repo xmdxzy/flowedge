@@ -1,0 +1,1266 @@
+{
+  "version": 1,
+  "_comment": "FlowEdge 的唯一产品形态：固定出片流水线。字段 bind = 向导参数写到哪个节点的哪个 data 键；when = 该节点是否入选（field 或 field=value）。改这里不用重编译。",
+  "pipelines": [
+    {
+      "id": "image",
+      "name": "文生图",
+      "summary": "一句话出一个画面；可开质量循环自动重采样择优",
+      "output": "image",
+      "est_seconds": 60,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "画面描述",
+          "type": "textarea",
+          "required": true,
+          "hint": "中文就行。写清主体、光线、材质、镜头",
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 1024,
+          "min": 384,
+          "max": 1536,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 1024,
+          "min": 384,
+          "max": 1536,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "height"
+            }
+          ]
+        },
+        {
+          "key": "batch",
+          "label": "张数",
+          "type": "int",
+          "default": 1,
+          "min": 1,
+          "max": 4,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "batch"
+            }
+          ]
+        },
+        {
+          "key": "qc",
+          "label": "质量循环",
+          "type": "bool",
+          "default": false,
+          "hint": "不太满意时打开：生成→验收→改参数→重跑→择优，慢 max_rounds 倍"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "t2i-1",
+          "type": "text2image",
+          "data": {
+            "prompt": "",
+            "prompts": "",
+            "split_lines": false,
+            "width": 1024,
+            "height": 1024,
+            "batch": 1
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "t2i-1"
+        },
+        {
+          "id": "e2",
+          "source": "t2i-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "image_batch",
+      "name": "分镜批量出图",
+      "summary": "一段描述拆成多张分镜图，一次模型加载批量出（比逐张省重复装载）",
+      "output": "image",
+      "est_seconds": 180,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "故事/场景描述",
+          "type": "textarea",
+          "required": true,
+          "hint": "一段话即可，拆镜由本地 LLM 完成",
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 1024,
+          "min": 384,
+          "max": 1536,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 1024,
+          "min": 384,
+          "max": 1536,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "height"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "llm-1",
+          "type": "llm",
+          "data": {
+            "model": "",
+            "prompt": "把上面的描述拆成分镜：每行一个英文画面描述，不要编号、不要解释、不要多余文字。",
+            "text": ""
+          }
+        },
+        {
+          "id": "t2i-1",
+          "type": "text2image",
+          "data": {
+            "prompt": "",
+            "prompts": "",
+            "split_lines": true,
+            "width": 1024,
+            "height": 1024,
+            "batch": 1
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "llm-1"
+        },
+        {
+          "id": "e2",
+          "source": "llm-1",
+          "target": "t2i-1"
+        },
+        {
+          "id": "e3",
+          "source": "t2i-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "image_edit",
+      "name": "图像编辑",
+      "summary": "改风格 / 局部重绘 / 超分放大，三种动作一条入口",
+      "output": "image",
+      "est_seconds": 40,
+      "fields": [
+        {
+          "key": "mode",
+          "label": "动作",
+          "type": "enum",
+          "default": "restyle",
+          "options": [
+            "restyle",
+            "inpaint",
+            "upscale"
+          ],
+          "hint": "restyle=按强度重绘（0.85 以上才明显改风格）· inpaint=蒙版区域重画（默认 flux-schnell，属弱修补；要专业重绘把 model 换成 Fill 模型）· upscale=4 倍放大"
+        },
+        {
+          "key": "image_path",
+          "label": "原图路径",
+          "type": "path",
+          "required": true,
+          "bind": [
+            {
+              "node": "i2i-1",
+              "path": "image_path"
+            },
+            {
+              "node": "inp-1",
+              "path": "image_path"
+            },
+            {
+              "node": "up-1",
+              "path": "image_path"
+            }
+          ]
+        },
+        {
+          "key": "prompt",
+          "label": "重绘提示词",
+          "type": "textarea",
+          "default": "watercolor painting on paper, soft washes, visible brush texture",
+          "bind": [
+            {
+              "node": "i2i-1",
+              "path": "prompt"
+            },
+            {
+              "node": "inp-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "strength",
+          "label": "重绘强度",
+          "type": "float",
+          "default": 0.85,
+          "min": 0.2,
+          "max": 1,
+          "bind": [
+            {
+              "node": "i2i-1",
+              "path": "strength"
+            }
+          ]
+        },
+        {
+          "key": "mask_path",
+          "label": "蒙版路径",
+          "type": "path",
+          "hint": "仅 inpaint 用：白区被重画，必须与原图同尺寸",
+          "bind": [
+            {
+              "node": "inp-1",
+              "path": "mask_path"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "i2i-1",
+          "type": "image2image",
+          "when": "mode=restyle",
+          "data": {
+            "prompt": "",
+            "image_path": "",
+            "strength": 0.85,
+            "steps": 10
+          }
+        },
+        {
+          "id": "inp-1",
+          "type": "inpaint",
+          "when": "mode=inpaint",
+          "data": {
+            "prompt": "",
+            "image_path": "",
+            "mask_path": "",
+            "denoise": 1,
+            "steps": 10
+          }
+        },
+        {
+          "id": "up-1",
+          "type": "upscale",
+          "when": "mode=upscale",
+          "data": {
+            "image_path": "",
+            "model": "RealESRGAN_x4plus.pth"
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "i2i-1"
+        },
+        {
+          "id": "e2",
+          "source": "start-1",
+          "target": "inp-1"
+        },
+        {
+          "id": "e3",
+          "source": "start-1",
+          "target": "up-1"
+        },
+        {
+          "id": "e4",
+          "source": "i2i-1",
+          "target": "end-1"
+        },
+        {
+          "id": "e5",
+          "source": "inp-1",
+          "target": "end-1"
+        },
+        {
+          "id": "e6",
+          "source": "up-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "video",
+      "name": "文生视频（带声音）",
+      "summary": "H3 一次推理出画面 + 立体声；608×352×124 帧 ≈ 5 秒",
+      "output": "video",
+      "est_seconds": 240,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "画面与声音描述",
+          "type": "textarea",
+          "required": true,
+          "hint": "中英文都行。想同时出环境声与配乐，就在描述里写出来",
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "optimize",
+          "label": "提示词优化",
+          "type": "bool",
+          "default": true,
+          "hint": "先用本地 LLM 改写成 H3 三段式（画面/环境声/配乐），压掉人声乱语；给了参考图/音频时自动转六段式",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "prompt_opt"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 608,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 352,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "height"
+            }
+          ]
+        },
+        {
+          "key": "frames",
+          "label": "帧数",
+          "type": "int",
+          "default": 124,
+          "min": 24,
+          "max": 248,
+          "hint": "24fps，124 帧 ≈ 5 秒",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "frames"
+            }
+          ]
+        },
+        {
+          "key": "steps",
+          "label": "步数",
+          "type": "int",
+          "default": 12,
+          "min": 4,
+          "max": 30,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "steps"
+            }
+          ]
+        },
+        {
+          "key": "segments",
+          "label": "段数",
+          "type": "int",
+          "default": 1,
+          "min": 1,
+          "max": 4,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "segments"
+            }
+          ]
+        },
+        {
+          "key": "qc",
+          "label": "质量循环",
+          "type": "bool",
+          "default": false
+        },
+        {
+          "key": "ref_images",
+          "label": "角色参考图（可选）",
+          "type": "textarea",
+          "default": "",
+          "hint": "每行一张路径（≤9），锁定人物外貌；给了就走 Ref2VA，提示词里用 <Picture 1> 引用",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "ref_images"
+            }
+          ]
+        },
+        {
+          "key": "ref_audio",
+          "label": "参考音频（可选）",
+          "type": "path",
+          "default": "",
+          "hint": "填一段念稿音频 → 口型同步；只填音频、不填图也会走参考路径",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "ref_audio"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "t2v-1",
+          "type": "text2video",
+          "data": {
+            "prompt": "",
+            "backend": "h3",
+            "width": 608,
+            "height": 352,
+            "frames": 124,
+            "fps": 24,
+            "steps": 12,
+            "negative": "",
+            "low_vram": false,
+            "segments": 1,
+            "interp": false,
+            "turbo": true,
+            "prompt_opt": true,
+            "ref_images": [],
+            "ref_audio": []
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "t2v-1"
+        },
+        {
+          "id": "e2",
+          "source": "t2v-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "video_from_image",
+      "name": "图生视频 · 长镜头",
+      "summary": "先定首帧（文生图）再 H3 首帧引导 + 末帧续接，2 段拼成约 10 秒",
+      "output": "video",
+      "est_seconds": 420,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "首帧画面",
+          "type": "textarea",
+          "required": true,
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "motion",
+          "label": "运镜与声音",
+          "type": "textarea",
+          "default": "镜头缓慢前推，雪粒被风吹起，远处风声与铃响",
+          "hint": "只描述「怎么动 + 什么声音」，不要重复首帧内容",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 608,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "width"
+            },
+            {
+              "node": "t2v-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 352,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "t2i-1",
+              "path": "height"
+            },
+            {
+              "node": "t2v-1",
+              "path": "height"
+            }
+          ]
+        },
+        {
+          "key": "frames",
+          "label": "每段帧数",
+          "type": "int",
+          "default": 124,
+          "min": 24,
+          "max": 248,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "frames"
+            }
+          ]
+        },
+        {
+          "key": "steps",
+          "label": "步数",
+          "type": "int",
+          "default": 12,
+          "min": 4,
+          "max": 30,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "steps"
+            }
+          ]
+        },
+        {
+          "key": "segments",
+          "label": "段数",
+          "type": "int",
+          "default": 2,
+          "min": 1,
+          "max": 4,
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "segments"
+            }
+          ]
+        },
+        {
+          "key": "qc",
+          "label": "质量循环",
+          "type": "bool",
+          "default": false
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "t2i-1",
+          "type": "text2image",
+          "data": {
+            "prompt": "",
+            "width": 608,
+            "height": 352,
+            "batch": 1
+          }
+        },
+        {
+          "id": "t2v-1",
+          "type": "text2video",
+          "data": {
+            "prompt": "",
+            "backend": "h3",
+            "image_path": "",
+            "width": 608,
+            "height": 352,
+            "frames": 124,
+            "fps": 24,
+            "steps": 12,
+            "negative": "",
+            "low_vram": false,
+            "segments": 2,
+            "interp": false,
+            "turbo": true
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "t2i-1"
+        },
+        {
+          "id": "e2",
+          "source": "t2i-1",
+          "target": "t2v-1"
+        },
+        {
+          "id": "e3",
+          "source": "t2v-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "film",
+      "name": "多段短片",
+      "summary": "一段梗概 → 分镜表（景别/角度/轴线/运镜/衔接）→ 逐镜生成 → 按 cut/continue/dissolve 装配",
+      "output": "video",
+      "est_seconds": 2400,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "片子梗概",
+          "type": "textarea",
+          "required": true,
+          "hint": "写清场景、人物关系、情绪与声音。全片无对白时明确写出来，压制人声乱语",
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "seconds",
+          "label": "目标时长（秒）",
+          "type": "int",
+          "default": 30,
+          "min": 10,
+          "max": 120,
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "seconds"
+            }
+          ]
+        },
+        {
+          "key": "max_shots",
+          "label": "镜头数上限",
+          "type": "int",
+          "default": 6,
+          "min": 2,
+          "max": 12,
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "max_shots"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 608,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 352,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "height"
+            }
+          ]
+        },
+        {
+          "key": "steps",
+          "label": "步数",
+          "type": "int",
+          "default": 12,
+          "min": 4,
+          "max": 30,
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "steps"
+            }
+          ]
+        },
+        {
+          "key": "audio_check",
+          "label": "音频抽检",
+          "type": "bool",
+          "default": true,
+          "hint": "每段查有没有人声乱语/静音缺口，不合格就显式报错而不是静默出片",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "audio_check"
+            }
+          ]
+        },
+        {
+          "key": "consistency_check",
+          "label": "一致性门",
+          "type": "bool",
+          "default": true,
+          "hint": "开机前审分镜表：continue 续接却跳轴/换光、场景锁字节不一致，直接拦下（否则 40 分钟拍完才发现接缝换场地）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "consistency_check"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "sb-1",
+          "type": "storyboard",
+          "data": {
+            "brief": "",
+            "seconds": 30,
+            "max_shots": 6
+          }
+        },
+        {
+          "id": "sl-1",
+          "type": "shotlist",
+          "data": {
+            "plan": "",
+            "backend": "h3",
+            "width": 608,
+            "height": 352,
+            "steps": 12,
+            "turbo": true,
+            "audio_check": true,
+            "interp": false,
+            "consistency_check": true
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "sb-1"
+        },
+        {
+          "id": "e2",
+          "source": "sb-1",
+          "target": "sl-1"
+        },
+        {
+          "id": "e3",
+          "source": "sl-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "voice",
+      "name": "文案转配音",
+      "summary": "文本 → 语音（本地 TTS；填参考音频即克隆音色）",
+      "output": "audio",
+      "est_seconds": 30,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "台词/文案",
+          "type": "textarea",
+          "required": true,
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "ref_audio",
+          "label": "参考音色（可选）",
+          "type": "path",
+          "hint": "填一段音频路径即做音色克隆；服务不支持克隆时显式报错，不会偷偷回退成默认音色",
+          "bind": [
+            {
+              "node": "tts-1",
+              "path": "ref_audio"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "tts-1",
+          "type": "tts",
+          "data": {
+            "text": "",
+            "voice": "",
+            "ref_audio": ""
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "tts-1"
+        },
+        {
+          "id": "e2",
+          "source": "tts-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "storyboard",
+      "name": "分镜表（先审再拍）",
+      "summary": "一句梗概 → 分镜表：景别/角度/轴线/运镜/光比/声音/转场。只规划、不烧显存，审完再拍",
+      "output": "text",
+      "est_seconds": 90,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "片子梗概",
+          "type": "textarea",
+          "required": true,
+          "hint": "写清场景、人物关系、情绪、声音；全片无对白就明确写出来",
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "seconds",
+          "label": "目标时长（秒）",
+          "type": "int",
+          "default": 30,
+          "min": 10,
+          "max": 120,
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "seconds"
+            }
+          ]
+        },
+        {
+          "key": "max_shots",
+          "label": "镜头数上限",
+          "type": "int",
+          "default": 6,
+          "min": 2,
+          "max": 12,
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "max_shots"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "sb-1",
+          "type": "storyboard",
+          "data": {
+            "brief": "",
+            "seconds": 30,
+            "max_shots": 6
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "sb-1"
+        },
+        {
+          "id": "e2",
+          "source": "sb-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "film_from_plan",
+      "name": "按分镜表出片",
+      "summary": "贴入（或改过的）分镜表 JSON → 逐镜生成 → 按 cut/continue/dissolve 装配；不再让 LLM 重规划",
+      "output": "video",
+      "est_seconds": 2400,
+      "fields": [
+        {
+          "key": "plan",
+          "label": "分镜表 JSON",
+          "type": "textarea",
+          "required": true,
+          "hint": "从「分镜表（先审再拍）」拿到的 JSON，可直接改 景别/运镜/时长/转场 再拍",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "plan"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 608,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 352,
+          "min": 256,
+          "max": 1280,
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "height"
+            }
+          ]
+        },
+        {
+          "key": "steps",
+          "label": "步数",
+          "type": "int",
+          "default": 12,
+          "min": 4,
+          "max": 30,
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "steps"
+            }
+          ]
+        },
+        {
+          "key": "audio_check",
+          "label": "音频抽检",
+          "type": "bool",
+          "default": true,
+          "hint": "每段查有没有人声乱语/静音缺口，不合格显式报错",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "audio_check"
+            }
+          ]
+        },
+        {
+          "key": "consistency_check",
+          "label": "一致性门",
+          "type": "bool",
+          "default": true,
+          "hint": "开机前审分镜表：continue 续接却跳轴/换光 直接拦下",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "consistency_check"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "sl-1",
+          "type": "shotlist",
+          "data": {
+            "plan": "",
+            "backend": "h3",
+            "width": 608,
+            "height": 352,
+            "steps": 12,
+            "turbo": true,
+            "audio_check": true,
+            "interp": false,
+            "consistency_check": true
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "sl-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
+      "id": "text",
+      "name": "文本生成",
+      "summary": "一句话需求 → 本地 LLM 出稿：台词 / 文案 / 扩写 / 分镜文案；不出图不占显存",
+      "output": "text",
+      "est_seconds": 120,
+      "fields": [
+        {
+          "key": "prompt",
+          "label": "要它写什么",
+          "type": "textarea",
+          "required": true,
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "instruction",
+          "label": "写作要求",
+          "type": "text",
+          "default": "用中文直接给成品，不要解释，不要罗列步骤。",
+          "bind": [
+            {
+              "node": "llm-1",
+              "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "model",
+          "label": "模型（留空用默认）",
+          "type": "text",
+          "default": "",
+          "bind": [
+            {
+              "node": "llm-1",
+              "path": "model"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "llm-1",
+          "type": "llm",
+          "data": {
+            "model": "",
+            "prompt": "",
+            "text": ""
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "llm-1"
+        },
+        {
+          "id": "e2",
+          "source": "llm-1",
+          "target": "end-1"
+        }
+      ]
+    }
+  ]
+}

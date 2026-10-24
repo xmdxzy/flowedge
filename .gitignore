@@ -1,4 +1,4 @@
-# 依赖
+﻿# 依赖
 node_modules/
 vendor/
 
@@ -29,8 +29,11 @@ backend/web/services/files/*
 # 数据
 *.db
 *.sqlite
-data/
+data/*
+# 例外：固定流水线定义是产品形态本身，必须进版本库（运行时数据仍忽略）
+!data/pipelines.json
 backend/data/
+backend/*/data/          # 测试跑出来的临时产物
 
 # 就地运行目录（exe + 本地数据库 + 启动脚本，不属于源码）
 /运行/
@@ -75,8 +78,12 @@ docs/动作产线-*
 docs/动作生成与动捕*
 
 # 本地生成物与部署目录（公开仓库只收代码与文档）
-data/generated/
-data/runs/
+data/*
+# 例外：固定流水线定义是产品形态本身，必须进版本库（运行时数据仍忽略）
+!data/pipelines.json
+data/*
+# 例外：固定流水线定义是产品形态本身，必须进版本库（运行时数据仍忽略）
+!data/pipelines.json
 运行/
 
 # 接口导出的临时 JSON 与手动备份（调试落盘，非源码）
