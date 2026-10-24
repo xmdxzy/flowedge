@@ -369,7 +369,11 @@ func getEnv(key, fallback string) string {
 
 // getQueueConcurrency 队列并发上限（默认 2：本地多模态任务多为显存密集，并行反而慢）
 func getQueueConcurrency() int {
-	c := 2
+	// 默认 1：这是单卡（24GB）产品，两条出片并行只会互相抢显存——
+	// 实测教训：film 在跑（H3 占 23.6GB）时并发一条 image_edit，它的
+	// text2image 直接撞 5m15s 节点超时，看起来像"图片节点坏了"。
+	// 真要并行（多卡/纯 CPU 任务）用 FLOWEDGE_QUEUE_CONCURRENCY 显式开。
+	c := 1
 	if v := os.Getenv("FLOWEDGE_QUEUE_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c = n

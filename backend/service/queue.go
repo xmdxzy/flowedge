@@ -11,52 +11,83 @@ import (
 
 // JobQueue 持久化任务队列。
 //
-// 定位：把「任务已受理」落库，用信号量限制并发。
-// 单机单 GPU 场景下并发上限默认 2 —— 两个 flux 并行只会互相抢显存。
-// 若需要水平扩容，应换外部 broker（Redis/NATS），本实现不做分布式承诺。
+// 定位：把「任务已受理」落库，用并发上限限制同时执行数量。
+//
+// 两条硬约束（都踩过）：
+//  1. **Enqueue 绝不阻塞**。旧实现是 `sem <- struct{}{}`：信号量满时调用方
+//     （HTTP handler）就卡住，界面表现为「点出片转圈 3 分钟后超时」——
+//     而任务其实还在排队。现在改成入队 + 调度，调用方立即返回。
+//  2. 默认并发 1。这是单卡产品，两条出片并行只会互相抢显存：
+//     实测 H3 跑片时并发一条文生图，后者直接撞 5m15s 节点超时。
+//     多卡/纯 CPU 场景用 FLOWEDGE_QUEUE_CONCURRENCY 显式调大。
 type JobQueue struct {
-	db     *gorm.DB
-	sem    chan struct{}
-	wg     sync.WaitGroup
-	mu     sync.Mutex
-	closed bool
+	db *gorm.DB
+
+	mu      sync.Mutex
+	pending []queuedJob
+	running int
+	max     int
+	closed  bool
+
+	wg sync.WaitGroup
+}
+
+type queuedJob struct {
+	job model.Job
+	fn  func()
 }
 
 func NewJobQueue(db *gorm.DB, maxConcurrent int) *JobQueue {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	return &JobQueue{
-		db:  db,
-		sem: make(chan struct{}, maxConcurrent),
-	}
+	return &JobQueue{db: db, max: maxConcurrent}
 }
 
-// Enqueue 异步执行任务。fn 抛 panic 不会拖垮整条队列（仅记日志）。
+// Enqueue 受理任务并立即返回（不阻塞调用方），按 FIFO 顺序调度。
 func (q *JobQueue) Enqueue(job model.Job, fn func()) {
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
+		q.db.Model(&model.Job{}).Where("id = ?", job.ID).
+			Updates(map[string]interface{}{"status": "interrupted", "error": "引擎正在关闭，任务未执行"})
 		return
 	}
+	q.pending = append(q.pending, queuedJob{job: job, fn: fn})
 	q.mu.Unlock()
+	q.dispatch()
+}
 
-	q.sem <- struct{}{}
-	q.wg.Add(1)
-	go func() {
-		defer func() {
-			<-q.sem
-			q.wg.Done()
-		}()
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[Queue] job %d panic recovered: %v", job.ID, r)
-				q.db.Model(&model.Job{}).Where("id = ?", job.ID).
-					Updates(map[string]interface{}{"status": "failed", "error": "panic in task"})
-			}
-		}()
-		fn()
-	}()
+// dispatch 在有空位时把队头任务拉起来（可重入：任务结束时再调一次）。
+func (q *JobQueue) dispatch() {
+	for {
+		q.mu.Lock()
+		if q.closed || q.running >= q.max || len(q.pending) == 0 {
+			q.mu.Unlock()
+			return
+		}
+		next := q.pending[0]
+		q.pending = q.pending[1:]
+		q.running++
+		q.mu.Unlock()
+
+		q.wg.Add(1)
+		go func(item queuedJob) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[Queue] job %d panic recovered: %v", item.job.ID, r)
+					q.db.Model(&model.Job{}).Where("id = ?", item.job.ID).
+						Updates(map[string]interface{}{"status": "failed", "error": "panic in task"})
+				}
+				q.mu.Lock()
+				q.running--
+				q.mu.Unlock()
+				q.wg.Done()
+				q.dispatch()
+			}()
+			item.fn()
+		}(next)
+	}
 }
 
 // RecoverInterrupted 启动时把上次进程留下的 running 任务标记为 interrupted。
@@ -88,6 +119,13 @@ func (q *JobQueue) Close() {
 	q.mu.Lock()
 	q.closed = true
 	q.mu.Unlock()
+}
+
+// Pending 队列里还没开始的任务数（运维/看板用）。
+func (q *JobQueue) Pending() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.pending)
 }
 
 // ListRecent 查询任务记录（运维排障）

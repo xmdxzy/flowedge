@@ -33,7 +33,7 @@ TOKEN = os.environ.get("FLOWEDGE_API_TOKEN", "")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def api(path: str, method: str = "GET", body=None, timeout: int = 60):
+def api(path: str, method: str = "GET", body=None, timeout: int = 180):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(BASE + path, data=data, method=method)
     if data:
