@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strings"
 
-	"flowedge/backend/model"
 )
 
 // H3 提示词优化
@@ -855,67 +854,15 @@ func cleanOptimizedPrompt(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// execPromptOptNode 独立的「提示词优化」节点：
-// 上游 text（或自身 text 字段）→ 按 mode 优化 → text。
-// mode 目前只有 h3；image/raw 直接透传（留扩展位）。
-func (e *EngineV2) execPromptOptNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	mode, _ := node.Data["mode"].(string)
-	if mode == "" {
-		mode = "h3"
+// 走语言侧 LLM（调用方负责 enterSide(sideLanguage)）。
+func (e *EngineV2) SplitPromptIntoBeats(prompt string, n int) ([]string, error) {
+	if e.llm == nil {
+		return nil, fmt.Errorf("LLM 服务不可用，无法拆分分镜")
 	}
-
-	raw, _ := node.Data["text"].(string)
-	if strings.TrimSpace(raw) == "" {
-		for _, out := range upstream {
-			if m, ok := out.(map[string]interface{}); ok {
-				if t, ok := m["text"].(string); ok && strings.TrimSpace(t) != "" {
-					raw = t
-					break
-				}
-			}
-		}
+	if n < 2 {
+		return []string{prompt}, nil
 	}
-	if strings.TrimSpace(raw) == "" {
-		return nil, fmt.Errorf("提示词优化缺少输入：连上游文本或填 text")
-	}
-
-	seconds := 5
-	if v, ok := node.Data["seconds"].(float64); ok && int(v) > 0 {
-		seconds = int(v)
-	}
-
-	release := e.enterLanguageSide("")
-	defer release()
-
-	// 场景锁：上游「场景九宫格」节点给了就带上，没给就行为不变。
-	// 锁在这里就已经编译成最终字节，下游只允许复用、不允许重新编译——
-	// 重新编译等于给了每段一个"重新解释场景"的机会。
-	lock, lerr := resolveSceneLock(node, upstream)
-	if lerr != nil {
-		return nil, lerr
-	}
-
-	opt, err := e.OptimizePromptForH3WithGrid(ctx, raw, seconds, lock)
-	if err != nil {
-		// 优化失败不炸工作流：透传原文，让用户看到原因后自行决定
-		return map[string]interface{}{
-			"text":     raw,
-			"original": raw,
-			"mode":     mode,
-			"error":    err.Error(),
-		}, nil
-	}
-	out := map[string]interface{}{
-		"text":     opt,
-		"original": raw,
-		"mode":     mode,
-	}
-	if lock != "" {
-		out["scene_lock"] = lock
-	}
-	return out, nil
-}
-
+	user := fmt.Sprintf("拆成 %d 段。镜头总指令：%s", n, prompt)
 // beatSplitInstruction 分镜拆解指令：长片（segments>1）必备。
 // 关键要求：段间首尾衔接 + 逐段重复角色外貌（H3 没有角色记忆，一致性只能靠文本+首帧引导）。
 const beatSplitInstruction = `你是分镜师。把下面这条镜头总指令拆成 N 段（每段约 5 秒），规则：
@@ -929,16 +876,6 @@ const beatSplitInstruction = `你是分镜师。把下面这条镜头总指令�
 6. N 段要构成完整的起承转合：开场建立、升级对抗、高潮爆发、收尾定格
 7. 只输出 N 行，一行一段，不要编号、不要解释、不要 Markdown`
 
-// SplitPromptIntoBeats 把优化后的总指令拆成 N 段衔接提示词。
-// 走语言侧 LLM（调用方负责 enterSide(sideLanguage)）。
-func (e *EngineV2) SplitPromptIntoBeats(prompt string, n int) ([]string, error) {
-	if e.llm == nil {
-		return nil, fmt.Errorf("LLM 服务不可用，无法拆分分镜")
-	}
-	if n < 2 {
-		return []string{prompt}, nil
-	}
-	user := fmt.Sprintf("拆成 %d 段。镜头总指令：%s", n, prompt)
 	out, err := e.deterministicChat(e.llm.Model, fmt.Sprintf("%s\n\n%s", beatSplitInstruction, user))
 	if err != nil {
 		return nil, err

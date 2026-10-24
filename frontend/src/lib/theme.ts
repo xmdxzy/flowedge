@@ -74,24 +74,3 @@ export const THEME_OPTIONS: { value: ThemePref; label: string; icon: string; hin
   { value: 'dark', label: '深色', icon: '☾', hint: '深色主题' },
   { value: 'system', label: '跟随系统', icon: '⌂', hint: '跟随系统外观自动切换' },
 ]
-
-// React Flow 的画布/小地图颜色是组件 props，没法用 CSS 变量，这里给两套
-export const CANVAS_THEME: Record<
-  Theme,
-  { bg: string; dot: string; minimapBg: string; minimapMask: string; minimapNode: string }
-> = {
-  dark: {
-    bg: '#0a0e14',
-    dot: '#1c2436',
-    minimapBg: '#0d111b',
-    minimapMask: 'rgba(10, 14, 20, 0.78)',
-    minimapNode: '#818cf8',
-  },
-  light: {
-    bg: '#f4f6fb',
-    dot: '#cfd9e8',
-    minimapBg: '#f8fafd',
-    minimapMask: 'rgba(240, 244, 250, 0.82)',
-    minimapNode: '#4f46e5',
-  },
-}

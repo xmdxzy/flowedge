@@ -1,261 +1,236 @@
 #!/usr/bin/env python3
-"""调用 FlowEdge 引擎出片（台词 / 氛围两种模式），供序策图编排。
+"""FlowEdge 出片 CLI（取代原来的「建工作流 → 跑工作流」两段式脚本）。
 
-为什么不让序策图直接怼 ComfyUI
-------------------------------
-H3 的图构建、互斥切换、显存仲裁、自检都在 FlowEdge 里（单一事实源）。
-序策图只负责「何时跑、跑哪种模式、验收过不过」，不重复实现构图逻辑。
+FlowEdge 收敛后只剩一个动作：**选流水线 + 填字段 → 出片**。这个脚本就是
+那条动作的命令行壳子，顺便给 agent 一个不必手写 curl 的入口。
 
 用法
 ----
-    # 台词模式：ref2va + 念稿音轨（口型同步、音频 1:1 透传）
-    python scripts/run-flowedge.py --mode dialogue --prompt-file p.txt --audio dub.wav --frames 107
+    python scripts/run-flowedge.py pipelines
+    python scripts/run-flowedge.py produce --pipeline image --params '{"prompt":"云海楼阁","qc":true}'
+    python scripts/run-flowedge.py produce --pipeline video --params-file .tmp/p.json --wait
+    python scripts/run-flowedge.py status 12
+    python scripts/run-flowedge.py runs --limit 10 --status failed
+    python scripts/run-flowedge.py artifacts --kind video
 
-    # 氛围模式：fl2va 联合生成，无台词（口型闭合）
-    python scripts/run-flowedge.py --mode ambience --prompt-file p.txt --frames 124
-
-    # 自动：给了 --audio 就是台词，否则氛围（序策图里由 mode 节点决定）
-    python scripts/run-flowedge.py --mode auto --prompt-file p.txt
-
-输出 JSON：{ok, mode, video, seconds, check_ok, detail}
-退出码：0 成功 / 2 失败（供 evalgate 直接判定）
+退出码：0 = 成功；1 = 出片失败/引擎报错；2 = 引擎不可达或参数不合法。
+输出：一行 JSON（便于 agent 直接解析），不打印花哨日志。
 """
-
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
-ENGINE = os.environ.get("FLOWEDGE_ENGINE", "http://127.0.0.1:8080")
+BASE = os.environ.get("FLOWEDGE_BASE", "http://127.0.0.1:8080")
+TOKEN = os.environ.get("FLOWEDGE_API_TOKEN", "")
 
-# 本机常驻 http_proxy（企业代理），本地端口必须绕过，否则会拿到 502 假死。
-# 这是 2026-10-19 踩过的坑：502 不代表服务挂了，而是请求根本没到本地。
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# 本机常驻企业代理（http_proxy=127.0.0.1:5751）：本地调用必须绕过，否则 502 假死
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def api(path: str, method: str = "GET", body=None, timeout: int = 60):
-    data = None
-    headers = {}
-    if body is not None:
-        data = json.dumps(body, ensure_ascii=False).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(ENGINE.rstrip("/") + path, data=data,
-                                 headers=headers, method=method)
-    with _OPENER.open(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8")
-        return json.loads(raw) if raw.strip() else {}
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    if TOKEN:
+        req.add_header("Authorization", "Bearer " + TOKEN)
+    with OPENER.open(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace")
+    return json.loads(raw) if raw.strip() else {}
 
 
-def wait_ready(url: str, seconds: int = 240) -> bool:
-    deadline = time.time() + seconds
-    while time.time() < deadline:
+def emit(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def cmd_pipelines(_args) -> int:
+    try:
+        cat = api("/api/pipelines")
+    except Exception as e:
+        emit({"ok": False, "error": f"引擎不可达（{BASE}）：{e}", "hint": "先启动 FlowEdge"})
+        return 2
+    rows = []
+    for p in cat.get("pipelines") or []:
+        rows.append({
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "output": p.get("output"),
+            "est_seconds": p.get("est_seconds"),
+            "summary": p.get("summary"),
+            "fields": [
+                {"key": f.get("key"), "type": f.get("type"), "default": f.get("default"),
+                 "required": bool(f.get("required")), "options": f.get("options")}
+                for f in p.get("fields") or []
+            ],
+        })
+    emit({"ok": True, "count": len(rows), "pipelines": rows})
+    return 0
+
+
+def cmd_produce(args) -> int:
+    params = {}
+    if args.params:
         try:
-            _OPENER.open(url, timeout=3).read()
-            return True
+            params = json.loads(args.params)
+        except json.JSONDecodeError as e:
+            emit({"ok": False, "error": f"--params 不是合法 JSON：{e}"})
+            return 2
+    if args.params_file:
+        try:
+            with open(args.params_file, encoding="utf-8-sig") as f:
+                params.update(json.load(f))
+        except Exception as e:
+            emit({"ok": False, "error": f"读 --params-file 失败：{e}"})
+            return 2
+
+    body = {"pipeline": args.pipeline, "params": params, "invoked_by": args.invoked_by}
+    try:
+        # 先体检：缺服务时给的是「怎么起」，不是十分钟后一条 failed
+        pre = api("/api/preflight", "POST", body)
+        if not pre.get("ok"):
+            emit({
+                "ok": False,
+                "stage": "preflight",
+                "missing": pre.get("missing"),
+                "hint": "按每项的 fix 处理，或有 fixable 的调 POST /api/deps/<fix_dep>/start",
+            })
+            return 2
+        sub = api("/api/produce", "POST", body)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        emit({"ok": False, "stage": "submit", "status": e.code, "error": detail[:600]})
+        return 2
+    except Exception as e:
+        emit({"ok": False, "error": f"引擎不可达（{BASE}）：{e}"})
+        return 2
+
+    run_id = sub.get("run_id")
+    if not args.wait:
+        emit({"ok": True, "stage": "submitted", "run_id": run_id, "pipeline": sub.get("pipeline")})
+        return 0
+
+    detail = wait_run(run_id, args.timeout)
+    if detail is None:
+        emit({"ok": False, "stage": "wait", "run_id": run_id,
+              "error": f"等了 {args.timeout}s 还没结束（不是失败，是还没跑完）"})
+        return 1
+    out = {"ok": detail.get("status") == "success", "run_id": run_id,
+           "status": detail.get("status"), "error": detail.get("error") or ""}
+    out["artifacts"] = artifacts_of(detail)
+    emit(out)
+    return 0 if out["ok"] else 1
+
+
+def cmd_status(args) -> int:
+    try:
+        detail = api(f"/api/runs/{args.run_id}")
+    except Exception as e:
+        emit({"ok": False, "error": f"查询失败：{e}"})
+        return 2
+    if args.wait and detail.get("status") == "running":
+        detail = wait_run(args.run_id, args.timeout) or detail
+    emit({"ok": True, "run": detail, "artifacts": artifacts_of(detail)})
+    return 0
+
+
+def cmd_runs(args) -> int:
+    path = f"/api/runs?limit={args.limit}"
+    if args.status:
+        path += "&status=" + args.status
+    try:
+        data = api(path)
+    except Exception as e:
+        emit({"ok": False, "error": f"引擎不可达：{e}"})
+        return 2
+    emit({"ok": True, **data})
+    return 0
+
+
+def cmd_artifacts(args) -> int:
+    path = "/api/artifacts"
+    if args.kind:
+        path += "?kind=" + args.kind
+    try:
+        data = api(path)
+    except Exception as e:
+        emit({"ok": False, "error": f"引擎不可达：{e}"})
+        return 2
+    emit({"ok": True, **data})
+    return 0
+
+
+def wait_run(run_id, timeout: int):
+    """轮询到结束。返回详情；超时返回 None（超时 ≠ 失败）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            info = api(f"/api/runs/{run_id}")
         except Exception:
-            time.sleep(5)
-    return False
+            continue
+        if info.get("status") != "running":
+            return info
+    return None
 
 
-def ensure_h3(need_audio: bool) -> str:
-    """确保引擎在、H3 在。（ASR/TTS 由调用方或图里其它节点负责）"""
-    try:
-        api("/api/capabilities")
-    except Exception as e:
-        return f"FlowEdge 引擎不可达（{ENGINE}）：{e}"
-    try:
-        api("/api/deps/comfy_h3/start", method="POST", timeout=30)
-    except Exception as e:
-        return f"H3 实例启动请求失败：{e}"
-    if not wait_ready("http://127.0.0.1:8189/system_stats", 240):
-        return "H3 实例 240s 内未就绪（冷启动约 50s，检查显存是否被别的进程占用）"
-    return ""
-
-
-
-def strip_dialogue_for_ambience(prompt: str) -> str:
-    """把带台词的剧本改成"无声版"，并补齐三段式声音字段。
-
-    两个坑（都踩过）：
-      1. 只删 <d> 块，会留下 "and says:" —— 模型照样开口；
-         要把「says + 说话人 + <d>」整段换成 stays silent。
-      2. 不补 overall_soundscape 字段，模型会自行脑补（含人声）。
-    """
-    import re as _re
-
-    # 1) "and says: (S1) ... <d>...</d>" → "stays silent"
-    prompt = _re.sub(r"(?:,?\s*and\s+)?says?:?\s*\(S\d+(?:,S\d+)*\)[^<]*<d>.*?</d>",
-                     ", and stays silent. ", prompt, flags=_re.S | _re.I)
-    # 2) 残余的说话人 + <d> 块（没有 says 连接词的情况）
-    prompt = _re.sub(r"\(S\d+(?:,S\d+)*\)[^<]*<d>.*?</d>", "", prompt, flags=_re.S)
-    # 3) 收尾动作里可能还留着"说完闭上嘴"，保留即可（正向描述）
-    prompt = _re.sub(r"\s{2,}", " ", prompt).strip()
-
-    # 4) 口型事实必须先写进画面描述，否则会拼到声音字段那一行（踩过）
-    if "lips stay closed" not in prompt.lower():
-        prompt = prompt.rstrip() + " Lips stay closed and still, jaw tight, breath audible through the nose."
-
-    # 5) 补齐官方三段式：空字段 = 模型自行脑补
-    low = prompt.lower()
-    if "overall_soundscape" not in low:
-        if "integrated_multimodal_description" not in low:
-            prompt = "integrated_multimodal_description: " + prompt
-        prompt += ("\noverall_soundscape: Continuous ambient sound of the setting, "
-                   "mixed with the physical sounds of the visible action; the only sound "
-                   "sources are the environment and what is visibly happening.")
-    if "non_diegetic_music" not in low:
-        prompt += "\nnon_diegetic_music: N/A"
-    return prompt
-
-
-def build_workflow(args, prompt: str) -> dict:
-    dialogue = args.mode == "dialogue" or (args.mode == "auto" and args.audio)
-    data = {
-        "prompt": "",
-        "backend": "h3",
-        "width": args.width,
-        "height": args.height,
-        "frames": args.frames,
-        "fps": args.fps,
-        "steps": args.steps,
-        "turbo": args.turbo,
-        "prompt_opt": False,
-        "segments": 1,
-        "interp": False,
-    }
-    # 参考图两模式都要：这是跨段角色一致性的唯一硬约束
-    if args.images:
-        data["ref_images"] = args.images.replace(";", "\n")
-    if dialogue:
-        if not args.audio or not os.path.isfile(args.audio):
-            raise SystemExit("台词模式需要 --audio 指向念稿 wav（先跑 dub-track.py）")
-        data["ref_audio"] = os.path.abspath(args.audio)
-    else:
-        prompt = strip_dialogue_for_ambience(prompt)
-    return {
-        "name": f"run-flowedge-{int(time.time())}",
-        "nodes": [
-            {"id": "s", "type": "start", "data": {"prompt": prompt}},
-            {"id": "v", "type": "text2video", "data": data},
-            {"id": "e", "type": "end", "data": {}},
-        ],
-        "edges": [{"id": "e1", "source": "s", "target": "v"},
-                  {"id": "e2", "source": "v", "target": "e"}],
-    }
+def artifacts_of(run: dict) -> list:
+    """从节点终态里挑出产物路径（image/video/audio 键）。"""
+    out = []
+    for node in run.get("node_states") or []:
+        output = node.get("output")
+        if not isinstance(output, dict):
+            continue
+        for key in ("image", "video", "audio", "path", "report"):
+            v = output.get(key)
+            if isinstance(v, str) and v:
+                out.append({"node": node.get("id"), "type": node.get("type"), "key": key, "path": v})
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, str) and item:
+                        out.append({"node": node.get("id"), "type": node.get("type"), "key": key, "path": item})
+    return out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="驱动 FlowEdge 出片（台词/氛围）")
-    ap.add_argument("--mode", choices=["dialogue", "ambience", "auto"], default="auto")
-    ap.add_argument("--prompt")
-    ap.add_argument("--prompt-file")
-    ap.add_argument("--audio", help="念稿 wav（台词模式必填）")
-    ap.add_argument("--images", help="参考图路径，分号分隔（≤9）")
-    ap.add_argument("--width", type=int, default=608)
-    ap.add_argument("--height", type=int, default=352)
-    ap.add_argument("--frames", type=int, default=107, help="必须落在 17k+5；107≈4.46s / 124≈5.17s")
-    ap.add_argument("--fps", type=int, default=24)
-    ap.add_argument("--steps", type=int, default=12)
-    ap.add_argument("--report-dir", default="",
-                    help="可选：把 report.json 写到该目录。由本脚本内部写盘——"
-                         "中文路径经 cmd.exe 传参会乱码，不能靠 shell 再转一手")
-    ap.add_argument("--turbo", action="store_true", default=True)
+    ap = argparse.ArgumentParser(description="FlowEdge 出片 CLI")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("pipelines", help="列出本机能出的片子与字段")
+
+    p = sub.add_parser("produce", help="出片")
+    p.add_argument("--pipeline", required=True, help="流水线 id（先跑 pipelines）")
+    p.add_argument("--params", help="JSON 字段，如 '{\"prompt\":\"...\"}'")
+    p.add_argument("--params-file", help="从文件读字段（中文参数走文件更稳）")
+    p.add_argument("--invoked-by", default="manual", choices=["manual", "workbuddy", "dsh", "mcp"])
+    p.add_argument("--wait", action="store_true", help="等到跑完再返回")
+    p.add_argument("--timeout", type=int, default=3600, help="--wait 的最长等待秒数")
+
+    s = sub.add_parser("status", help="查一次出片")
+    s.add_argument("run_id", type=int)
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=int, default=3600)
+
+    r = sub.add_parser("runs", help="最近运行")
+    r.add_argument("--limit", type=int, default=20)
+    r.add_argument("--status", choices=["running", "success", "failed", "cancelled"])
+
+    a = sub.add_parser("artifacts", help="产物清单")
+    a.add_argument("--kind", choices=["image", "video", "audio"])
+
     args = ap.parse_args()
-
-    prompt = args.prompt or ""
-    if args.prompt_file:
-        with open(args.prompt_file, encoding="utf-8") as f:
-            prompt = f.read()
-    if not prompt.strip():
-        print(json.dumps({"ok": False, "error": "缺少 --prompt 或 --prompt-file"}, ensure_ascii=False))
-        return 2
-    if (args.frames - 5) % 17 != 0:
-        print(json.dumps({"ok": False, "error": f"frames={args.frames} 不在 17k+5 网格上"}, ensure_ascii=False))
-        return 2
-
-    err = ensure_h3(need_audio=bool(args.audio))
-    if err:
-        print(json.dumps({"ok": False, "error": err}, ensure_ascii=False))
-        return 2
-
-    try:
-        wf = build_workflow(args, prompt)
-    except SystemExit as e:
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
-        return 2
-
-    mode = "dialogue" if ("ref_audio" in wf["nodes"][1]["data"]) else "ambience"
-
-    try:
-        created = api("/api/workflows", method="POST", body=wf)
-        wid = created.get("id")
-        run = api(f"/api/workflows/{wid}/run", method="POST", body={}, timeout=60)
-        rid = run.get("run_id")
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": f"提交失败：{e}"}, ensure_ascii=False))
-        return 2
-
-    # 轮询：H3 冷启 + 12 步 turbo，107 帧约 2~4 分钟
-    deadline = time.time() + 1800
-    status = "running"
-    detail = None
-    while time.time() < deadline:
-        time.sleep(8)
-        try:
-            info = api(f"/api/runs/{rid}")
-        except Exception:
-            continue
-        status = info.get("status") or "running"
-        if status != "running":
-            detail = info
-            break
-
-    if status != "success":
-        msg = ""
-        if detail:
-            msg = str(detail.get("error") or "")[:400]
-        print(json.dumps({"ok": False, "mode": mode, "status": status, "run_id": rid,
-                          "error": msg or "运行未成功"}, ensure_ascii=False))
-        return 2
-
-    # 从节点状态里取产物与自检
-    video, check_ok, seconds = "", None, None
-    for n in (detail or {}).get("node_states") or []:
-        if n.get("id") == "v":
-            out = n.get("output") or {}
-            video = out.get("video") or ""
-            check_ok = out.get("check_ok")
-            seconds = out.get("seconds")
-    if not video or not os.path.isfile(video):
-        print(json.dumps({"ok": False, "mode": mode, "error": "运行成功但没有产物文件",
-                          "video": video}, ensure_ascii=False))
-        return 2
-
-    # 报告在本进程内写盘：避免把中文路径再传回 cmd.exe
-    if seconds is None:
-        seconds = round(args.frames / float(args.fps), 3)
-    report = {"mode": mode, "video": os.path.abspath(video), "seconds": seconds,
-              "check_ok": check_ok, "run_id": rid, "frames": args.frames,
-              "steps": args.steps}
-    if args.report_dir:
-        try:
-            os.makedirs(args.report_dir, exist_ok=True)
-            with open(os.path.join(args.report_dir, "report.json"), "w", encoding="utf-8") as f:
-                json.dump(report, f, ensure_ascii=False, indent=2)
-            report["report"] = os.path.join(os.path.abspath(args.report_dir), "report.json")
-        except Exception as e:  # 报告写失败不影响成片，但要说出来
-            report["report_error"] = str(e)
-
-    print(json.dumps({"ok": True, "mode": mode, "video": os.path.abspath(video),
-                      "seconds": seconds, "check_ok": check_ok, "run_id": rid,
-                      "report": report.get("report", "")}, ensure_ascii=False))
-    return 0
+    return {
+        "pipelines": cmd_pipelines,
+        "produce": cmd_produce,
+        "status": cmd_status,
+        "runs": cmd_runs,
+        "artifacts": cmd_artifacts,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":

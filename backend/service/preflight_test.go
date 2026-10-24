@@ -1,8 +1,6 @@
-package service
+﻿package service
 
 import (
-	"os"
-	"strings"
 	"testing"
 
 	"flowedge/backend/model"
@@ -87,24 +85,5 @@ func TestPreflightDeps_VideoBackendSwitchesDependency(t *testing.T) {
 	got = PreflightDeps(wan, caps, &Supervisor{specs: map[string]*DepSpec{}})
 	if len(got) != 1 || got[0].Dep != "comfyui" {
 		t.Fatalf("wan 后端应要求 comfyui，got %+v", got)
-	}
-}
-
-// preflight.go 里不许按节点类型分支。
-// 只要还有人写 `switch n.Type { case "asr": ... }`，新加的模态就必然漏预检——
-// 而漏预检的症状是"跑进去才报连接错误"，用户看到的是"工作流失败"，代价最高的一类故障。
-//
-// 判定用**结构**而不是字面量：depFix 里的 "asr"/"tts" 是依赖名（引擎托管的服务），
-// 不是节点类型，两者恰好同名，靠字符串匹配会误伤。
-func TestPreflightHasNoTypeSwitches(t *testing.T) {
-	raw, err := os.ReadFile("preflight.go")
-	if err != nil {
-		t.Fatalf("读 preflight.go 失败：%v", err)
-	}
-	src := string(raw)
-	for _, bad := range []string{"switch n.Type", "switch node.Type", "n.Type ==", "node.Type =="} {
-		if strings.Contains(src, bad) {
-			t.Errorf("preflight.go 出现按节点类型分支（%q）：依赖必须由契约的 Requires 声明", bad)
-		}
 	}
 }

@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"context"
@@ -463,41 +463,3 @@ func dedupStrings(in []string) []string {
 	sort.Strings(out)
 	return out
 }
-
-// initQualityLoopContract 把质量循环登记进模块目录（任务书/前端据此展示）。
-func initQualityLoopContract() {
-	Modules["quality_loop"] = ModuleContract{
-		Type:  "quality_loop",
-		Title: "质量循环",
-		Role:  RoleGate,
-		Inputs: []Port{
-			{Name: "seed", Kind: PortText, Required: false, Desc: "可选：喂给内层工作流的文本（留空用参数 input）"},
-		},
-		Outputs: []Port{
-			{Name: "artifact", Kind: PortAny, Required: true, Desc: "择优后的产物（video/image/audio 按类型暴露）"},
-			{Name: "report", Kind: PortJSON, Required: true, Desc: "逐轮得分/检查项/应用过的补丁"},
-		},
-		KeyParams: []KeyParam{
-			{Key: "workflow_id", Label: "循环的生成工作流", Help: "被反复重跑的那条工作流的 id"},
-			{Key: "max_rounds", Label: "最多轮次", Help: "硬上限，默认 3；修不动就停并交出最好的一轮"},
-			{Key: "target_score", Label: "目标分", Help: "0-100，按 fail 级检查项的通过率算；100 = 全绿"},
-			{Key: "repair", Label: "修复策略", Options: []string{"auto", "resample", "off"},
-				Help: "auto=数值项按修复建议改参数；resample=只重采样；off=只跑不修"},
-			{Key: "target_node", Label: "被修补的节点", Help: "留空自动挑生成节点（shotlist/text2video/text2image…）"},
-			{Key: "min_frames", Label: "最少帧数", Unit: "帧"},
-			{Key: "min_width", Label: "最小宽度", Unit: "px"},
-			{Key: "min_height", Label: "最小高度", Unit: "px"},
-			{Key: "duration_min", Label: "最短时长", Unit: "秒"},
-			{Key: "require_audio", Label: "必须有音轨"},
-			{Key: "forbid_speech", Label: "禁止人声"},
-			{Key: "loudness_min_db", Label: "响度下限", Unit: "dB"},
-			{Key: "max_silence_gap", Label: "最大静音缺口", Unit: "秒"},
-		},
-		Requires:         []Requirement{{Dep: "comfyui", Label: "文生图/视频"}},
-		GateLayers:       []string{"technical", "audio"},
-		Agent:            "生成→验收→修复→重跑→择优。要「出片并保证达标」时用它；只跑一次不验收用 workflow 运行即可。",
-		Nondeterministic: true,
-	}
-}
-
-func init() { initQualityLoopContract() }

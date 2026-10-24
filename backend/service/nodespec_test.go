@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"testing"
@@ -27,16 +27,6 @@ func TestNodeSpecsCoverRegisteredTypes(t *testing.T) {
 	}
 }
 
-// comfy_workflow 内部会 enterSide(sideDiffusion)（comfy_workflow_node.go），
-// 旧映射表漏了它，侧别感知调度会把它和语言节点排在一起，多付一次冷加载。
-func TestComfyWorkflowDeclaresDiffusionSide(t *testing.T) {
-	if got := nodeSide("comfy_workflow"); got != sideDiffusion {
-		t.Fatalf("comfy_workflow 应在扩散侧，实际 %q", got)
-	}
-	if !isHeavyNode("comfy_workflow") {
-		t.Fatal("comfy_workflow 会加载扩散权重，必须算重节点（否则不采显存峰值、不写档案）")
-	}
-}
 
 // 超时算法从 switch 搬进 NodeSpecs 后，逐类核对一次，防止搬运时改错系数。
 func TestNodeTimeoutBudgetPerType(t *testing.T) {
@@ -84,14 +74,15 @@ func TestNodeTimeoutBudgetPerType(t *testing.T) {
 
 // 血缘白名单现在由 NodeSpecs.Media 派生，这条锁住派生结果没漏掉视频管线主产物。
 func TestMediaProducerDerivedFromSpecs(t *testing.T) {
-	for _, typ := range []string{"text2image", "tts", "video_compose", "shotlist", "text2video", "upscale", "inpaint", "image2image", "comfy_workflow"} {
+	for _, typ := range []string{"text2image", "tts", "shotlist", "text2video", "upscale", "inpaint", "image2image"} {
 		if !mediaProducerTypes[typ] {
 			t.Errorf("%s 应标记 Media=true（否则产物没有血缘）", typ)
 		}
 	}
-	for _, typ := range []string{"select", "end", "start", "aggregate", "sub_workflow", "llm"} {
+	for _, typ := range []string{"end", "start", "llm", "prompt_opt", "storyboard", "quality_loop"} {
 		if mediaProducerTypes[typ] {
 			t.Errorf("%s 不产出媒体文件，不该进血缘白名单", typ)
 		}
 	}
 }
+

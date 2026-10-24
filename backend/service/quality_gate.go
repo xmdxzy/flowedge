@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"context"
@@ -42,66 +42,6 @@ type gateCheck struct {
 	Fix    string `json:"fix"`
 }
 
-// execQualityGateNode 质检门执行器
-func (e *EngineV2) execQualityGateNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	// 1. 取产物：上游任意节点输出里的 image/audio/video 路径（多个取第一个）
-	path := pickArtifactPath(upstream)
-	if path == "" {
-		return nil, fmt.Errorf("质检门缺少输入产物：连一条来自上游的图片/音频/视频线")
-	}
-
-	info, err := probeGateMedia(path)
-	if err != nil {
-		// 不可达 ≠ 空结果：探测失败必须显式报，不能放行
-		return nil, fmt.Errorf("质检探测失败（%s）：%w", path, err)
-	}
-
-	rules := parseGateRules(node)
-	checks := runGateChecks(ctx, path, info, rules)
-	annotateFixes(checks, info, rules)
-
-	fails := make([]string, 0, len(checks))
-	fixes := make([]string, 0, len(checks))
-	for _, c := range checks {
-		if !c.OK && c.Level == "fail" {
-			detail := fmt.Sprintf("%s：%s", c.Name, c.Detail)
-			if c.Fix != "" {
-				detail += " → 修复：" + c.Fix
-				fixes = append(fixes, fmt.Sprintf("%s → %s", c.Name, c.Fix))
-			}
-			fails = append(fails, detail)
-		}
-	}
-
-	// 产物先建好，判不过也原样带出去。
-	//
-	// 这不是「失败也返回成功」：error 仍然返回，run 仍然 failed、下游仍然 skipped。
-	// 带 checks 出去的**唯一**目的，是让证据层能区分「测了不合格」与「没测到」——
-	// 判据就是有没有 checks（evidence.go gateFacts）。返回 nil 会让一次真正的
-	// 质量不合格被记成 unscored，自进化看到的就不是「质量在漏」而是「门在崩」。
-	out := map[string]interface{}{
-		"gate":    map[bool]string{true: "pass", false: "fail"}[len(fails) == 0],
-		"checks":  checks,
-		"fixes":   fixes,
-		"path":    path,
-		"kind":    info.kind,
-		"width":   info.width,
-		"height":  info.height,
-		"frames":  info.frames,
-		"seconds": info.seconds,
-		"text":    gateSummary(checks),
-	}
-	if len(fails) > 0 {
-		out["failures"] = fails
-		// 阻断：run 记 failed，下游级联 skipped
-		return out, fmt.Errorf("质检未通过（%s）：%s", path, strings.Join(fails, "；"))
-	}
-
-	return out, nil
-}
-
-// annotateFixes 给每一项「未通过」填可执行修复建议（通过的项不填，避免噪音）。
-//
 // 建议必须落到具体动作：改哪个字段、改成多少、或给一条能复制的命令。
 // 「请检查参数」这类正确但无用的话一律不写——那只是把排查成本原样退回去。
 func annotateFixes(checks []gateCheck, info *gateMediaInfo, r gateRules) {

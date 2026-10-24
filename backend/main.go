@@ -1,14 +1,14 @@
-// FlowEdge Lite —— 本地多模态生成引擎
+﻿// FlowEdge Lite —— 本地多模态生成引擎
 //
 // 只做两件事：
 //  1. 本地多模态（图片 / 视频 / 音频）的高质量生成工作流；
 //  2. 质量建议门控 + 循环提升：不过门就诊断、修复、重跑，直到达标或到轮次上限。
 //
-// 对外接口只有三个面：画布 UI（编辑/观察）、/api（运行与产物）、MCP（给 DSH 调用）。
+// 对外接口只有三个面：出片台 UI（选流水线/填字段/看进度）、/api（出片与产物）、MCP（给 DSH 调用）。
+// 图由服务端按 data/pipelines.json 组装，用户不画图。
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
@@ -103,7 +103,6 @@ func main() {
 	}
 
 	llmService := service.NewLLMService(cfg.OllamaBaseURL, llmModel)
-	llmStreamService := service.NewLLMStreamService(cfg.OllamaBaseURL, llmModel)
 
 	comfyURL := getEnv("COMFYUI_BASE_URL", "http://localhost:8188")
 	h3URL := getEnv("H3_BASE_URL", "http://127.0.0.1:8189")
@@ -185,9 +184,6 @@ func main() {
 		return []byte(wf.Nodes), []byte(wf.Edges), nil
 	})
 
-	// 流式 LLM（token 经 WS 推送前端打字机效果）
-	engine.SetLLMStream(llmStreamService)
-
 	// 事件日志：广播与落库并行
 	if eventLogger != nil {
 		engine.SetEventLog(eventLogger)
@@ -262,193 +258,47 @@ func main() {
 		log.Printf("上次异常退出的运行任务 %d 个，已标记为 interrupted", n)
 	}
 
-	wfHandler := handler.NewWorkflowHandler(db, engine, jobQueue)
-	// 运行前依赖预检：Ollama/ASR/TTS/视觉模型没就绪时在入口显式失败
-	wfHandler.SetPreflight(depSupervisor, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
-	// 资源准入闸：执行前问一句序策治理器「现在能不能跑」（fail-open）
-	govGate := service.NewGovernorGate()
-	wfHandler.SetGovernor(govGate)
+	pipesPath := filepath.Join(baseDir, "data", "pipelines.json")
+	pipes, perr := service.LoadPipelines(pipesPath)
+	if perr != nil {
+		log.Fatalf("流水线定义加载失败：%v\n"+
+			"  它现在是产品本身（7 条固定出片流水线），没有它引擎不启动。\n"+
+			"  修法：把仓库 data/pipelines.json 复制到 %s（dist/data/ 里构建时已带一份）", perr, pipesPath)
+	}
 
-	debugHandler := handler.NewDebugHandler(db, engine)
+	producer := handler.NewProducer(db, engine, jobQueue, pipes)
+	// 运行前依赖预检：Ollama/ASR/TTS/ComfyUI 没就绪时在入口显式失败并给修复动作
+	producer.SetPreflight(depSupervisor, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
+	if n := producer.SweepTransient(); n > 0 {
+		log.Printf("清理上次残留的质量循环临时图 %d 条", n)
+	}
 
 	api := r.Group("/api")
 	{
 		wsHandler := handler.NewWSHandler(wsHub)
 
-		api.POST("/preflight", wfHandler.PreflightCheck)
-		api.GET("/workflows", wfHandler.List)
-		api.GET("/workflows/:id", wfHandler.Get)
-		api.POST("/workflows", wfHandler.Create)
-		api.PUT("/workflows/:id", wfHandler.Update)
-		api.DELETE("/workflows/:id", wfHandler.Delete)
+		// 流水线目录：产品形态本身（界面按它渲染向导，字段与默认值都在 JSON 里）
+		api.GET("/pipelines", producer.ListPipelines)
+		api.POST("/pipelines/reload", producer.ReloadPipelines)
+		// 出片前体检（只探依赖、不跑）
+		api.POST("/preflight", producer.PreflightPipelines)
+		// 出片：唯一运行入口
+		api.POST("/produce", producer.Produce)
 
-		// 任务书：把画布编译成可执行规格（md 给人/智能体读，json 给程序读）
-		api.GET("/workflows/:id/spec", wfHandler.Spec)
-		api.POST("/workflows/:id/spec/apply", wfHandler.SpecApply)
-
-		// 模块目录：节点积木清单（端口 + 参数标签 + 门层 + 执行元数据）
-		moduleHandler := handler.NewModuleHandler()
-		api.GET("/modules", moduleHandler.List)
-
-		lpHandler := handler.NewLLMProfileHandler(llmProfileStore)
-		api.GET("/llm/profiles", lpHandler.List)
-		api.PUT("/llm/profiles", lpHandler.Replace)
-
-		api.POST("/workflows/:id/run", wfHandler.Run)
-		api.GET("/workflows/:id/runs", wfHandler.ListRuns)
-		api.GET("/runs/:runId", wfHandler.GetRun)
-		api.POST("/runs/:runId/resume", wfHandler.ResumeRun)
-		api.POST("/runs/:runId/rerun-from", wfHandler.ResumeFromRun)
-		api.POST("/runs/:runId/cancel", wfHandler.CancelRun)
-
-		// 单步调试与断点：step 执行一个节点后暂停，continue 跑到下一个断点/结束
-		api.POST("/runs/:runId/step", debugHandler.Step)
-		api.POST("/runs/:runId/continue", debugHandler.Continue)
-
+		// 运行看板
 		runHandler := handler.NewRunHandler(db, eventLogger)
 		api.GET("/runs", runHandler.ListAll)
+		api.GET("/runs/:runId", producer.GetRun)
+		api.POST("/runs/:runId/cancel", producer.CancelRun)
+		api.POST("/runs/:runId/rerun", producer.Rerun)
 		api.GET("/runs/:runId/events", runHandler.Events)
 		api.GET("/runs/:runId/trace", runHandler.Trace)
-
-		api.GET("/gpu/status", func(c *gin.Context) {
-			c.JSON(200, gpuSched.GetSchedulerStatus())
-		})
-		api.GET("/gpu/timeline", func(c *gin.Context) {
-			c.JSON(200, gin.H{
-				"events": gpuSched.Timeline(parseLimit(c.Query("limit"), 60)),
-				"status": gpuSched.GetSchedulerStatus(),
-			})
-		})
 
 		// 产物管理（生成的图片 / 视频 / 音频）
 		artifactHandler := handler.NewArtifactHandler(getEnv("GENERATED_DIR", "data/generated"))
 		api.GET("/artifacts", artifactHandler.List)
 		api.GET("/artifacts/:name", artifactHandler.Serve)
 		api.DELETE("/artifacts/:name", artifactHandler.Delete)
-
-		// 模型资产清点
-		api.GET("/models", func(c *gin.Context) {
-			inv := service.ScanModels(service.ModelsRoot(baseDir))
-			ollamaModels := []string{}
-			ollamaSizes := map[string]float64{}
-			if body, err := http.Get(cfg.OllamaBaseURL + "/api/tags"); err == nil {
-				var tags struct {
-					Models []struct {
-						Name string `json:"name"`
-						Size int64  `json:"size"`
-					} `json:"models"`
-				}
-				if json.NewDecoder(body.Body).Decode(&tags) == nil {
-					for _, m := range tags.Models {
-						ollamaModels = append(ollamaModels, m.Name)
-						if m.Size > 0 {
-							ollamaSizes[m.Name] = float64(m.Size) / (1 << 30)
-						}
-					}
-				}
-				body.Body.Close()
-			}
-			c.JSON(http.StatusOK, gin.H{
-				"inventory":       inv,
-				"ollama_models":   ollamaModels,
-				"vision_model":    service.PickVisionModel(cfg.OllamaBaseURL),
-				"models_dir":      service.ModelsRoot(baseDir),
-				"resident_side":   engine.ResidentSide(),
-				"llm_backend":     llmService.BackendLabel(),
-				"default_llm":     llmService.Model,
-				"ollama_sizes_gb": ollamaSizes,
-				"t2i_checkpoint":  t2iService.Checkpoint,
-				"t2i_backends":    service.T2IBackends,
-				"checkpoints":     checkpointsFromBundles(bundleStore),
-				"bundles_path":    bundleStore.Path(),
-			})
-		})
-
-		// 模型 bundle：逻辑角色 → 权重文件 + 参数
-		api.GET("/models/bundles", func(c *gin.Context) {
-			roles := bundleStore.Roles()
-			out := make(map[string]interface{}, len(roles))
-			for _, role := range roles {
-				out[role] = bundleStore.Resolve(role)
-			}
-			resp := gin.H{"path": bundleStore.Path(), "roles": out}
-			if err := bundleStore.LoadErr(); err != nil {
-				resp["load_error"] = err.Error()
-			}
-			c.JSON(http.StatusOK, resp)
-		})
-		api.PUT("/models/bundles", func(c *gin.Context) {
-			var req struct {
-				Role   string             `json:"role"`
-				Files  map[string]string  `json:"files"`
-				Params map[string]float64 `json:"params"`
-			}
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "请求体不是合法 JSON：" + err.Error()})
-				return
-			}
-			if strings.TrimSpace(req.Role) == "" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 role（如 video.h3.fl2va）"})
-				return
-			}
-			if len(req.Files) == 0 && len(req.Params) == 0 {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "files 与 params 至少给一个"})
-				return
-			}
-			bundleStore.Merge(req.Role, req.Files, req.Params)
-			if err := bundleStore.Save(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "保存模型配置失败：" + err.Error()})
-				return
-			}
-			service.InvalidateObjectInfoCache()
-			c.JSON(http.StatusOK, gin.H{"ok": true, "role": req.Role, "resolved": bundleStore.Resolve(req.Role)})
-		})
-		api.POST("/models/bundles/reload", func(c *gin.Context) {
-			err := bundleStore.Reload()
-			service.InvalidateObjectInfoCache()
-			resp := gin.H{"ok": err == nil, "path": bundleStore.Path()}
-			if err != nil {
-				resp["error"] = err.Error()
-			}
-			c.JSON(http.StatusOK, resp)
-		})
-
-		// 多实例：模型 → ComfyUI 实例路由（data/instances.json）
-		api.GET("/instances", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{
-				"path":      instRegistry.Path(),
-				"default":   instRegistry.DefaultInstance().Name,
-				"instances": instRegistry.All(),
-				"note":      instRegistry.LoadNote(),
-			})
-		})
-		api.PUT("/instances", func(c *gin.Context) {
-			var req struct {
-				Default   string             `json:"default"`
-				Instances []service.Instance `json:"instances"`
-			}
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "请求体不是合法 JSON：" + err.Error()})
-				return
-			}
-			if len(req.Instances) == 0 {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "instances 不能为空"})
-				return
-			}
-			if err := instRegistry.Replace(req.Instances); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-			if strings.TrimSpace(req.Default) != "" {
-				instRegistry.SetDefault(req.Default)
-			}
-			if err := instRegistry.Save(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "保存实例配置失败：" + err.Error()})
-				return
-			}
-			service.InvalidateObjectInfoCache()
-			c.JSON(http.StatusOK, gin.H{"ok": true, "instances": instRegistry.All()})
-		})
 
 		// 依赖进程托管（ComfyUI / ASR / TTS 一键启停）
 		depHandler := handler.NewDepHandler(depSupervisor)
@@ -458,21 +308,14 @@ func main() {
 		api.POST("/deps/:name/stop", depHandler.Stop)
 		api.GET("/deps/:name/wait", depHandler.Wait)
 
-		// 提交前估算：按实测档案预测峰值显存与墙钟（区间 + confidence，不是承诺）
-		estHandler := handler.NewEstimateHandler(db, profileStore, 24576)
-		api.POST("/estimate", estHandler.Estimate)
-		api.GET("/vram/profiles", estHandler.ListProfiles)
-
 		// 对外接入配置生成（MCP 客户端配置）：exe 绝对路径与端口只有引擎自己知道
 		integHandler := handler.NewIntegrationHandler(baseDir, cfg.Port)
 		api.GET("/mcp/config", integHandler.MCPConfig)
 
 		api.GET("/ws", wsHandler.HandleWS)
 
-		healthHandler := handler.NewHealthHandler(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL, version)
-		healthHandler.SetNodeTypeLister(engine)
+		healthHandler := handler.NewHealthHandler(version)
 		api.GET("/health", healthHandler.Health)
-		api.GET("/capabilities", healthHandler.Capabilities)
 	}
 
 	mountStatic(r)

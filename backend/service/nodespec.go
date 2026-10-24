@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"strings"
@@ -38,18 +38,11 @@ type NodeSpec struct {
 }
 
 var NodeSpecs = map[string]NodeSpec{
-	// ---- 控制流：不占显存，不产媒体 ----
+	// ---- 控制流 ----
 	"start": {Type: "start"},
-	// 文件源：只引用已有文件，不吃显存、不产新媒体（Media=false，不进血缘白名单）
-	"input_source": {Type: "input_source"},
-	// 文本拆分：纯字符串处理，不吃显存、不产媒体
-	"text_split": {Type: "text_split"},
-	"end":        {Type: "end"},
-	"if_else":    {Type: "if_else"},
-	// 质量循环：门控不通过时按修复建议重跑到达标（最长 8 小时，
-	// 默认 3 分钟会把合法的多轮生成循环误杀）
-	"loop": {Type: "loop", MaxTimeout: 8 * time.Hour},
+	"end":   {Type: "end"},
 	// 质量循环：每一轮都是完整生成，天然比单次生成贵 max_rounds 倍。
+	// 上限 12 小时：默认 30 分钟会把合法的多轮生成循环误杀。
 	"quality_loop": {Type: "quality_loop", Timeout: func(n *model.NodeInstance) time.Duration {
 		rounds := 3
 		if v, ok := n.Data["max_rounds"].(float64); ok && v > 0 {
@@ -58,12 +51,8 @@ var NodeSpecs = map[string]NodeSpec{
 		return time.Duration(rounds) * 2 * time.Hour
 	}, MaxTimeout: 12 * time.Hour},
 
-	// ---- 语言侧：Ollama ----
-	"llm":        {Type: "llm", Side: sideLanguage, Timeout: nil},
-	"vision":     {Type: "vision", Side: sideLanguage},
-	"prompt_opt": {Type: "prompt_opt", Side: sideLanguage},
-	"scene_grid": {Type: "scene_grid", Side: sideLanguage},
-	"select":     {Type: "select", Side: sideLanguage},
+	// ---- 语言侧：Ollama（规划与提示词优化，不产媒体）----
+	"llm":        {Type: "llm", Side: sideLanguage},
 	"storyboard": {Type: "storyboard", Side: sideLanguage, Timeout: func(*model.NodeInstance) time.Duration {
 		return 5 * time.Minute // LLM 规划 + JSON 校验
 	}},
@@ -83,34 +72,9 @@ var NodeSpecs = map[string]NodeSpec{
 	}},
 	"shotlist": {Type: "shotlist", Side: sideDiffusion, Heavy: true, Media: true,
 		Timeout: shotListTimeout, MaxTimeout: maxShotlistTimeout},
-	// comfy_workflow 内部会 enterSide(sideDiffusion)，过去漏在映射表外，
-	// 导致侧别感知调度把它和语言节点排在一起（真机表现为多一次 180s 冷加载）。
-	"comfy_workflow": {Type: "comfy_workflow", Side: sideDiffusion, Heavy: true, Media: true},
 
 	// ---- 语音侧：CPU，但与扩散权重抢内存带宽 ----
-	"asr": {Type: "asr", Side: sideAudio, Timeout: func(*model.NodeInstance) time.Duration {
-		return 15 * time.Minute // 长音频分段转写
-	}},
 	"tts": {Type: "tts", Side: sideAudio, Media: true},
-
-	// ---- 后期 ----
-	"video_compose": {Type: "video_compose", Media: true},
-	// 字幕烧录吃 CPU（ffmpeg + libass），不占显存，产物是新的 mp4
-	"subtitles": {Type: "subtitles", Media: true},
-	// 后期包装同样吃 CPU；竖屏(模糊垫底)+BGM+字幕一次重编码，可能跑几十秒
-	"post_production": {Type: "post_production", Media: true},
-	"quality_gate":    {Type: "quality_gate"},
-	// 一致性门：ffmpeg 抽帧 + CPU 算签名，不吃显存、不产媒体（它是门不是变换）。
-	// 超时按段数累计：每段三次抽帧（首/中/末），实测每段 ~3-8s。
-	"consistency_gate": {Type: "consistency_gate", Timeout: func(n *model.NodeInstance) time.Duration {
-		segs := 2
-		if n != nil {
-			if v, ok := n.Data["expected_segments"].(float64); ok && v > 1 {
-				segs = int(v)
-			}
-		}
-		return time.Duration(60+segs*20) * time.Second
-	}},
 }
 
 // NodeSpecOf 查节点元数据。未登记的类型返回零值 + false，

@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 // 本文件只放「节点执行体」：每个节点的业务逻辑。
 // 引擎内核（DAG 调度 / 超时 / 事件 / 取消 / 注册表）留在 engine_v2.go。
@@ -42,7 +42,6 @@ func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, up
 	defer release()
 
 	// 节点级提示词 = 指令前缀；上游文本 = 输入主体。两者拼接，缺一不可丢
-	runID := runIDFrom(ctx)
 	instruction := ""
 	if p, ok := node.Data["prompt"].(string); ok {
 		instruction = p
@@ -113,30 +112,8 @@ func (e *EngineV2) execLLMNode(ctx context.Context, node *model.NodeInstance, up
 		return out, nil
 	}
 
-	// 流式优先：token 经 WS 实时推送前端（打字机效果）
-	if e.llmStream != nil {
-		ch, err := e.llmStream.ChatStreamWithModel(prompt, reqModel)
-		if err != nil {
-			return nil, err
-		}
-		var sb strings.Builder
-		usage := LLMUsage{}
-		for chunk := range ch {
-			if chunk.Done {
-				// Done 块携带本次请求的完整 token 用量
-				usage = chunk.Usage
-				break
-			}
-			sb.WriteString(chunk.Content)
-			e.emit(runID, Event{Type: "node_token", NodeID: node.ID, Data: map[string]interface{}{"delta": chunk.Content}})
-		}
-		out := map[string]interface{}{"text": sb.String()}
-		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
-			out["_usage"] = usage // 供事件日志汇总 token 消耗
-		}
-		return out, nil
-	}
-
+	// 流式（llm_stream）已随画布删除：出片台不显示 token 打字机效果，
+	// 保留一条非流式调用即可，少一条协议分支。
 	result, u, err := e.llm.ChatWithModelUsage(prompt, reqModel)
 	if err != nil {
 		return nil, err

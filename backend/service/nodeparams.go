@@ -90,6 +90,18 @@ func ValidateNodeParams(nodes []model.NodeInstance, hasInbound map[string]bool) 
 	return issues
 }
 
+// ParseEdges 解析 edges JSON（组装流水线后校验用）。
+func ParseEdges(edgesJSON []byte) ([]model.EdgeInstance, error) {
+	var edges []model.EdgeInstance
+	if len(edgesJSON) == 0 {
+		return nil, nil
+	}
+	if err := json.Unmarshal(edgesJSON, &edges); err != nil {
+		return nil, fmt.Errorf("parse edges failed: %w", err)
+	}
+	return edges, nil
+}
+
 // InboundSet 从边列表推导「哪些节点有入边」
 func InboundSet(edges []model.EdgeInstance) map[string]bool {
 	m := make(map[string]bool, len(edges))

@@ -2,9 +2,8 @@ import { useEffect, useState } from 'react'
 
 // 全局轻提示 + 确认框（替代 alert / confirm）
 //
-// 背景（2026-10-19 审计）：6 处 alert()/confirm() 在深色界面里弹原生白框，
-// 长错误无法复制、阻塞主线程；而 index.css 里早有 .fe-toast 样式却零调用（死代码）。
-// 这里用模块级订阅实现，不引入 context，任何文件 `import { toast, confirmDialog }` 即可。
+// 模块级订阅，不引入 context：任何文件 `import { toast, confirmDialog }` 即可。
+// 样式走 index.css 的 .toast / .confirm（不再依赖工具类，主题切换自动跟随）。
 
 export type ToastKind = 'info' | 'success' | 'error'
 
@@ -108,66 +107,34 @@ export default function ToastHost() {
   return (
     <>
       {items.length > 0 && (
-        <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 pointer-events-none">
+        <div className="toast-host" aria-live="polite">
           {items.map((it) => (
-            <div
-              key={it.id}
-              className={`fe-toast pointer-events-auto max-w-[420px] px-3.5 py-2.5 rounded-lg border text-[12px] leading-relaxed shadow-lg ${
-                it.kind === 'error'
-                  ? 'border-error/50 bg-error/15 text-error'
-                  : it.kind === 'success'
-                    ? 'border-success/50 bg-success/15 text-success'
-                    : 'border-border bg-surface text-gray-200'
-              }`}
-              role="status"
-              aria-live="polite"
-            >
-              <div className="flex items-start gap-2">
-                <span className="flex-1 whitespace-pre-wrap break-words">{it.message}</span>
-                <button
-                  onClick={() => setItems((prev) => prev.filter((i) => i.id !== it.id))}
-                  className="text-[11px] opacity-60 hover:opacity-100 px-1"
-                  aria-label="关闭提示"
-                >
-                  ×
-                </button>
-              </div>
+            <div key={it.id} className={`toast toast--${it.kind}`} role="status">
+              <span className="toast__text">{it.message}</span>
+              <button
+                onClick={() => setItems((prev) => prev.filter((i) => i.id !== it.id))}
+                className="toast__x"
+                aria-label="关闭提示"
+              >
+                ×
+              </button>
             </div>
           ))}
         </div>
       )}
 
       {req && (
-        <div
-          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/60"
-          role="dialog"
-          aria-modal="true"
-          aria-label={req.title}
-          onClick={() => answer(false)}
-        >
-          <div
-            className="w-[380px] max-w-[92vw] rounded-xl border border-border bg-surface p-4 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <p className="text-sm text-white font-medium">{req.title}</p>
-            <p className="text-[12px] text-gray-400 mt-2 leading-relaxed whitespace-pre-wrap break-words">
-              {req.message}
-            </p>
-            <div className="flex justify-end gap-2 mt-4">
-              <button
-                onClick={() => answer(false)}
-                className="text-[12px] px-3 py-1.5 rounded-md border border-border text-gray-300 hover:text-white"
-                autoFocus
-              >
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={req.title} onClick={() => answer(false)}>
+          <div className="confirm" onClick={(e) => e.stopPropagation()}>
+            <p className="confirm__title">{req.title}</p>
+            <p className="confirm__msg">{req.message}</p>
+            <div className="confirm__actions">
+              <button onClick={() => answer(false)} className="btn btn--ghost" autoFocus>
                 取消
               </button>
               <button
                 onClick={() => answer(true)}
-                className={`text-[12px] px-3 py-1.5 rounded-md border ${
-                  req.danger
-                    ? 'border-error/50 bg-error/15 text-error hover:bg-error/25'
-                    : 'border-primary/50 bg-primary/15 text-primary hover:bg-primary/25'
-                }`}
+                className={`btn ${req.danger ? 'btn--danger' : 'btn--primary'}`}
               >
                 {req.okText}
               </button>

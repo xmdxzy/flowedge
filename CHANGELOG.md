@@ -1,3 +1,28 @@
+## [v2026.10.25-v2] 革命性收敛：只剩多模态出片流程（2026-10-25）
+
+**图不再由用户画。** 产品从「通用工作流画布平台」收敛为「选流水线 + 填字段 → 出片 + 质量循环」。
+完整说明见 `docs/多模态出片台-v2.md`。前端版本同步升到 `2.0.0`（破坏性重写：画布删除）。
+
+- **新增固定流水线层**：`data/pipelines.json`（7 条：`image` / `image_batch` / `image_edit` /
+  `video` / `video_from_image` / `film` / `voice`）+ `backend/service/pipeline.go`
+  （字段 `bind` 写节点 data、`when` 选节点、未知字段 400 拒绝、深拷贝模板）。
+- **唯一运行入口 `POST /api/produce`**；新增 `/api/pipelines`、`/api/pipelines/reload`、
+  `POST /api/preflight`（按 pipeline+params 体检）、`/api/runs/:id/rerun`。
+- **质量循环接进每条流水线**：`qc=true` 时把图落成 `qc:` 临时工作流，外层换
+  `start → quality_loop → end`，跑完即删、启动时清扫；预检/校验在包壳前对原图做。
+- 删：画布与节点体系（调色板/检查器/React Flow）、工作流 CRUD、模板库、任务书 spec、
+  模块契约、估算与显存档案接口、模型库、实例管理 UI、LLM profiles 编辑、单步调试/断点、
+  治理闸（`governor_gate`）、流式 LLM、通用控制流节点。
+- 删节点 15 种：`if_else`/`loop`/`comfy_workflow`/`input_source`/`text_split`/`vision`/
+  `select`/`asr`/`video_compose`/`subtitles`/`post_production`/`scene_grid`/`quality_gate`/
+  `consistency_gate`/`prompt_opt`；**节点 27 → 12**，API 44 → 21，MCP 9 工具 → 5。
+  场景锁与提示词优化**作为库保留**（`text2video.data.prompt_opt`、`ref_images`/`ref_audio`）。
+- 规模：backend 23,633 → 17,318 行（-27%），147 → 105 个 Go 文件，测试 9,960 → 5,784 行。
+- 验证：`go build` + `go test ./...` 四包全绿；新增 `pipeline_test.go`（真文件逐条组装）、
+  `produce_test.go`（参数校验/质检包壳/临时图清扫）；`verify-canonical-live.py` 改写为
+  新接口冒烟（含「已删接口必须 404」）。
+- **未验证**：GPU 侧真出片（ComfyUI/H3/TTS）本轮未触发，端到端出片待首跑。
+
 ## 2026-10-24 · 轻装化：FlowEdge Lite v1
 
 **只保留两件核心能力，其余全部删除。**（-34,531 / +368 行，165 个文件）

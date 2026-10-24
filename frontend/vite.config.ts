@@ -9,6 +9,9 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8080',
         changeOrigin: true,
+        // 实时看板走 /api/ws：dev 下不转发 WS 就会一直显示"实时已断开"。
+        // 打包后是同源部署，与这项无关。
+        ws: true,
       },
     },
   },

@@ -1,10 +1,8 @@
-package service
+﻿package service
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
 
@@ -415,96 +413,6 @@ func validateSceneGrid(g SceneGrid) error {
 //
 // 节点只产出锁句，不产出画面。它必须在上游、在提示词优化之前跑完，
 // 否则每段会各自生成一份锁，等于没锁。
-func (e *EngineV2) execSceneGridNode(ctx context.Context, node *model.NodeInstance, upstream map[string]interface{}) (interface{}, error) {
-	rawCells, _ := node.Data["cells"].(string)
-	idea, _ := node.Data["idea"].(string)
-	style, _ := node.Data["style"].(string)
-	light, _ := node.Data["light"].(string)
-	palette, _ := node.Data["palette"].(string)
-	depth, _ := node.Data["depth"].(string)
-
-	// 上游若已经给了九宫格（例如 storyboard 产出），直接用它
-	if strings.TrimSpace(rawCells) == "" {
-		for _, out := range upstream {
-			m, ok := out.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if s, ok := m["cells_text"].(string); ok && strings.TrimSpace(s) != "" {
-				rawCells = s
-				break
-			}
-		}
-	}
-
-	var g SceneGrid
-	source := "manual"
-	if strings.TrimSpace(rawCells) != "" {
-		parsed, err := ParseSceneGrid(rawCells)
-		if err != nil {
-			return nil, err
-		}
-		g = parsed
-	} else {
-		if strings.TrimSpace(idea) == "" {
-			return nil, fmt.Errorf("场景九宫格缺少输入：填 cells（九行）或 idea（一句场景描述）")
-		}
-		if e.llm == nil {
-			return nil, fmt.Errorf("LLM 服务不可用，无法从想法拆九宫格；请直接填 cells")
-		}
-		release := e.enterLanguageSide("")
-		// 确定性调用（temperature=0）：同一句想法每次拆出同一套九宫格，
-		// 否则锁句会漂移，跨镜头一致性就失去基准。
-		out, err := e.deterministicChat(e.llm.Model, fmt.Sprintf("%s\n\n场景：%s", sceneGridInstruction, idea))
-		release()
-		if err != nil {
-			return nil, fmt.Errorf("九宫格拆解失败：%w", err)
-		}
-		parsed, perr := ParseSceneGrid(cleanOptimizedPrompt(out))
-		if perr != nil {
-			// 模型常把位置名写成英文短语或加序号；退回逐行填充再试一次
-			parsed, perr = ParseSceneGrid(strings.ReplaceAll(out, "|", "|"))
-		}
-		if perr != nil {
-			return nil, fmt.Errorf("九宫格拆解结果无法解析：%w", perr)
-		}
-		g = parsed
-		source = "llm"
-	}
-
-	// 节点字段优先于解析结果：用户手填的光位/风格不该被 LLM 版本覆盖
-	if strings.TrimSpace(g.Style) == "" {
-		g.Style = strings.TrimSpace(style)
-	}
-	if strings.TrimSpace(g.Light) == "" {
-		g.Light = strings.TrimSpace(light)
-	}
-	if strings.TrimSpace(g.Palette) == "" {
-		g.Palette = strings.TrimSpace(palette)
-	}
-	if strings.TrimSpace(g.Depth) == "" {
-		g.Depth = strings.TrimSpace(depth)
-	}
-
-	lock, err := CompileSceneLock(g)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[scene-grid] 锁句已生成（来源 %s，%d 字）：%s", source, len(lock), lock)
-
-	return map[string]interface{}{
-		"text":       lock, // 直接连到下游 text 端口即可
-		"lock":       lock, // 明确语义，避免与普通 text 混淆
-		"grid":       g,    // 结构化回流（下游可继续编辑）
-		"cells":      g.Cells,
-		"cells_text": strings.Join(g.Cells, "\n"),
-		"source":     source,
-	}, nil
-}
-
-// sceneGridFromNode 从节点数据/上游解析出九宫格（供 text2video 与 prompt_opt 共用）。
-//
-// 优先级：已编译好的 lock > 结构化 grid > 文本 cells。
 // 理由：lock 是上游一次定稿的产物，下游**不允许**重新编译——重新编译就等于允许漂移。
 func sceneGridFromNode(node *model.NodeInstance, upstream map[string]interface{}) (SceneGrid, string, bool) {
 	if node != nil {

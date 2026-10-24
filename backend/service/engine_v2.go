@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"context"
@@ -80,7 +80,6 @@ func joinIsAny(n *model.NodeInstance) bool {
 // EngineV2 增强版工作流引擎
 type EngineV2 struct {
 	llm             *LLMService
-	llmStream       *LLMStreamService
 	t2i             *Text2ImageService
 	asr             *ASRService
 	tts             *TTSService
@@ -259,12 +258,6 @@ func (e *EngineV2) parallelSlots() chan struct{} {
 	return ch
 }
 
-// SetLLMStream 注入流式 LLM 服务（nil 则 LLM 节点走非流式）
-func (e *EngineV2) SetLLMStream(s *LLMStreamService) {
-	e.llmStream = s
-}
-
-// SetResolver 注入被循环工作流的解析器（由 main 用 DB 实现）
 func (e *EngineV2) SetResolver(fn func(uint) ([]byte, []byte, error)) {
 	e.resolveWorkflow = fn
 }
@@ -389,54 +382,6 @@ func (e *EngineV2) ExecuteWithRunID(nodesJSON, edgesJSON []byte, runID uint, per
 	}()
 
 	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, "", persist)
-}
-
-// ExecuteWithControl 带单步/断点控制的可取消执行入口。
-// rc 为 nil 时与 ExecuteWithRunID 完全等价。
-func (e *EngineV2) ExecuteWithControl(nodesJSON, edgesJSON []byte, runID uint, rc *RunControl, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = withRunID(ctx, runID)
-	ctx = withRunControl(ctx, rc)
-
-	e.runMu.Lock()
-	if e.activeRuns == nil {
-		e.activeRuns = make(map[uint]context.CancelFunc)
-	}
-	e.activeRuns[runID] = cancel
-	e.runMu.Unlock()
-
-	defer func() {
-		cancel()
-		e.runMu.Lock()
-		delete(e.activeRuns, runID)
-		e.runMu.Unlock()
-	}()
-
-	return e.runWithContext(ctx, nodesJSON, edgesJSON, nil, "", persist)
-}
-
-// ResumeWithControl 断点续跑 + 单步/断点控制。
-// 单步调试的每一次「继续」都是走这里：已成功节点复用输出，只有 pending 节点会真正执行。
-func (e *EngineV2) ResumeWithControl(nodesJSON, edgesJSON []byte, prev []model.NodeInstance, runID uint, rc *RunControl, persist func([]model.NodeInstance)) ([]model.NodeInstance, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = withRunID(ctx, runID)
-	ctx = withRunControl(ctx, rc)
-
-	e.runMu.Lock()
-	if e.activeRuns == nil {
-		e.activeRuns = make(map[uint]context.CancelFunc)
-	}
-	e.activeRuns[runID] = cancel
-	e.runMu.Unlock()
-
-	defer func() {
-		cancel()
-		e.runMu.Lock()
-		delete(e.activeRuns, runID)
-		e.runMu.Unlock()
-	}()
-
-	return e.runWithContext(ctx, nodesJSON, edgesJSON, prev, "", persist)
 }
 
 // CancelRun 中止一个正在运行的工作流，返回是否找到该运行
@@ -778,22 +723,9 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 			}
 		}
 
-		// runNode 单节点执行体：断点申请 → 输入快照 → 执行 → 缓存 → 事件上报
+		// runNode 单节点执行体：输入快照 → 执行 → 缓存 → 事件上报
 		runNode := func(nid string) {
 
-			// 单步 / 断点：先向控制对象申请执行许可。
-			// 命中断点或预算用尽时节点保持 pending（不置 running、不写 started_at），
-			// 这样 Resume 时它会被当作「未执行」重新排队，语义与用户预期一致。
-			if rc := runControlFrom(ctx); rc != nil {
-				if rc.ShouldPauseBefore(nid) {
-					rc.MarkPaused(nid, "breakpoint")
-					return
-				}
-				if !rc.Take() {
-					rc.MarkPaused(nid, "step")
-					return
-				}
-			}
 
 			mu.Lock()
 			node := nodeMap[nid]
@@ -1014,17 +946,6 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 
 		wg.Wait()
 
-		// 单步 / 断点命中：把当前进度落库后正常返回（不是失败）。
-		// 调用方从 RunControl.State() 读出停在哪个节点，再决定继续还是中止。
-		if rc := runControlFrom(ctx); rc != nil {
-			if paused, _, _ := rc.State(); paused {
-				if persist != nil {
-					persist(nodes)
-				}
-				return nodes, nil
-			}
-		}
-
 		if layerFailed {
 			for _, id := range order {
 				if nodeMap[id].Status == "pending" {
@@ -1072,33 +993,23 @@ func (e *EngineV2) registerBuiltinNodes() {
 	}
 
 	e.nodes = nodeRegistry{
-		"start":            plain(e.execStartNode),
-		"input_source":     plain(e.execInputSourceNode),
-		"text_split":       plain(e.execTextSplitNode),
-		"llm":              e.execLLMNode,
-		"text2image":       plain(e.execText2ImageNode),
-		"image2image":      e.execImage2ImageNode,
-		"inpaint":          e.execInpaintNode,
-		"upscale":          e.execUpscaleNode,
-		"text2video":       e.execText2VideoNode,
-		"storyboard":       e.execStoryboardNode,
-		"shotlist":         e.execShotListNode,
-		"asr":              plain(e.execASRNode),
-		"tts":              plain(e.execTTSNode),
-		"video_compose":    plain(e.execVideoNode),
-		"subtitles":        plain(e.execSubtitlesNode),
-		"post_production":  plain(e.execPostProductionNode),
-		"vision":           e.execVisionNode,
-		"select":           e.execSelectNode,
-		"prompt_opt":       e.execPromptOptNode,
-		"scene_grid":       e.execSceneGridNode,
-		"quality_gate":     e.execQualityGateNode,
-		"consistency_gate": e.execConsistencyGateNode,
-		"if_else":          plain(e.execIfElseNode),
-		"loop":             e.execLoopNode,
-		"quality_loop":     e.execQualityLoopNode,
-		"comfy_workflow":   plain(e.execComfyWorkflowNode),
-		"end":              plain(e.execEndNode),
+		// 只保留"出片链路"用得到的节点。画布类的通用节点（if_else / loop /
+		// comfy_workflow / input_source / text_split）与工具类节点（vision / select /
+		// asr / video_compose / subtitles / post_production / scene_grid /
+		// quality_gate / consistency_gate）已随通用画布一起删除：
+		// 它们的入口（用户自己画图）不存在了，留着就是死代码。
+		"start":        plain(e.execStartNode),
+		"llm":          e.execLLMNode,
+		"text2image":   plain(e.execText2ImageNode),
+		"image2image":  e.execImage2ImageNode,
+		"inpaint":      e.execInpaintNode,
+		"upscale":      e.execUpscaleNode,
+		"text2video":   e.execText2VideoNode,
+		"storyboard":   e.execStoryboardNode,
+		"shotlist":     e.execShotListNode,
+		"tts":          plain(e.execTTSNode),
+		"quality_loop": e.execQualityLoopNode,
+		"end":          plain(e.execEndNode),
 	}
 }
 

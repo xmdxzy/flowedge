@@ -106,34 +106,69 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 		}
 	}
 
+	// 依赖按节点类型直接判定（不再走"模块契约"抽象）：
+	// 节点只剩 13 种，每种要哪个服务是确定的；多一层契约只会把
+	// "加了节点忘登记"变成静默放行。
 	for i := range nodes {
 		n := &nodes[i]
-		// 依赖从模块契约读取，**不再按节点类型 switch**。
-		// 加一个模态（新的图像/视频/语音/3D 模块）只要在契约里写 Requires，
-		// 预检、一键修复、任务书同时生效——引擎不需要认识这个模态。
-		c, ok := ModuleContractOf(n.Type)
-		if !ok {
-			continue // 未声明契约的类型：预检不拦，执行期会给出它自己的错误
-		}
-		reqs := c.Requires
-		if c.RequiresFor != nil {
-			reqs = c.RequiresFor(n)
-		}
-		for _, req := range reqs {
-			capability, known := CapabilityFor(req.Dep, caps)
-			if !known {
-				continue // 契约写了一个引擎不认识的依赖名：留给测试去抓
+		switch n.Type {
+		case "text2image", "image2image", "inpaint", "upscale":
+			if c, ok := capabilityOf("comfyui", caps); ok {
+				addComfy(n, "", "文生图/图像编辑（ComfyUI）", c)
 			}
-			if req.Dep == "comfyui" || req.Dep == "comfy_h3" {
-				profile := ""
-				if req.Dep == "comfy_h3" {
-					profile = "h3"
+		case "text2video":
+			profile, label := "", "视频生成（ComfyUI）"
+			if b, _ := n.Data["backend"].(string); b == "h3" {
+				profile, label = "h3", "视频生成（ComfyUI-H3）"
+			}
+			dep := "comfyui"
+			if profile == "h3" {
+				dep = "comfy_h3"
+			}
+			if c, ok := capabilityOf(dep, caps); ok {
+				addComfy(n, profile, label, c)
+			}
+		case "llm", "prompt_opt", "storyboard":
+			if c, ok := capabilityOf("ollama", caps); ok {
+				add(n, "ollama", "语言模型（Ollama）", c)
+			}
+		case "shotlist":
+			if c, ok := capabilityOf("comfy_h3", caps); ok {
+				addComfy(n, "h3", "分镜生成（ComfyUI-H3）", c)
+			}
+			if v, _ := n.Data["audio_check"].(bool); v {
+				if c, ok := capabilityOf("asr", caps); ok {
+					add(n, "asr", "音频抽检（ASR）", c)
 				}
-				addComfy(n, profile, req.Label, capability)
-				continue
 			}
-			add(n, req.Dep, req.Label, capability)
+		case "tts":
+			if c, ok := capabilityOf("tts", caps); ok {
+				add(n, "tts", "语音合成（TTS）", c)
+			}
 		}
 	}
+
 	return missing
+}
+
+// capabilityOf 依赖名 → 探测结果。未知依赖名返回 false：调用方跳过，
+// 但 preflight_test 会核对「节点类型清单里每种都至少消耗一个已知依赖」。
+func capabilityOf(dep string, caps Capabilities) (Capability, bool) {
+	switch dep {
+	case "ollama":
+		return caps.Ollama, true
+	case "comfyui":
+		return caps.ComfyUI, true
+	case "comfy_h3":
+		return caps.ComfyH3, true
+	case "asr":
+		return caps.ASR, true
+	case "tts":
+		return caps.TTS, true
+	case "vision":
+		return caps.Vision, true
+	case "ffmpeg":
+		return caps.FFmpeg, true
+	}
+	return Capability{}, false
 }

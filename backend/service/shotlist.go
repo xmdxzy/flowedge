@@ -152,6 +152,25 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		return nil, err
 	}
 
+	// ---- 一致性门（开机前）：审分镜表的轴线/光比/场景锁 ----
+	//
+	// 放在这里而不是出片后：这个 plan 一旦漂了，后面每一镜都会忠实执行漂移，
+	// 抽帧比对只能在 40 分钟后告诉你"前面白拍"。
+	consistencyCheck := true
+	if v, ok := node.Data["consistency_check"].(bool); ok {
+		consistencyCheck = v
+	}
+	var consistencyIssues []ShotConsistencyIssue
+	if consistencyCheck {
+		consistencyIssues = AuditPlanConsistency(plan)
+		if fails := consistencyFails(consistencyIssues); len(fails) > 0 {
+			return nil, fmt.Errorf("一致性门未通过（未开机，未烧显存）：\n%s", consistencyFailMessage(fails))
+		}
+		for _, it := range consistencyIssues {
+			log.Printf("[shotlist] 一致性告警 %s: %s", it.Code, it.Msg)
+		}
+	}
+
 	backend, _ := node.Data["backend"].(string)
 	if backend == "" {
 		backend = "h3"
@@ -479,6 +498,7 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		"check":        toJSON(check),
 		"check_ok":     check.OK,
 		"gate_report":  toJSON(gateReport),
+		"consistency":  toJSON(consistencyIssues),
 		"gate_ok":      !verdict.HasFail(),
 		"gate_verdict": verdict.Worst(),
 	}, nil

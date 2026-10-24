@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """FlowEdge Windows 原生构建：前端 → 内嵌 → 单个 FlowEdge.exe
 
@@ -209,6 +209,15 @@ def main():
     log("  1) 把 %s 复制到任意目录" % os.path.basename(exe))
     log("  2) 双击运行（或运行 FlowEdge-启动.bat）")
     log("  3) 浏览器打开 http://127.0.0.1:8080")
+    # 流水线定义是产品形态本身，必须跟着 exe 一起发；缺它引擎会直接拒绝启动。
+    data_out = os.path.join(OUT_DIR, "data")
+    os.makedirs(data_out, exist_ok=True)
+    src = os.path.join(ROOT, "data", "pipelines.json")
+    if os.path.exists(src):
+        shutil.copy2(src, os.path.join(data_out, "pipelines.json"))
+        log("已复制 data/pipelines.json → dist/data/（部署时跟 exe 一起放到 <exe目录>/data/）")
+    else:
+        fail("缺少 data/pipelines.json：7 条固定流水线的定义，没有它引擎不启动")
     log("  数据保存在 exe 同目录的 data/ 下，卸载即删目录")
     log("  可选：FlowEdge.exe --export-services 导出语音服务脚本（需 Python）")
 

@@ -25,11 +25,7 @@ type Workflow struct {
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
 
-	// 触发器：外部系统可通过 Webhook token 调用，或按 cron 定时执行
-	TriggerToken    string     `gorm:"size:64;index" json:"trigger_token"`
-	CronExpr        string     `gorm:"size:64" json:"cron_expr"`
-	TriggerEnabled  bool       `gorm:"default:false" json:"trigger_enabled"`
-	LastTriggeredAt *time.Time `json:"last_triggered_at"`
+	// 没有触发器/没有 cron：出片只能由人（或 MCP 客户端）显式发起。
 }
 
 // WorkflowRun 工作流执行记录
@@ -39,31 +35,16 @@ type WorkflowRun struct {
 	Status     string          `gorm:"size:20;default:pending" json:"status"` // pending, running, paused, success, failed
 	NodeStates json.RawMessage `gorm:"type:text" json:"node_states"`
 	Error      string          `gorm:"type:text" json:"error,omitempty"`
-	// 断点调试：停在哪个节点 / 为什么停（step=单步耗尽，breakpoint=断点）
-	// InvokedBy 谁触发了这次运行：manual / workbuddy / dsh / mcp / webhook / cron。
-	// 与开始节点声明的 entry_agent 分开记：声明是「预期」，这里是「实际」，
-	// 两者不一致时要在提交响应里告诉调用方（而不是默默按预期跑）。
-	InvokedBy   string `gorm:"size:32" json:"invoked_by,omitempty"`
-	PausedAt    string `gorm:"size:64" json:"paused_at,omitempty"`
-	PauseReason string `gorm:"size:32" json:"pause_reason,omitempty"`
-
-	// 评测语义：由评测层在**起跑时**注入，引擎只落库、只回填，绝不猜。
-	//
-	// 为什么放在 run 上而不是事后补：证据信封在运行结束那一刻落盘，
-	// 事后补等于改一份已经写死的「事实」——那是伪造证据，不是采集证据。
-	// 字段用指针：没传就是 null（没采集），不能写成空串冒充「采集到了空值」。
-	CaseID             *string `gorm:"size:128;index" json:"case_id,omitempty"`
-	DatasetFingerprint *string `gorm:"size:64" json:"dataset_fingerprint,omitempty"`
-	Category           *string `gorm:"size:64;index" json:"category,omitempty"`
-	Role               string  `gorm:"size:16;index" json:"role,omitempty"` // baseline / candidate
-	EvalBatch          string  `gorm:"size:64;index" json:"eval_batch,omitempty"`
-
-	// WorkflowVersion 起跑那一刻的图版本（0 = 没有快照）。
-	//
-	// 必须在起跑时钉住：原来在收尾时读「当前最大版本号」，一旦运行期间
-	// 有人改图并存了版本，一次旧图的运行会被记成新图的成绩 —— 配对评测
-	// 直接张冠李戴，且事后完全看不出来（版本号看着都对）。
-	WorkflowVersion int `gorm:"default:0" json:"workflow_version"`
+	// PipelineID 这次出片用的是哪条流水线（data/pipelines.json 里的 id）。
+	// 与 WorkflowID 分工：WorkflowID 是实际执行的那张图（质量循环时是临时图），
+	// PipelineID 是用户点的那个东西 —— 重跑、看板分组都靠它。
+	PipelineID string `gorm:"size:64;index" json:"pipeline_id,omitempty"`
+	// Params 起跑时生效的参数（默认值已合并）。重跑直接用这一份，
+	// 不重新猜默认值 —— 否则"重跑"会悄悄换了参数，比较就失去意义。
+	Params json.RawMessage `gorm:"type:text" json:"params,omitempty"`
+	// InvokedBy 谁发起的这次出片：manual / workbuddy / dsh / mcp。
+	// 如实记录，不猜；未知一律记 manual。
+	InvokedBy string `gorm:"size:32" json:"invoked_by,omitempty"`
 
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`

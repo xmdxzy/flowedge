@@ -1,9 +1,10 @@
-# FlowEdge 项目规则（给未来的自己/其他 agent）
+﻿# FlowEdge 项目规则（给未来的自己/其他 agent）
 
 > 这些都踩过一次，别再踩第二次。详细证据链见 skill `local-multimodal-ops`。
-> **出片先读 `docs/多模态出片手册.md`**：选路 / 时长分配 / 提示词模板 / 验收 / 排错，一页查完。
+> **产品形态先读 `docs/多模态出片台-v2.md`**：7 条固定流水线 / 21 条 API / 质量循环怎么接。
+> **出片参数与验收读 `docs/多模态出片手册.md`**（写于画布时代：选路/时长/提示词/验收仍有效，"建工作流"那套已作废）。
 > **先查路由表**：`.workbuddy/memory/INDEX.md`（任务/症状 → 精确到章节 + 唯一事实源），命中就不再全文搜索。
-> **提交前一键**：`python scripts/check-all.py`（build+test+tsc+契约测试，失败才展开细节）。
+> **提交前一键**：`python scripts/check-all.py`（build+test+tsc+前端用例，失败才展开细节）。
 
 ## 0. 作业纪律（最高优先级）
 
@@ -107,24 +108,42 @@ agent 的 shell 起不了任何活过本次调用的进程——沙箱每命令�
 反例：`gulp compile` 会因仓库自带的 `.vscode/extensions` 自测扩展报错而 `exit 1`，但主程序产物完全正常——只看退出码会误判整件事失败。
 同源规则见 §0.12 ②「用工具没报错当没问题」和本条的镜像面。
 
-### 0.16 轻装化后的事实（2026-10-24，先读这条再动手）
+### 0.16 v2 后的事实（2026-10-25，先读这条再动手）
 
-FlowEdge 已裁到只剩两件事：**本地多模态生成** + **质量门控循环**。细节见
-`docs/轻装化-FlowEdge-Lite-v1.md`。会做错的地方：
+FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**，且**图不再由用户画**。
+完整说明见 `docs/多模态出片台-v2.md`。会做错的地方：
 
-- **别再找这些 API**：`/api/cards`、`/api/skills`、`/api/toolchain`、`/api/mcp/*`（客户端侧）、
-  `/api/agents`、`/api/kb/*`、`/api/evidence/*`、`/api/evolution/*`、`/api/triggers`、
-  `/api/hooks/*`、`/api/credentials`、`/api/workflows/:id/versions`、`/v1/*`。它们已删除，不是坏了。
-- **别再找这些节点**：`agent_task`、`mcp_call`、`command`、`code`、`http_request`、
-  `data_transform`、`rag_query`、`aggregate`、`sub_workflow`。旧图用到它们会报 `unknown node type`，这是预期。
-- **循环提升现在用 `quality_loop`，不是自己拼 `loop + quality_gate`**：它内建
-  「生成→打分→诊断→改参数→重跑→择优」，未达标会显式失败并带逐轮报告。修复项只做有确定解的
-  数值项（帧数/宽高/时长下限/音轨/禁人声），语义类问题走重采样。
-- **节点缓存已删**：故意。缓存命中会让「重跑一轮」变成假重跑，质量循环就失去意义。
-- **前端测试必须 `NODE_ENV=test`**：这个 shell 里 `NODE_ENV=production`，`act()` 会整体抛错，
-  表现为 73 个用例全红——那是环境，不是代码。
-- 代码量参考：backend 145 个 Go 文件 / ~23.7k 行，frontend 64 个源文件 / ~9.2k 行；
-  API 44 条，节点 27 种。数字明显超出说明有东西被加回来了。
+- **产品形态是 7 条固定流水线**（`data/pipelines.json`）：`image` / `image_batch` /
+  `image_edit` / `video` / `video_from_image` / `film` / `voice`。用户选一条、填字段，
+  服务端组装图去跑。加能力 = 改这个 JSON（字段 `bind` 写节点 data、`when` 选节点），
+  **不是**加画布节点。
+- **唯一运行入口 `POST /api/produce {pipeline, params, invoked_by}`**。再也不会出现
+  "先 POST /api/workflows 再 /run" 的两段式。
+- **别再找这些接口**（已删除，不是坏了）：`/api/workflows*`、`/api/modules`、
+  `/api/estimate`、`/api/vram/profiles`、`/api/models*`、`/api/instances`、
+  `/api/llm/profiles`、`/api/gpu/*`、`/api/runs/:id/step|continue|resume`、
+  `/api/preflight` 的旧语义（现在按 `{pipeline, params}` 体检）。对外只剩 21 条。
+- **别再找这些节点**：`if_else`、`loop`、`comfy_workflow`、`input_source`、`text_split`、
+  `vision`、`select`、`asr`、`video_compose`、`subtitles`、`post_production`、
+  `scene_grid`、`quality_gate`、`consistency_gate`、`prompt_opt`。节点只剩 12 种；
+  旧图会报 `unknown node type`，这是预期。其中**场景锁与提示词优化的库函数保留**
+  （`scene_grid.go` / `prompt_opt.go`），因为 `text2video` 内部要用：
+  优化开关是 `text2video.data.prompt_opt`，参考图/音频走 `ref_images`/`ref_audio`
+  （给了就自动 Ref2VA 六段式）。
+- **一致性门在 `shotlist` 的 plan 层，不是节点**：`service/consistency_plan.go` 的
+  `AuditPlanConsistency` 在开机前审分镜表——`continue` 续接却跳轴/换光比 = FAIL，
+  场景锁句字节不全等 = FAIL，环境声多写法 = WARN。旧的 `consistency_gate` 节点
+  （出片后抽帧比对）已删；别把它加回来，加在这个审计函数里。
+- **质量循环不是自己拼 loop**：流水线字段 `qc=true` 时，服务端把该图落成 `qc:` 前缀的
+  临时工作流，外层换 `start → quality_loop → end`，跑完即删、启动时清扫。
+  预检与参数校验在**包壳之前**对原始图做（对壳做等于没查）。
+- **节点缓存已删**：故意。缓存命中会让"重跑一轮"变成假重跑。
+- **前端测试必须 `NODE_ENV=test`**：这个 shell 里 `NODE_ENV=production`，`act()` 会整体抛错。
+- **部署必须带上 `data/pipelines.json`**（exe 同目录）：缺它引擎 `log.Fatalf` 不启动。
+  `build-windows.py` 会复制到 `dist/data/`，`3-应用更新并重启.bat` 会同步到 `运行/data/`；
+  手动换 exe 时别忘了这一步。
+- 代码量参考（2026-10-25 实测）：backend 62 个非测试 Go 文件 / 17.3k 行（改前 23.6k），
+  测试 43 个文件 / 5.8k 行，API 21 条，节点 12 种。数字明显超出说明有东西被加回来了。
 
 ## 1–4. 环境硬约束（权重 / 显存 / 进程 / 下载）
 
@@ -195,7 +214,9 @@ cd frontend && npm test                    # 前端用例（零新增依赖，�
 cd frontend && npx tsc --noEmit            # 类型检查（测试文件也在内）
 ```
 
-- **前端测试不引入 vitest**：`frontend/scripts/run-tests.mjs` 用 vite 自带 esbuild 把 `src/**/*.test.ts` 打成 ESM 包，`node:test` + `node:assert` 跑。含**前后端契约测试**：从 `backend/service/nodespec.go` 解析节点类型，断言每个都出现在前端调色板——「后端有、UI 点不到」这类漂移从此是红灯。
+- **前端测试不引入 vitest**：`frontend/scripts/run-tests.mjs` 用 vite 自带 esbuild 把 `src/**/*.test.ts` 打包，`node:test` + `node:assert` 跑。
+  旧的「后端节点类型 ↔ 前端调色板」契约测试**已作废**（调色板不存在了）；现在的形态契约在后端：
+  `backend/service/pipeline_test.go` 直接拿 `data/pipelines.json` 逐条组装，字段 bind/when 写错就是红灯。
 - **`--skip-ui` 不复制前端**：只内嵌 `backend/web/static` 已有产物。改了前端却用 `--skip-ui`，exe 界面还是旧的（或直接 500）；要么完整构建，要么先手动 `cp -r frontend/dist/* backend/web/static/`。
 - **前端资源优先级**（启动时判定，运行中改文件不生效）：`STATIC_DIR` → `<exe目录>/web/static` → exe 内嵌 → 开发目录 `../frontend/dist`。临时放 `运行/web/static` 可免重编调试，但用完必须删，否则永远遮蔽内嵌版本。
 - 部署一步到位：`运行/3-应用更新并重启.bat`（停服 → 替换 exe → 清 web/static → 启动）。

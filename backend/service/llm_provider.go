@@ -94,15 +94,3 @@ func IsUnloadUnsupported(err error) bool {
 }
 
 // streamBackend 流式服务同样按后端判定（错误文案用）
-func (s *LLMStreamService) backend() string {
-	if s == nil {
-		return BackendOllama
-	}
-	if s.Backend != "" {
-		return s.Backend
-	}
-	return ResolveLLMBackend(s.BaseURL, os.Getenv("LLM_PROVIDER"))
-}
-
-// BackendLabel 当前后端展示名
-func (s *LLMStreamService) BackendLabel() string { return BackendLabel(s.backend()) }

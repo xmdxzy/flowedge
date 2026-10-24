@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """提交前一键全检：把 5 条命令压成 1 条，输出压成 4 行。
 
 为什么要有它
@@ -12,7 +12,7 @@
     python scripts/check-all.py          # 后端 core 包 + 前端类型 + 契约测试（约 60s）
     python scripts/check-all.py --full   # 后端全包（含 engine_v2_test 等，约 120s）
     python scripts/check-all.py --fast   # 只编译 + 前端类型（约 25s，改前端时用）
-    python scripts/check-all.py --live   # 追加起引擎 + canonical 在线 35 断言（约 60s 额外）
+    python scripts/check-all.py --live   # 追加起引擎 + 新接口在线冒烟（约 60s 额外）
 
 退出码：0 = 全过；1 = 有 FAIL；2 = 环境缺失（找不到 go/node/tsc）。
 """
@@ -94,7 +94,7 @@ def main() -> int:
     else:
         log("  [SKIP] tsc 未安装（frontend/node_modules 缺）")
     if not args.fast:
-        ok &= run("前端契约测试", [node, "scripts/run-tests.mjs"], FRONTEND, env)
+        ok &= run("前端用例（node:test）", [node, "scripts/run-tests.mjs"], FRONTEND, env)
 
     if args.live:
         py = sys.executable
@@ -109,3 +109,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

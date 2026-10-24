@@ -1,4 +1,4 @@
-package mcp
+﻿package mcp
 
 import (
 	"bytes"
@@ -89,7 +89,7 @@ func TestUnknownToolIsToolError(t *testing.T) {
 // 而不是抛一个裸的 connection refused。
 func TestEngineUnreachableGivesActionableError(t *testing.T) {
 	srv := NewServer("http://127.0.0.1:1", "", nil, nil)
-	resp := runOnce(t, srv, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"flowedge_list_workflows","arguments":{}}}`)
+	resp := runOnce(t, srv, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"flowedge_pipelines","arguments":{}}}`)
 	result, _ := resp["result"].(map[string]interface{})
 	if result["isError"] != true {
 		t.Fatalf("expected error result: %v", result)
@@ -101,10 +101,10 @@ func TestEngineUnreachableGivesActionableError(t *testing.T) {
 	}
 }
 
-// TestListWorkflowsForwards 正常路径：转发到引擎并回传结果
-func TestListWorkflowsForwards(t *testing.T) {
+// TestPipelinesForwards 正常路径：转发到引擎并回传流水线目录
+func TestPipelinesForwards(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/workflows" {
+		if r.URL.Path != "/api/pipelines" {
 			w.WriteHeader(404)
 			return
 		}
@@ -112,35 +112,34 @@ func TestListWorkflowsForwards(t *testing.T) {
 			w.WriteHeader(401)
 			return
 		}
-		_, _ = w.Write([]byte(`[{"id":1,"name":"demo"}]`))
+		_, _ = w.Write([]byte(`{"pipelines":[{"id":"image","name":"文生图"}],"count":1}`))
 	}))
 	defer up.Close()
 
 	srv := NewServer(up.URL, "secret", nil, nil)
-	resp := runOnce(t, srv, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"flowedge_list_workflows","arguments":{}}}`)
+	resp := runOnce(t, srv, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"flowedge_pipelines","arguments":{}}}`)
 	result, _ := resp["result"].(map[string]interface{})
 	if result["isError"] != false {
 		t.Fatalf("expected success: %v", result)
 	}
 	content, _ := result["content"].([]interface{})
 	text, _ := content[0].(map[string]interface{})["text"].(string)
-	if !strings.Contains(text, "demo") {
-		t.Errorf("result should contain workflow name: %s", text)
+	if !strings.Contains(text, "文生图") {
+		t.Errorf("result should contain pipeline name: %s", text)
 	}
 }
 
-// TestRunWorkflowRequiresArg 缺参数要在工具层明确报错
-func TestRunWorkflowRequiresArg(t *testing.T) {
+// TestProduceRequiresPipeline 缺参数要在工具层明确报错
+func TestProduceRequiresPipeline(t *testing.T) {
 	srv := NewServer("http://127.0.0.1:1", "", nil, nil)
-	resp := runOnce(t, srv, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"flowedge_run_workflow","arguments":{}}}`)
+	resp := runOnce(t, srv, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"flowedge_produce","arguments":{}}}`)
 	result, _ := resp["result"].(map[string]interface{})
 	content, _ := result["content"].([]interface{})
 	text, _ := content[0].(map[string]interface{})["text"].(string)
-	if !strings.Contains(text, "workflow_id") {
+	if !strings.Contains(text, "pipeline") {
 		t.Errorf("should name the missing param: %s", text)
 	}
 }
-
 // TestNotificationIgnored notification（无 id）不能产生响应
 func TestNotificationIgnored(t *testing.T) {
 	var out bytes.Buffer
@@ -165,3 +164,4 @@ func TestParseErrorIsProtocolError(t *testing.T) {
 		t.Errorf("code = %v, want -32700", errObj["code"])
 	}
 }
+

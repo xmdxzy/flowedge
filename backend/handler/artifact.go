@@ -40,14 +40,15 @@ type Artifact struct {
 	ModTime int64  `json:"mod_time"`
 }
 
-// List 列出产物（按修改时间倒序）
+// List 列出产物（按修改时间倒序）。?kind=image|video|audio 只看一类。
 func (h *ArtifactHandler) List(c *gin.Context) {
 	abs, _ := filepath.Abs(h.dir)
+	want := c.Query("kind")
 	items := make([]Artifact, 0)
 	entries, err := os.ReadDir(h.dir)
 	if err != nil {
 		// 目录不存在时返回空列表而不是错误：新装环境还没生成过任何东西
-		c.JSON(http.StatusOK, gin.H{"dir": abs, "items": items, "count": 0})
+		c.JSON(http.StatusOK, gin.H{"dir": abs, "kind": want, "items": items, "count": 0})
 		return
 	}
 
@@ -58,6 +59,9 @@ func (h *ArtifactHandler) List(c *gin.Context) {
 		ext := strings.ToLower(filepath.Ext(e.Name()))
 		kind, ok := artifactExt[ext]
 		if !ok {
+			continue
+		}
+		if want != "" && kind != want {
 			continue
 		}
 		info, err := e.Info()
@@ -73,7 +77,7 @@ func (h *ArtifactHandler) List(c *gin.Context) {
 	}
 
 	sort.Slice(items, func(i, j int) bool { return items[i].ModTime > items[j].ModTime })
-	c.JSON(http.StatusOK, gin.H{"dir": abs, "items": items, "count": len(items)})
+	c.JSON(http.StatusOK, gin.H{"dir": abs, "kind": want, "items": items, "count": len(items)})
 }
 
 // Serve 提供单个产物文件（只允许平坦文件名，防目录穿越）
