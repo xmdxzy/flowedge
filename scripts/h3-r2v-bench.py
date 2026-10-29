@@ -45,7 +45,7 @@ def upload(name):
     return name
 
 
-def build(width, height, frames, steps, seed, unet):
+def build(width, height, frames, steps, seed, unet, prompt):
     g = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": CLIP, "type": "minimax", "device": "default"}},
@@ -64,7 +64,7 @@ def build(width, height, frames, steps, seed, unet):
         refs[f"ref_image_{i + 1}"] = link(50 + i, 0)
     g["5"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
         "clip": link(2, 0), "vae": link(3, 0), "audio_vae": link(4, 0),
-        "prompt": PROMPT, "width": width, "height": height, "length": frames,
+        "prompt": prompt, "width": width, "height": height, "length": frames,
         "ref_image_size": "match", "ref_images": refs, "ref_audios": {}}}
     g["7"] = {"class_type": "BasicGuider", "inputs": {"model": link(41, 0), "conditioning": link(5, 0)}}
     g["9"] = {"class_type": "BasicScheduler", "inputs": {
@@ -86,7 +86,7 @@ def vram():
         return -1
 
 
-def run(width, height, frames, steps, seed, tag, unet):
+def run(width, height, frames, steps, seed, tag, unet, prompt):
     peak = [0]
     stop = threading.Event()
 
@@ -99,7 +99,7 @@ def run(width, height, frames, steps, seed, tag, unet):
 
     t = threading.Thread(target=sampler, daemon=True)
     t.start()
-    g = build(width, height, frames, steps, seed, unet)
+    g = build(width, height, frames, steps, seed, unet, prompt)
     cid = str(uuid.uuid4())
     t0 = time.time()
     r = req("/prompt", {"prompt": g, "client_id": cid})
@@ -141,6 +141,9 @@ if __name__ == "__main__":
     ap.add_argument("--runs", type=int, default=2)
     ap.add_argument("--tag", default="r2v-base")
     ap.add_argument("--unet", default=UNET)
+    ap.add_argument("--prompt-suffix", default="",
+                    help="挪 prompt 防 ComfyUI 节点缓存：两臂必须不同文本")
     a = ap.parse_args()
+    prompt = PROMPT + ((" " + a.prompt_suffix) if a.prompt_suffix else "")
     for i in range(a.runs):
-        run(a.w, a.h, a.frames, a.steps, 555000 + i, f"{a.tag}-r{i + 1}", a.unet)
+        run(a.w, a.h, a.frames, a.steps, 555000 + i, f"{a.tag}-r{i + 1}", a.unet, prompt)

@@ -228,6 +228,17 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**。
 - **一致性门有两层**：`shotlist` 开机前审 plan（轴线/光比/锁句，FAIL 拦下）；
   出片后量各镜 U/V 均值，相邻两镜漂移 >6 报 `plan.color_shift`（WARN）。
   实测抓到过"plan 两镜都写冷色、生成一暖一冷"——那是生成侧漂移，plan 门管不到。
+- **剧本生成是两段式（2026-10-30）**：storyboard 节点先跑结构层（片种卡/冷开场/
+  角色圣经/节拍表，`service/storyboard_creative.go`）再分镜；结构层失败自动回退
+  单段式（日志 `[storyboard] 回退单段式`，节点输出无 `structure` 即回退发生）。
+  `storyboardInstruction` 带镜头语法词表与四个节奏型（建立/对话/冲突/收束）；
+  film/storyboard 流水线新增 `style`/`characters` 可选字段（bind `sb-1`，
+  用户输入优先于模型创作，`style` 解析后强制覆盖 plan.Style）。
+  审计新 WARN：`plan.beat_missing` / `plan.beat_monotone` / `plan.no_cold_open`。
+  改剧本提示词必跑 `go test ./service/ -run 'TestPlanShotCreatively|TestStoryboardTemplatesContract|TestAuditPlan'`
+  （模板契约测试拦"把词表/节拍改薄"的回归）；真机 A/B 用
+  `FLOWEDGE_LIVE_LLM=1 go test ./service/ -run TestLiveStoryboardTwoStage -v`。
+  GitHub 调研清单与制作侧 backlog 见 `docs/剧本生成与创意优化-20261030.md`。
 - **部署必须带上 `data/pipelines.json`**（exe 同目录）：缺它引擎 `log.Fatalf` 不启动。
   `build-windows.py` 会复制到 `dist/data/`，`3-应用更新并重启.bat` 会同步到 `运行/data/`；
   手动换 exe 时别忘了这一步。
@@ -289,6 +300,19 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**。
   **已接入 FlowEdge**：非台词 **FL2VA** 镜走 PDD 8 步；2 镜生产 1m11+1m49，总 216.1s，
   `verify-media` 全绿。**Ref2VA PDD 实测反而 3m40+3m50（585.8s）**，代码已把 `h3_r2v`
   的 PDD 关掉、回 base 12；别再默认给角色片开 PDD。
+- **W4A8 量化权重实测（2026-10-30，别再全量重测）**：`minimax_h3_ref2va_pruned_w4a8_mixed`
+  **已是台词镜生产默认**（`运行/data/models.json` 的 `video.h3.ref2va.unet`）——
+  bench 暖态 75.1→48.5s（**1.55×**）峰值 −0.4GB，真机台词片 run 358 两镜 ASR 验词过、
+  成片台词完整、身份抽帧一致。FL2VA 的 W4A8 **不换**（PDD-on-base 42.5s 仍最快；
+  W4A8 暖态 62.8s）。三个判负别再试：**PDD LoRA 叠 W4A8**（84.7s vs 42.5s，去量化路径
+  拖慢）、**video VAE int8_convrot**（暖态慢 8%、峰值不变——动态加载吃满显存，
+  权重省 2.4GB 不体现为峰值下降）、**W4A8 文本编码器**（15.7GB ≥ 现役 nvfp4，零收益）。
+  W4A8 的「峰值降到 17–18GB」预期不成立：动态 VRAM 加载器会吃满可用显存。
+  权重 sha256 存 `.tmp/w4a8-sha256.txt`；r2v A/B 台架 `scripts/h3-r2v-bench.py`。
+- **验词门只比字不比标点（2026-10-30 修）**：faster-whisper 对同一句台词能回全角/
+  半角/无标点三种（TTS 念轨本尊都转不出全角句号），`verifyDialogueLine` 原来按标点
+  Contains 会把念对的台词判死（run 357 真实误杀）。现在两侧过 `stripASRPunct`
+  （只留文字与数字），测试 `verify_dialogue_test.go` 钉住。
 - **多镜批量构图已上线（2026-10-30，P2 结构优化）**：`film`/`film_from_plan` 的
   `batch_size` 字段（默认 3，0/1=关）。连续、非台词、组内无 continue、缓存未命中、
   lowVRAM 同档的镜合成**一张图**提交（屏障节点强制两阶段），换权重 3N→3。

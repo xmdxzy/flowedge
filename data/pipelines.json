@@ -898,6 +898,30 @@
           ]
         },
         {
+          "key": "style",
+          "label": "风格锚（可选）",
+          "type": "text",
+          "hint": "画面质感/色调/年代一句话，如：黄昏渔村，青灰冷调，地面潮湿反光。留空由剧本结构层自拟",
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "style"
+            }
+          ]
+        },
+        {
+          "key": "characters",
+          "label": "角色设定（可选）",
+          "type": "textarea",
+          "hint": "每行一个：名字：外貌+衣着+道具（具体到可画，如发色/服装/随身物）。给出后全片逐镜锁定；留空由结构层创作",
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "characters"
+            }
+          ]
+        },
+        {
           "key": "seconds",
           "label": "目标时长（秒）",
           "type": "int",
@@ -1351,6 +1375,30 @@
             {
               "node": "start-1",
               "path": "prompt"
+            }
+          ]
+        },
+        {
+          "key": "style",
+          "label": "风格锚（可选）",
+          "type": "text",
+          "hint": "画面质感/色调/年代一句话，如：黄昏渔村，青灰冷调，地面潮湿反光。留空由剧本结构层自拟",
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "style"
+            }
+          ]
+        },
+        {
+          "key": "characters",
+          "label": "角色设定（可选）",
+          "type": "textarea",
+          "hint": "每行一个：名字：外貌+衣着+道具（具体到可画，如发色/服装/随身物）。给出后全片逐镜锁定；留空由结构层创作",
+          "bind": [
+            {
+              "node": "sb-1",
+              "path": "characters"
             }
           ]
         },

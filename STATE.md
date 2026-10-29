@@ -19,14 +19,17 @@
   **≈2.05×**，峰值显存持平）→ 引擎接入（`comfy_media_batch.go` + shotlist 分组/回退）
   → 生产 A/B（同 372 帧：569s→285s，**2.0×**；run 353 vs 354，verify-media 全绿）
   → `film`/`film_from_plan` 默认 `batch_size=3`。引擎已部署 2026.10.30。
-- ✅ **fp8 VAE 死路有解**：官方 Comfy-Org 的 `video_vae_int8_convrot`（2.8GB，省 2.4GB）
-  排入下载接力；**W4A8-TE 判死**（15.7GB ≥ 现役 nvfp4，零收益）；TE-Speed/VSA 维持门控不测。
-- ⏳ **W4A8 DiT 下载中**（hf-mirror ~0.7MB/s，01:39 时 5.6/12.54GB，预计 ~04:15 完成），
-  VAE 与 Ref2VA W4A8 在同一接力链上自动续。下载完自动可 bench：
-  `h3-bench.py --unet minimax_h3_fl2va_pruned_w4a8_mixed.safetensors --tag w4a8`
-- ✅ 顺手修了三处：`engine_comfy_node.go` 缺 `dataFloat`（工作区编译是坏的）、
+- ✅ **W4A8 全部测完（07:36 收口）**：Ref2VA W4A8 暖态 **1.55×** 且真机台词片验收通过
+  （run 358：两镜 ASR 验词过、台词完整、身份一致）→ **已切台词镜生产默认**
+  （`运行/data/models.json` video.h3.ref2va.unet，回滚改回 int8_convrot 那份）；
+  FL2VA W4A8 暖态 1.16× 不作默认（PDD 42.5s 仍最快）；三个判负：PDD 叠 W4A8（84.7s）、
+  video VAE int8（慢 8% 峰值不变）、W4A8-TE（同尺寸零收益）。「峰值 17–18GB」预期
+  不成立——动态加载器吃满显存。TE-Speed/VSA 维持门控不测。
+- ✅ 顺手修了四处：`engine_comfy_node.go` 缺 `dataFloat`（工作区编译是坏的）、
   `batch_size` 字段漏 bind（参数收下但不生效）、`.gitignore` 行内注释导致
-  `backend/*/data/` 失效。
+  `backend/*/data/` 失效、**验词门按标点判死念对的台词**（`stripASRPunct`，run 357 误杀）。
+- ✅ 已提交：e6d59b9（批量构图+全部实测+10-26 以来累积工作，132 文件）；
+  W4A8 收口与门修复见其后的第二个提交。
 - 📌 教训各记一条：**ComfyUI 节点输出缓存**会把同图重跑变 2 秒假跑（A/B 必须挪
   seed+prompt）；**引擎重启后 ComfyUI 孤儿**占端口（`managed:false` 即先杀再起）。
 
@@ -144,3 +147,16 @@ python scripts/h3-reserve.py --set 4 --yes       # 不论结果如何先改回�
 **验证**：`check-all.py` ALL-PASS（轮 14：build 4.4s / test 66.2s / tsc 3.6s / 前端 6.8s）；
 本脚本演练模式实测通过。
 ⬜ 部署本身仍未执行（要人跑一条命令，或授权我跑）。
+
+---
+
+## 2026-10-30（另一线程）— 剧本生成创意优化（影响下次部署）
+
+- 剧本链升级**两段式**：结构层（片种卡/冷开场/角色圣经/节拍表）→ 分镜层。
+  新文件 `service/storyboard_creative.go`；`storyboardInstruction` 注入镜头语法
+  词表与节奏型；一致性审计新增 3 条节拍 WARN；`pipelines.json` 的 film/storyboard
+  新增 `style`/`characters` 字段（bind sb-1）。真机冒烟已过（Ollama dsh-lens-8b，
+  两段 93.5s，产物 `backend/.tmp/storyboard-live.json`）。
+  详见 `docs/剧本生成与创意优化-20261030.md`。
+- **对上面收尾清单的影响**：`dist/FlowEdge.exe` 不含这些改动——部署前先
+  `python scripts/build-windows.py` 重构建一次，否则线上还是旧剧本链。

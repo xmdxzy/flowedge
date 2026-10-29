@@ -159,6 +159,38 @@ func AuditPlanConsistency(plan *ShotPlan) []ShotConsistencyIssue {
 		}
 	}
 
+	// 7) 节拍覆盖（2026-10-30 两段式剧本链起，storyboard 逐镜产出 beat）：
+	//    节拍是叙事节奏的审查抓手——冷开场钩子、转折落点都能在开机前对着查。
+	//    只告警不拦：手工 plan 不写 beat 是合法的，但不写就失去了这层审查。
+	beats := map[string]int{}
+	for _, sh := range plan.Shots {
+		if b := strings.TrimSpace(sh.Beat); b != "" {
+			beats[b]++
+		}
+	}
+	switch {
+	case len(plan.Shots) >= 4 && len(beats) == 0:
+		issues = append(issues, ShotConsistencyIssue{
+			Level: "WARN", Code: "plan.beat_missing",
+			Msg: "全片没有任何镜头标注节拍（beat）：冷开场/转折这些叙事节奏没法在开机前审查（storyboard 两段式会自动产出，手工 plan 建议补 beat 字段）",
+		})
+	case len(plan.Shots) >= 3 && len(beats) == 1:
+		for b := range beats {
+			issues = append(issues, ShotConsistencyIssue{
+				Level: "WARN", Code: "plan.beat_monotone",
+				Msg: fmt.Sprintf("%d 镜全是同一节拍「%s」：没有钩子-发展-转折的节奏变化，片子会平", len(plan.Shots), b),
+			})
+		}
+	}
+	if len(beats) > 1 {
+		if b := strings.TrimSpace(plan.Shots[0].Beat); b != "" && b != "hook" && !strings.Contains(b, "钩") {
+			issues = append(issues, ShotConsistencyIssue{
+				Level: "WARN", Code: "plan.no_cold_open", ShotID: plan.Shots[0].ID,
+				Msg: fmt.Sprintf("首镜节拍是「%s」：冷开场钩子缺失（第一拍应当是悬念/奇观/冲突预告，而不是背景交代）", b),
+			})
+		}
+	}
+
 	return issues
 }
 

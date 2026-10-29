@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"flowedge/backend/model"
 )
@@ -36,6 +37,23 @@ const storyboardInstruction = `你是短剧分镜师。把用户的内容需求�
 9. 台词默认「无对白」；只有用户明确给出台词时才写「身份：原话」，每句不超过 10 个字
 10. character 字段写死角色外貌与衣着（H3 没有跨镜记忆，靠逐镜重复维持一致性）
 
+镜头语法词表（shot_size/angle/camera/light 从词表取词；light 可追加色彩与方向修饰）：
+- shot_size：大远景 / 远景 / 全景 / 中景 / 中近景 / 近景 / 特写 / 大特写
+- angle：平视 / 仰拍 / 俯拍 / 顶拍 / 荷兰角
+- camera：固定 / 缓慢推近 / 缓慢拉远 / 横移 / 跟拍 / 摇
+- light：正午硬光 / 阴天柔光 / 黄金时刻 / 蓝调时刻 / 夜景霓虹 / 冷月光 / 烛光暖光 / 侧逆光
+
+节奏型（按节拍给镜头组选景别序列，相邻两镜景别只差一档，不要逐镜随机）：
+- 建立序列：远景/全景（固定或缓慢推近）→ 中景 → 近景
+- 对话序列：中景（双人）→ 近景 → 特写（情绪点）
+- 冲突序列：近景跟拍 → 特写 → 全景（拉开距离看局势）
+- 收束序列：中景 → 全景（缓慢拉远，留白）
+
+结构约束（给了节拍表就逐镜对齐；没给就按六拍名自判）：
+11. 首镜必须是钩子：悬念/奇观/冲突预告之一，不许平铺直叙交代背景
+12. 每镜的 beat 填所属节拍名（hook/setup/develop/clash/turn/finish）；转折拍（turn）优先近景/特写并给音乐
+13. 相邻镜头的运镜与景别不许完全相同（全片「固定+中景」会像幻灯片）
+
 输出 JSON 结构（严格照此，不要多字段）：
 {
   "title": "片名",
@@ -46,6 +64,7 @@ const storyboardInstruction = `你是短剧分镜师。把用户的内容需求�
     {
       "id": 1,
       "seconds": 5.0,
+      "beat": "hook",
       "shot_size": "中景",
       "angle": "平视",
       "axis": "A侧",
@@ -75,6 +94,8 @@ func (e *EngineV2) execStoryboardNode(ctx context.Context, node *model.NodeInsta
 	if maxShots < 1 {
 		maxShots = 8
 	}
+	style, _ := node.Data["style"].(string)
+	characters, _ := node.Data["characters"].(string)
 
 	release := e.enterLanguageSide("")
 	defer release()
@@ -82,24 +103,24 @@ func (e *EngineV2) execStoryboardNode(ctx context.Context, node *model.NodeInsta
 	if e.llm == nil {
 		return nil, fmt.Errorf("LLM 服务不可用，无法规划分镜")
 	}
-	user := fmt.Sprintf("目标总时长：%d 秒。镜头数量不超过 %d 个（时长按内容给，3–8 秒/镜）。\n内容需求：%s", target, maxShots, brief)
-	raw, err := e.llm.ChatWithModel(storyboardInstruction+"\n\n"+user, e.llm.Model)
+	// 两段式：先结构（故事/角色圣经/节拍表）后分镜；结构层失败自动回退单段式
+	plan, bp, err := planShotCreatively(e.llm, e.llm.Model, brief, style, characters, target, maxShots)
 	if err != nil {
 		return nil, err
 	}
-	plan, perr := ParseShotPlan(raw)
-	if perr != nil {
-		return nil, fmt.Errorf("%w（原始输出片段：%.200s）", perr, raw)
-	}
 	planJSON := toJSON(plan)
-	return map[string]interface{}{
+	out := map[string]interface{}{
 		"text":   planJSON, // 供下游 shotlist 直接吃
 		"plan":   planJSON,
 		"shots":  len(plan.Shots),
 		"title":  plan.Title,
 		"style":  plan.Style,
 		"target": target,
-	}, nil
+	}
+	if bp != nil {
+		out["structure"] = toJSON(bp) // 结构层产物（故事/角色/节拍），供审阅与回放
+	}
+	return out, nil
 }
 
 // shotResult 单镜执行结果（写进入 run 的输出，便于回溯）
@@ -945,7 +966,19 @@ func verifyDialogueLine(asr *ASRService, path, expect string) (passed, checked b
 	if err != nil {
 		return false, false
 	}
-	return strings.Contains(stripAllSpace(text), stripAllSpace(expect)), true
+	return strings.Contains(stripASRPunct(text), stripASRPunct(expect)), true
+}
+
+// stripASRPunct 验词只比字、不比标点：faster-whisper 对同一句台词可能回全角
+// 标点、半角标点或完全不回（实测「晚安，今晚的海很平静。」三种都出过，
+// 连 TTS 念轨本尊都转不出全角句号）——按标点严格比对会把念对的台词判死。
+func stripASRPunct(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		return -1
+	}, s)
 }
 
 // gateFailMessage 门检失败的完整违约清单（用户照着改 plan，不用翻日志）
