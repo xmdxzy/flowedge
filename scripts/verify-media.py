@@ -48,7 +48,13 @@ AV_SYNC_TOL = 0.20          # 音视频总时长偏差 >0.2s → 拼接丢段
 SILENCE_MIN = 0.45          # 中段静音 >0.45s → 疑似断音（正常呼吸间隔都短于此）
 SILENCE_EDGE = 0.60         # 片头片尾各留 0.6s 不算（淡入淡出）
 CLIP_DB = -0.5              # 峰值超过此值 → 削波
-QUIET_MEAN_DB = -42.0       # 整片均值低于此值 → 基本没声音
+QUIET_MEAN_DB = -42.0       # 整片均值低于此值 → 基本没声音（硬伤）
+# 交付电平：低于此值不算「没声音」，但已经不在可交付区间（-23 ~ -16 dB）。
+# 为什么单独一档：2026-10-25 实测 video 单镜产物 mean=-41.0dB，旧阈值 -42 判它「通过」，
+# 而耳朵上已经听不清。阈值掩盖偏差，比没有阈值更坏。
+DELIVER_MEAN_DB = -30.0
+DELIVER_HINT = ("交付电平偏低：用 loudnorm 收口（站内「产物 → 测响度 → 响度归一」一键完成，"
+                "目标 -16 LUFS / 峰值 -1.5dB）")
 
 
 def find_bin(name: str) -> str:
@@ -282,7 +288,10 @@ def verify(path: str, want_asr: bool, frames_dir: str | None, expect: str = "",
         if "max" in lv and lv["max"] > CLIP_DB:
             issues.append((WARN, "clip", f"峰值 {lv['max']}dB 已削波（批量拼接前建议 loudnorm）"))
         if "mean" in lv and lv["mean"] < QUIET_MEAN_DB:
-            issues.append((WARN, "too_quiet", f"均值 {lv['mean']}dB 近乎无声"))
+            # 低于 -42dB 就是听不见，不该只记 WARN 放过
+            issues.append((FAIL, "silent", f"均值 {lv['mean']}dB 近乎无声（低于 {QUIET_MEAN_DB}dB，属硬伤）"))
+        elif "mean" in lv and lv["mean"] < DELIVER_MEAN_DB:
+            issues.append((WARN, "too_quiet", f"均值 {lv['mean']}dB 低于交付电平 {DELIVER_MEAN_DB}dB。{DELIVER_HINT}"))
 
     # 6) ASR 抽检（乱语/不该有的人声）
     if want_asr and os.path.isfile(path):

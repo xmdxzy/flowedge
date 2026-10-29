@@ -509,6 +509,77 @@
               "path": "ref_audio"
             }
           ]
+        },
+        {
+          "key": "text_overlay",
+          "label": "贴字（可选）",
+          "type": "textarea",
+          "default": "",
+          "hint": "出片后由 ffmpeg 贴上去的固定文字（标题/招牌）；换行用 \\n。留空=不贴。模型自己写小字/长句会糊，要精确文案就走这里（零显存、可重跑）"
+        },
+        {
+          "key": "overlay_srt",
+          "label": "字幕文件（可选）",
+          "type": "path",
+          "default": "",
+          "hint": "填 .srt/.ass 路径就按时间轴烧进画面；填了优先于上面的固定文字"
+        },
+        {
+          "key": "overlay_position",
+          "label": "文字位置",
+          "type": "text",
+          "default": "bottom",
+          "hint": "bottom / top / center"
+        },
+        {
+          "key": "overlay_style",
+          "label": "文字样式",
+          "type": "text",
+          "default": "caption",
+          "hint": "caption 常规字幕 / title 片名大标题（带淡入与压暗带）/ plate 底板卡片 / lower_third 左下信息条（带金线）"
+        },
+        {
+          "key": "overlay_scale",
+          "label": "贴字前上采样高度",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 1080,
+          "hint": "0=保持原分辨率。608×352 直接烧字会像素化，填 720 或 1080 先放大再排字，字才立得住（只上不下）"
+        },
+        {
+          "key": "overlay_size",
+          "label": "字号 px",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 200,
+          "hint": "0 = 按画面高度自动（h/22）"
+        },
+        {
+          "key": "overlay_box",
+          "label": "文字加底板",
+          "type": "bool",
+          "default": false,
+          "hint": "半透明黑底，花背景上也看得清"
+        },
+        {
+          "key": "overlay_from",
+          "label": "出现时间 s",
+          "type": "float",
+          "default": 0,
+          "min": 0,
+          "max": 600,
+          "hint": "0 = 全程显示"
+        },
+        {
+          "key": "overlay_to",
+          "label": "消失时间 s",
+          "type": "float",
+          "default": -1,
+          "min": -1,
+          "max": 600,
+          "hint": "-1 = 到片尾"
         }
       ],
       "nodes": [
@@ -529,12 +600,11 @@
             "height": 352,
             "frames": 124,
             "fps": 24,
-            "steps": 12,
             "negative": "",
             "low_vram": false,
             "segments": 1,
             "interp": false,
-            "turbo": true,
+            "turbo": false,
             "prompt_opt": true,
             "ref_images": [],
             "ref_audio": []
@@ -674,6 +744,77 @@
           "label": "质量循环",
           "type": "bool",
           "default": false
+        },
+        {
+          "key": "text_overlay",
+          "label": "贴字（可选）",
+          "type": "textarea",
+          "default": "",
+          "hint": "出片后由 ffmpeg 贴上去的固定文字（标题/招牌）；换行用 \\n。留空=不贴。模型自己写小字/长句会糊，要精确文案就走这里（零显存、可重跑）"
+        },
+        {
+          "key": "overlay_srt",
+          "label": "字幕文件（可选）",
+          "type": "path",
+          "default": "",
+          "hint": "填 .srt/.ass 路径就按时间轴烧进画面；填了优先于上面的固定文字"
+        },
+        {
+          "key": "overlay_position",
+          "label": "文字位置",
+          "type": "text",
+          "default": "bottom",
+          "hint": "bottom / top / center"
+        },
+        {
+          "key": "overlay_style",
+          "label": "文字样式",
+          "type": "text",
+          "default": "caption",
+          "hint": "caption 常规字幕 / title 片名大标题（带淡入与压暗带）/ plate 底板卡片 / lower_third 左下信息条（带金线）"
+        },
+        {
+          "key": "overlay_scale",
+          "label": "贴字前上采样高度",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 1080,
+          "hint": "0=保持原分辨率。608×352 直接烧字会像素化，填 720 或 1080 先放大再排字，字才立得住（只上不下）"
+        },
+        {
+          "key": "overlay_size",
+          "label": "字号 px",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 200,
+          "hint": "0 = 按画面高度自动（h/22）"
+        },
+        {
+          "key": "overlay_box",
+          "label": "文字加底板",
+          "type": "bool",
+          "default": false,
+          "hint": "半透明黑底，花背景上也看得清"
+        },
+        {
+          "key": "overlay_from",
+          "label": "出现时间 s",
+          "type": "float",
+          "default": 0,
+          "min": 0,
+          "max": 600,
+          "hint": "0 = 全程显示"
+        },
+        {
+          "key": "overlay_to",
+          "label": "消失时间 s",
+          "type": "float",
+          "default": -1,
+          "min": -1,
+          "max": 600,
+          "hint": "-1 = 到片尾"
         }
       ],
       "nodes": [
@@ -705,12 +846,11 @@
             "height": 352,
             "frames": 124,
             "fps": 24,
-            "steps": 12,
             "negative": "",
             "low_vram": false,
             "segments": 2,
             "interp": false,
-            "turbo": true
+            "turbo": false
           }
         },
         {
@@ -828,6 +968,21 @@
           ]
         },
         {
+          "key": "batch_size",
+          "label": "多镜合批",
+          "type": "int",
+          "default": 3,
+          "min": 0,
+          "max": 8,
+          "hint": "≥2 时把连续的非台词镜合并成一张图提交（省每镜重搬 TE/DiT/VAE 的时间，3 镜实测 ~2 倍速）。0=关。批量失败自动回退逐镜",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "batch_size"
+            }
+          ]
+        },
+        {
           "key": "audio_check",
           "label": "音频抽检",
           "type": "bool",
@@ -852,6 +1007,174 @@
               "path": "consistency_check"
             }
           ]
+        },
+        {
+          "key": "interp",
+          "label": "48fps 插帧",
+          "type": "bool",
+          "default": false,
+          "hint": "CPU minterpolate 补帧：慢镜/推摇尚可，大动作会糊。不占显存",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "interp"
+            }
+          ]
+        },
+        {
+          "key": "audio_master",
+          "label": "响度归一",
+          "type": "bool",
+          "default": true,
+          "hint": "装配后把音轨归一到目标响度（只重编码音轨，视频流原样 copy）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "audio_master"
+            }
+          ]
+        },
+        {
+          "key": "lufs",
+          "label": "目标响度 (LUFS)",
+          "type": "int",
+          "default": -16,
+          "min": -23,
+          "max": -9,
+          "hint": "-16 适合网络播放；-14 更响；超过 -9 会压扁动态",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "lufs"
+            }
+          ]
+        },
+        {
+          "key": "bgm",
+          "label": "BGM 文件（可选）",
+          "type": "text",
+          "default": "",
+          "hint": "留空=不混。给音频路径则按 bgm_gain 铺底，并在人声处自动让位",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "bgm"
+            }
+          ]
+        },
+        {
+          "key": "bgm_gain",
+          "label": "BGM 电平 (dB)",
+          "type": "int",
+          "default": -18,
+          "min": -40,
+          "max": 0,
+          "hint": "相对原音轨的电平：BGM 是底，不是主角",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "bgm_gain"
+            }
+          ]
+        },
+        {
+          "key": "bgm_duck",
+          "label": "BGM 自动让位",
+          "type": "bool",
+          "default": true,
+          "hint": "用原音轨做旁链压缩：有人声/强环境声时 BGM 自动压低",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "bgm_duck"
+            }
+          ]
+        },
+        {
+          "key": "reshoot_max",
+          "label": "定点重拍轮数",
+          "type": "int",
+          "default": 1,
+          "min": 0,
+          "max": 3,
+          "hint": "单镜验收不过（缺音轨/帧数不足/音画漂移）只重拍那一镜；0=不重拍",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "reshoot_max"
+            }
+          ]
+        },
+        {
+          "key": "text_overlay",
+          "label": "贴字（可选）",
+          "type": "textarea",
+          "default": "",
+          "hint": "出片后由 ffmpeg 贴上去的固定文字（标题/招牌）；换行用 \\n。留空=不贴。模型自己写小字/长句会糊，要精确文案就走这里（零显存、可重跑）"
+        },
+        {
+          "key": "overlay_srt",
+          "label": "字幕文件（可选）",
+          "type": "path",
+          "default": "",
+          "hint": "填 .srt/.ass 路径就按时间轴烧进画面；填了优先于上面的固定文字"
+        },
+        {
+          "key": "overlay_position",
+          "label": "文字位置",
+          "type": "text",
+          "default": "bottom",
+          "hint": "bottom / top / center"
+        },
+        {
+          "key": "overlay_style",
+          "label": "文字样式",
+          "type": "text",
+          "default": "caption",
+          "hint": "caption 常规字幕 / title 片名大标题（带淡入与压暗带）/ plate 底板卡片 / lower_third 左下信息条（带金线）"
+        },
+        {
+          "key": "overlay_scale",
+          "label": "贴字前上采样高度",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 1080,
+          "hint": "0=保持原分辨率。608×352 直接烧字会像素化，填 720 或 1080 先放大再排字，字才立得住（只上不下）"
+        },
+        {
+          "key": "overlay_size",
+          "label": "字号 px",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 200,
+          "hint": "0 = 按画面高度自动（h/22）"
+        },
+        {
+          "key": "overlay_box",
+          "label": "文字加底板",
+          "type": "bool",
+          "default": false,
+          "hint": "半透明黑底，花背景上也看得清"
+        },
+        {
+          "key": "overlay_from",
+          "label": "出现时间 s",
+          "type": "float",
+          "default": 0,
+          "min": 0,
+          "max": 600,
+          "hint": "0 = 全程显示"
+        },
+        {
+          "key": "overlay_to",
+          "label": "消失时间 s",
+          "type": "float",
+          "default": -1,
+          "min": -1,
+          "max": 600,
+          "hint": "-1 = 到片尾"
         }
       ],
       "nodes": [
@@ -880,10 +1203,12 @@
             "width": 608,
             "height": 352,
             "steps": 12,
-            "turbo": true,
+            "pdd": true,
+            "turbo": false,
             "audio_check": true,
             "interp": false,
-            "consistency_check": true
+            "consistency_check": true,
+            "loudness_min_db": -30
           }
         },
         {
@@ -930,6 +1255,36 @@
           ]
         },
         {
+          "key": "voice",
+          "label": "声线",
+          "type": "enum",
+          "default": "zh_female_warm",
+          "options": [
+            "zh_female_warm",
+            "zh_female_calm",
+            "zh_male_deep",
+            "zh_male_young",
+            "zh_narrator",
+            "anime_moe",
+            "anime_genki",
+            "anime_healing",
+            "anime_tsundere",
+            "anime_idol",
+            "anime_mix_heal70",
+            "anime_mix_5050",
+            "anime_mix_moe70",
+            "en_female_warm",
+            "en_male_narrator"
+          ],
+          "hint": "Breeze TTS 2 内置音色设计预设；anime_* 是年轻女声/二次元，anime_mix_* 是「甜萌×温柔」的调和版。要用克隆音色请用下面的「参考音色」。",
+          "bind": [
+            {
+              "node": "tts-1",
+              "path": "voice"
+            }
+          ]
+        },
+        {
           "key": "ref_audio",
           "label": "参考音色（可选）",
           "type": "path",
@@ -956,7 +1311,8 @@
           "data": {
             "text": "",
             "voice": "",
-            "ref_audio": ""
+            "ref_audio": "",
+            "timeout_ms": 900000
           }
         },
         {
@@ -1126,6 +1482,21 @@
           ]
         },
         {
+          "key": "batch_size",
+          "label": "多镜合批",
+          "type": "int",
+          "default": 3,
+          "min": 0,
+          "max": 8,
+          "hint": "≥2 时把连续的非台词镜合并成一张图提交（省每镜重搬 TE/DiT/VAE 的时间，3 镜实测 ~2 倍速）。0=关。批量失败自动回退逐镜",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "batch_size"
+            }
+          ]
+        },
+        {
           "key": "audio_check",
           "label": "音频抽检",
           "type": "bool",
@@ -1150,6 +1521,174 @@
               "path": "consistency_check"
             }
           ]
+        },
+        {
+          "key": "interp",
+          "label": "48fps 插帧",
+          "type": "bool",
+          "default": false,
+          "hint": "CPU minterpolate 补帧：慢镜/推摇尚可，大动作会糊。不占显存",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "interp"
+            }
+          ]
+        },
+        {
+          "key": "audio_master",
+          "label": "响度归一",
+          "type": "bool",
+          "default": true,
+          "hint": "装配后把音轨归一到目标响度（只重编码音轨，视频流原样 copy）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "audio_master"
+            }
+          ]
+        },
+        {
+          "key": "lufs",
+          "label": "目标响度 (LUFS)",
+          "type": "int",
+          "default": -16,
+          "min": -23,
+          "max": -9,
+          "hint": "-16 适合网络播放；-14 更响；超过 -9 会压扁动态",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "lufs"
+            }
+          ]
+        },
+        {
+          "key": "bgm",
+          "label": "BGM 文件（可选）",
+          "type": "text",
+          "default": "",
+          "hint": "留空=不混。给音频路径则按 bgm_gain 铺底，并在人声处自动让位",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "bgm"
+            }
+          ]
+        },
+        {
+          "key": "bgm_gain",
+          "label": "BGM 电平 (dB)",
+          "type": "int",
+          "default": -18,
+          "min": -40,
+          "max": 0,
+          "hint": "相对原音轨的电平：BGM 是底，不是主角",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "bgm_gain"
+            }
+          ]
+        },
+        {
+          "key": "bgm_duck",
+          "label": "BGM 自动让位",
+          "type": "bool",
+          "default": true,
+          "hint": "用原音轨做旁链压缩：有人声/强环境声时 BGM 自动压低",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "bgm_duck"
+            }
+          ]
+        },
+        {
+          "key": "reshoot_max",
+          "label": "定点重拍轮数",
+          "type": "int",
+          "default": 1,
+          "min": 0,
+          "max": 3,
+          "hint": "单镜验收不过（缺音轨/帧数不足/音画漂移）只重拍那一镜；0=不重拍",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "reshoot_max"
+            }
+          ]
+        },
+        {
+          "key": "text_overlay",
+          "label": "贴字（可选）",
+          "type": "textarea",
+          "default": "",
+          "hint": "出片后由 ffmpeg 贴上去的固定文字（标题/招牌）；换行用 \\n。留空=不贴。模型自己写小字/长句会糊，要精确文案就走这里（零显存、可重跑）"
+        },
+        {
+          "key": "overlay_srt",
+          "label": "字幕文件（可选）",
+          "type": "path",
+          "default": "",
+          "hint": "填 .srt/.ass 路径就按时间轴烧进画面；填了优先于上面的固定文字"
+        },
+        {
+          "key": "overlay_position",
+          "label": "文字位置",
+          "type": "text",
+          "default": "bottom",
+          "hint": "bottom / top / center"
+        },
+        {
+          "key": "overlay_style",
+          "label": "文字样式",
+          "type": "text",
+          "default": "caption",
+          "hint": "caption 常规字幕 / title 片名大标题（带淡入与压暗带）/ plate 底板卡片 / lower_third 左下信息条（带金线）"
+        },
+        {
+          "key": "overlay_scale",
+          "label": "贴字前上采样高度",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 1080,
+          "hint": "0=保持原分辨率。608×352 直接烧字会像素化，填 720 或 1080 先放大再排字，字才立得住（只上不下）"
+        },
+        {
+          "key": "overlay_size",
+          "label": "字号 px",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 200,
+          "hint": "0 = 按画面高度自动（h/22）"
+        },
+        {
+          "key": "overlay_box",
+          "label": "文字加底板",
+          "type": "bool",
+          "default": false,
+          "hint": "半透明黑底，花背景上也看得清"
+        },
+        {
+          "key": "overlay_from",
+          "label": "出现时间 s",
+          "type": "float",
+          "default": 0,
+          "min": 0,
+          "max": 600,
+          "hint": "0 = 全程显示"
+        },
+        {
+          "key": "overlay_to",
+          "label": "消失时间 s",
+          "type": "float",
+          "default": -1,
+          "min": -1,
+          "max": 600,
+          "hint": "-1 = 到片尾"
         }
       ],
       "nodes": [
@@ -1162,10 +1701,12 @@
             "width": 608,
             "height": 352,
             "steps": 12,
-            "turbo": true,
+            "pdd": true,
+            "turbo": false,
             "audio_check": true,
             "interp": false,
-            "consistency_check": true
+            "consistency_check": true,
+            "loudness_min_db": -30
           }
         },
         {

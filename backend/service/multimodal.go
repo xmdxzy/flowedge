@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,11 @@ type Text2ImageService struct {
 	// Instances 模型 → ComfyUI 实例路由（data/instances.json）。
 	// nil 时按 kind 直接选 BaseURL / H3BaseURL，行为与改造前一致。
 	Instances *InstanceRegistry
+
+	// evictMu 保护 lastEvictBase：跨实例腾显存时要知道「上一次跑在哪个实例」，
+	// 同实例连续跑（film 的逐镜、image_batch 的逐张）就直接跳过，一次 HTTP 都不发。
+	evictMu       sync.Mutex
+	lastEvictBase string
 
 	client *http.Client
 }
@@ -572,11 +578,21 @@ func (s *TTSService) SynthesizeWith(text string, outputPath string, opt TTSOptio
 	return "", fmt.Errorf("%w: TTS 不可用：未配置 TTS_BASE_URL，且当前系统不支持 Windows 内置语音（非 Windows，或已设置 FLOWEDGE_TTS_SAPI=0）", ErrServiceNotConfigured)
 }
 
+// ttsFirstCallBudget HTTP 预算的固定部分：买「模型此刻不在显存里」这件事。
+//
+// Breeze TTS 2（3.47B BF16）冷加载实测 180s（2026-10-27 逐 10 秒采样确认：
+// 3.0GB → 11.5GB → 19.9GB，loaded=true 恰好 180s）。旧值 60s 意味着
+// 「服务刚起」或「被显存仲裁卸载后」的每一次请求都会在 HTTP 层超时，
+// 而服务端其实正在正常加载——节点只看到 timeout，看不出是预算不够。
+// 240s = 180s 实测 + 服务启动/首句余量。
+const ttsFirstCallBudget = 240 * time.Second
+
 // synthesizeHTTP 走本地 / 远程 TTS 服务
 //
 // 超时按工作量估，不用魔法常数：Audio8-TTS 0.6B 在本机实测 RTF 7.9（默认音色）/
-// 18~32（克隆音色），即 1 秒音频要 8~32 秒算。所以预算 = 60s 固定（模型加载 + 首帧）
-// + 每字 1.5s，封顶 20 分钟。60 字台词 ⇒ 约 150s，够覆盖克隆模式的最坏情况。
+// 18~32（克隆音色），即 1 秒音频要 8~32 秒算。所以预算 = ttsFirstCallBudget
+// （覆盖冷加载 + 首帧）+ 每字 1.5s，封顶 20 分钟。60 字台词 ⇒ 约 390s，
+// 同时覆盖 Breeze 的 180s 冷加载与 Audio8 克隆模式的最坏情况。
 func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptions) error {
 	reqBody := map[string]interface{}{
 		"text": text,
@@ -601,7 +617,7 @@ func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptio
 	}
 	jsonBody, _ := json.Marshal(reqBody)
 
-	budget := 60*time.Second + time.Duration(len([]rune(text)))*1500*time.Millisecond
+	budget := ttsFirstCallBudget + time.Duration(len([]rune(text)))*1500*time.Millisecond
 	if budget > 20*time.Minute {
 		budget = 20 * time.Minute
 	}
@@ -642,6 +658,86 @@ func (s *TTSService) synthesizeHTTP(text string, outputPath string, opt TTSOptio
 		return fmt.Errorf("tts service returned too-small audio (%d bytes)", n)
 	}
 	return nil
+}
+
+// Unload 请求服务端释放模型与显存（POST /unload），**进程保留**。
+//
+// 用途：扩散侧（H3 权重 20.5GB）要整张卡时让语音侧让位。Breeze TTS 2 驻留
+// 实测 15–20GB，两者物理上装不下；不放掉它，扩散只能退化成部分加载
+// （实测 87s → 2269s）或直接 failed。
+//
+// 选 /unload 而不是停进程：下次合成只需重新加载权重，省掉进程启动与端口探测；
+// 且服务仍 Healthy，execTTSNode 不会误判成「没起」再走一遍 Start 流程。
+//
+// 后端不支持该端点（Kokoro / Audio8 / SAPI）时返回错误，调用方应退回停服务。
+func (s *TTSService) Unload() error {
+	if s.BaseURL == "" {
+		return fmt.Errorf("tts service not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.BaseURL+"/unload", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("backend does not support /unload")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unload returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// TTSVRAM TTS 服务进程侧的显存读数（/health 的 vram 字段，单位 MiB）。
+//
+// 为什么要这个：空闲回收器必须在**卸载之前**判断「卸完还装不装得回来」。
+// Breeze 快路径要 20.3GiB 空闲才加载得动（见 tts_breeze_server.py 的预检），
+// 盲目卸掉只会得到一个「loaded=false 且下次必然失败」的服务——比不卸更糟。
+//
+// ReservedMB 是判据而不是 AllocatedMB：caching allocator 保留的块
+// （含 CUDA Graph 私有池）同样占着设备，卸载后这部分才会还给驱动。
+type TTSVRAM struct {
+	AllocatedMB int `json:"allocated_mb"`
+	ReservedMB  int `json:"reserved_mb"`
+	FreeMB      int `json:"free_mb"`
+	TotalMB     int `json:"total_mb"`
+}
+
+// VRAMInfo 读 TTS 服务的显存读数。后端不提供 /health 的 vram 段时返回零值 + 错误，
+// 调用方应当按「不知道」处理，而不是按「0」处理。
+func (s *TTSService) VRAMInfo() (TTSVRAM, error) {
+	var out TTSVRAM
+	if s.BaseURL == "" {
+		return out, fmt.Errorf("tts service not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.BaseURL+"/health", nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return out, fmt.Errorf("health returned status %d", resp.StatusCode)
+	}
+	var body struct {
+		Loaded bool    `json:"loaded"`
+		VRAM   TTSVRAM `json:"vram"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return out, err
+	}
+	return body.VRAM, nil
 }
 
 // VideoService 视频处理服务（FFmpeg）

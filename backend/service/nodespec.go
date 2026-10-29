@@ -72,9 +72,13 @@ var NodeSpecs = map[string]NodeSpec{
 	}},
 	"shotlist": {Type: "shotlist", Side: sideDiffusion, Heavy: true, Media: true,
 		Timeout: shotListTimeout, MaxTimeout: maxShotlistTimeout},
+	// comfy 逃生舱：跑用户自备的 ComfyUI 图。图内容未知 ⇒ 按重节点处理
+	//（采样显存峰值），超时默认 20 分钟、上限 2 小时（comfyNodeTimeout 内部夹紧）。
+	"comfy": {Type: "comfy", Side: sideDiffusion, Heavy: true, Media: true,
+		Timeout: comfyNodeTimeout, MaxTimeout: comfyMaxTimeout},
 
 	// ---- 语音侧：CPU，但与扩散权重抢内存带宽 ----
-	"tts": {Type: "tts", Side: sideAudio, Media: true},
+	"tts": {Type: "tts", Side: sideAudio, Media: true, Timeout: ttsTimeout},
 }
 
 // NodeSpecOf 查节点元数据。未登记的类型返回零值 + false，
@@ -223,7 +227,33 @@ func shotListTimeout(n *model.NodeInstance) time.Duration {
 		// 分镜表来自上游节点（storyboard），编译期读不到 → 给类型上限，运行期再细分
 		return maxShotlistTimeout
 	}
-	return ShotListBudget(shots, totalFrames)
+	// 预算按「帧 × 分辨率 × 步数」算，不是固定每镜 N 分钟：
+	// 768×448@20 步的成本是 608×352@12 步的 2.5 倍，只按帧数会给少一半预算。
+	return ShotListBudget(shots, totalFrames,
+		int(fieldFloat(n, "width", 608)),
+		int(fieldFloat(n, "height", 352)),
+		int(fieldFloat(n, "steps", 12)))
+}
+
+// ttsTimeout 语音合成超时。
+//
+// 这个节点原先没有 Timeout，吃的是 defaultNodeTimeout = 180s——而 Breeze TTS 2
+// （3.47B BF16）的**冷加载实测正好 180s**（2026-10-27 现场用 GPU Process Memory
+// 逐 10 秒采样：3.0GB → 11.5GB → 19.9GB，loaded=true 用了 180s）。两数打平 ⇒
+// 「服务被卸载后第一次请求」必然超时失败，报 node timeout after 3m0s（run #288 实发生）。
+//
+// 热合成很快（实测 5s/句），所以预算主要是买「模型不在显存里」这件事：
+//
+//	5 分钟基础  覆盖 180s 冷加载 + 服务进程拉起/就绪 + 首句
+//	每字 200ms  长台词的自回归成本（Breeze 自回归，长文本容易跑飞）
+//
+// 上限由 maxNodeTimeout（30 分钟）兜底，长文本不会被误杀。
+func ttsTimeout(n *model.NodeInstance) time.Duration {
+	text := fieldString(n, "text")
+	if text == "" {
+		text = fieldString(n, "prompt")
+	}
+	return 5*time.Minute + time.Duration(len([]rune(text)))*200*time.Millisecond
 }
 
 // fieldString 读节点字符串字段（取不到返回空串，让调用方自己判空）。

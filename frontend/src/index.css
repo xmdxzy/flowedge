@@ -176,3 +176,47 @@ body{font-family:system-ui,'Microsoft YaHei UI','PingFang SC',sans-serif;font-si
 .runs-layout{grid-template-columns:1fr;grid-template-rows:minmax(160px,34vh) 1fr}
 .artifacts-bar__right .mono{max-width:40vw}
 }
+
+/* ---- 画布（CanvasPage）：与出片台同一份数据的第二个视图 ---- */
+.cv-layout{display:grid;grid-template-columns:236px minmax(420px,1fr) 330px;gap:10px;padding:10px;height:100%;min-height:0}
+.cv-side{display:flex;flex-direction:column;gap:10px;min-height:0;overflow:auto}
+.cv-list{display:flex;flex-direction:column;gap:4px;max-height:280px;overflow:auto}
+.cv-item{appearance:none;text-align:left;border:1px solid var(--line);background:var(--panel-2);color:var(--text);border-radius:8px;padding:7px 9px;font:inherit;font-size:12px;cursor:pointer;display:flex;flex-direction:column;gap:2px}
+.cv-item:hover{border-color:var(--brand)}
+.cv-item__name{font-weight:600}
+.cv-item__meta{color:var(--muted);font-size:11px}
+.cv-add{display:flex;gap:6px}
+.cv-main{display:flex;flex-direction:column;gap:8px;min-height:0}
+.cv-bar{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.cv-bar__name{max-width:260px}
+.cv-bar__right{margin-left:auto;display:flex;gap:6px}
+.cv-flow{flex:1;min-height:420px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel-2)}
+.cv-node{min-width:158px;padding:8px 10px;border-radius:9px;border:1px solid var(--line-2);background:var(--panel);color:var(--text);font-size:12px;box-shadow:0 2px 10px rgba(0,0,0,.18)}
+.cv-node--err{border-color:var(--danger);box-shadow:0 0 0 1px var(--danger-soft),0 2px 10px rgba(0,0,0,.2)}
+.cv-node--sel{border-color:var(--brand)}
+.cv-node__hd{display:flex;align-items:baseline;gap:6px}
+.cv-node__label{font-weight:600}
+.cv-node__type{font-size:10px;color:var(--muted-2)}
+.cv-node__badge{margin-top:5px;font-size:10px;padding:1px 6px;border-radius:999px;display:inline-block}
+.cv-node__badge--err{color:var(--danger);background:var(--danger-soft)}
+.cv-node__badge--warn{color:var(--warn);background:var(--warn-soft)}
+.cv-port{width:9px;height:9px;border-radius:50%;border:2px solid var(--panel);background:var(--muted)}
+.cv-port--text{background:var(--cyan)}
+.cv-port--image{background:var(--brand)}
+.cv-port--video{background:var(--ok)}
+.cv-port--audio{background:var(--warn)}
+.cv-port--any{background:var(--muted-2)}
+.cv-port--req{box-shadow:0 0 0 2px var(--brand-soft)}
+.cv-fields{display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow:auto}
+.cv-insp__hd{display:flex;justify-content:space-between;align-items:center;font-size:12px}
+.cv-insp__del{margin-left:auto}
+.cv-report{display:flex;flex-direction:column;gap:7px;max-height:40vh;overflow:auto}
+.cv-est{border-top:1px dashed var(--line);padding-top:6px;display:flex;flex-direction:column;gap:2px}
+.cv-est__main{font-size:15px;font-weight:600;color:var(--brand)}
+.cv-deps{display:flex;flex-direction:column;gap:5px}
+.react-flow__attribution{display:none}
+.react-flow__controls button{background:var(--panel);border-bottom:1px solid var(--line);color:var(--text)}
+.react-flow__controls button svg{fill:var(--text)}
+.react-flow__edge-path{stroke:var(--muted-2);stroke-width:1.6}
+.react-flow__edge.selected .react-flow__edge-path{stroke:var(--brand)}
+.react-flow__node{font-family:inherit}.cv-qc{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer}

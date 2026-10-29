@@ -33,10 +33,20 @@ data/*
 # 例外：固定流水线定义是产品形态本身，必须进版本库（运行时数据仍忽略）
 !data/pipelines.json
 backend/data/
-backend/*/data/          # 测试跑出来的临时产物
+# 测试跑出来的临时产物（注意：gitignore 不支持行内注释，模式必须独占一行）
+backend/*/data/
 
 # 就地运行目录（exe + 本地数据库 + 启动脚本，不属于源码）
 /运行/
+
+# 会话日志与运维面板数据（DSH ops）
+.dsh-ops/
+
+# 用户成片目录
+/作品/
+
+# 运行时缓存
+jieba.cache
 
 # IDE
 .idea/

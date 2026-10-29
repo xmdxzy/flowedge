@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ArtifactItem,
   ArtifactListResponse,
   DepListResponse,
@@ -12,6 +12,7 @@ import type {
   RunListResponse,
   RunSummary,
   RerunAccepted,
+  UnloadResult,
 } from './types'
 
 // 后端调用层：只有三件事——取数据、把后端的中文错误原样抛出来、别吞 HTTP 状态。
@@ -37,7 +38,7 @@ export function errorText(err: unknown): string {
   return String(err)
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let resp: Response
   try {
     resp = await fetch(path, init)
@@ -68,7 +69,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (body ?? {}) as T
 }
 
-function postJSON(path: string, payload?: unknown): Promise<unknown> {
+export function postJSON(path: string, payload?: unknown): Promise<unknown> {
   return request<unknown>(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -158,6 +159,17 @@ export function startDep(name: string): Promise<unknown> {
 
 export function stopDep(name: string): Promise<unknown> {
   return postJSON(`/api/deps/${encodeURIComponent(name)}/stop`)
+}
+
+/**
+ * 卸载模型但保留进程：把显存要回来，又不付冷启动代价。
+ *
+ * 和 stop 的区别很关键：stop 杀进程（下次冷启动 30–60 秒 + 权重重载 3 分钟），
+ * unload 只让 ComfyUI 调 /free、让 Ollama 走 keep_alive=0，进程还在。
+ */
+export async function unloadDep(name: string): Promise<UnloadResult> {
+  const data = await postJSON(`/api/deps/${encodeURIComponent(name)}/unload`)
+  return data as UnloadResult
 }
 
 /** 重读 data/deps.json（不重启引擎、不动已跑的进程） */

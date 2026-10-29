@@ -294,6 +294,19 @@ export default function ProducePage({ pipelines, loading, loadError, onReload, o
                 </div>
               )}
 
+              {/* 能跑但不便宜：显存会不会换页、同参数是不是刚跑过。
+                  不拦出片，只把代价说在前面（后端 preflightWarnings）。 */}
+              {(preflightResult?.warnings?.length ?? 0) > 0 && (
+                <section className="panel panel--warn">
+                  <h3 className="panel__title">出片前提醒</h3>
+                  <ul className="mcp__notes">
+                    {preflightResult?.warnings?.map((w) => (
+                      <li key={w}>{w}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+
               {preflightResult && !preflightResult.ok && (
                 <section className="panel panel--warn">
                   <h3 className="panel__title">依赖没就绪，没有提交出片</h3>

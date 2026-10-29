@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,9 +33,18 @@ import (
 type DepStatus struct {
 	Name      string `json:"name"`
 	Label     string `json:"label"`
-	Running   bool   `json:"running"`   // 端口/健康检查通过
+	Running   bool   `json:"running"`   // 端口/健康检查通过，**或**进程活着只是忙
 	Managed   bool   `json:"managed"`   // 由本进程拉起（可停止）
 	Autostart bool   `json:"autostart"` // 启动时自动拉起
+	// Busy 进程明明活着，但 HTTP 忙到不回健康检查。
+	//
+	// 由来（2026-10-26 实测）：H3 在换页状态里 GPU 100%、占 23.8GB，
+	// 但 /system_stats 与 /queue 全都超时不回 → 旧逻辑判 Running=false。
+	// 面板于是显示「未启动」，用户照着点「启动」→ **又派生一份实例**，
+	// 两个进程抢一张卡 —— 这正是那晚 27 倍慢的起点。
+	// 「忙」和「死」必须分开：忙的时候该禁用启动按钮，而不是鼓励再起一个。
+	Busy      bool   `json:"busy,omitempty"`
+	State     string `json:"state,omitempty"` // ok / busy / stopped
 	PID       int    `json:"pid,omitempty"`
 	Endpoint  string `json:"endpoint"`
 	Command   string `json:"command,omitempty"`
@@ -67,6 +77,15 @@ type Supervisor struct {
 	started map[string]bool // 是否由本进程尝试启动过（用于区分「启动后秒退」与「从未启动」）
 	lastErr map[string]string
 	client  *http.Client
+
+	// logDir 托管进程的 stdout/stderr 落盘目录（<部署目录>/logs）。
+	// 空字符串 = 丢弃输出，与改造前行为一致（测试里就不必造目录）。
+	logDir   string
+	procLogs map[string][]*os.File
+
+	// startLocks 每个依赖一把「单飞」启动锁：Start 全程持有，
+	// 防止冷启动窗口内被第二次调用再派生一个实例（见 Start 注释）。
+	startLocks map[string]*sync.Mutex
 }
 
 type depsFile struct {
@@ -89,6 +108,24 @@ type depsFile struct {
 		BaseURL   string   `json:"base_url"`
 		Autostart bool     `json:"autostart"`
 	} `json:"ollama"`
+	// H3 段：ComfyUI-H3 独立工作树的启动参数。
+	//
+	// ReserveVRAM 单独拎出来是因为它是最常被调的那个：24GB 卡上 4GB 预留属于
+	// 「算术不可满足」（见 applyH3Config 注释），做 A/B 时要能一键改、一键回滚。
+	// Args 是整体覆盖口子（等价于环境变量 H3_ARGS，但能写进配置、可 reload）。
+	H3 struct {
+		Args        []string `json:"args"`
+		ReserveVRAM *int     `json:"reserve_vram"`
+		// CacheNone 控制 ComfyUI 的 --cache-none（缺省 true，保持既有行为）。
+		//
+		// 设成 false 会保留缓存。依据（2026-10-26 实测，ComfyUI 自己的日志）：
+		//   `Model MiniMaxH3 prepared for dynamic VRAM loading. 19995MB Staged`
+		//   → `Model Initializing ...` 4 分 14 秒才 complete，之后 8 步采样只用 45 秒
+		//   （1.6 it/s）；而同一进程里已初始化过的提交，12 步只要 29 秒（2.17 s/it）。
+		// 也就是说"每轮 4 分钟初始化"很可能就是 --cache-none 每次重做 staging 造成的。
+		// 这是待 A/B 的假设，不是已证结论——所以做成配置，不直接改默认。
+		CacheNone *bool `json:"cache_none"`
+	} `json:"h3"`
 	TTS struct {
 		Home      string `json:"home"`
 		Script    string `json:"script"`
@@ -100,17 +137,87 @@ type depsFile struct {
 		// 「引擎启动不拉起」只解决开机那段，真正吃显存的是「用过一次之后一直挂着」——
 		// 这个值让服务自己把显存还回去，不用人去点停止。
 		IdleUnload int `json:"idle_unload"`
+		// Device TTS 后端的运行设备（cpu / cuda / 留空 = 服务自己探测）。
+		//
+		// 2026-10-27 起 Go 侧真的用它做**调度决策**：device=cpu 的 TTS 不占显存，
+		// voice 才能进 CPU 道与出片并行（见 queue.go JobClassForNodes）。
+		// 之前这个键只给 Python 服务自己读，Go 侧解析不到 ⇒ 队列只能一刀切按 GPU 串行。
+		Device string `json:"device"`
 	} `json:"tts"`
+	// IdleRelease 空闲显存回收（2026-10-28）。
+	//
+	// 用户的原话是「无任务时释放我的显存啊，flowedge 白白占用了那么多」。
+	// 这一段的语义：**连续 after_seconds 秒没有任何 GPU 活 → 把托管模型的权重
+	// 还回显存**（/unload、/free 都保留进程，下次只付权重加载）。
+	// 判定与执行都在 service/vram_idle.go，不依赖任何服务自己的空闲超时
+	// （那个看不见引擎队列，会在下一镜配音前 5 秒把模型卸掉）。
+	//
+	// 为什么 AfterSeconds 是 *int：
+	//   不写这一段 = 用默认 10 分钟；写 0 = **明确关闭**。
+	//   用普通 int 的话两者都是 0，分不出「没配」和「关掉」。
+	IdleRelease struct {
+		AfterSeconds *int     `json:"after_seconds"`
+		Targets      []string `json:"targets"`
+		TTSMinFreeMB int      `json:"tts_min_free_mb"`
+		TTSGuard     *bool    `json:"tts_guard"`
+	} `json:"idle_release"`
+}
+
+// IdleReclaimPolicy 把 deps.json 的 idle_release 段翻成策略。
+//
+// 缺省即安全：没写这一段时返回 DefaultIdleReclaimPolicy()（10 分钟 + TTS 守卫）。
+// 显式 after_seconds=0 才会关闭——「关掉」必须是有人明确写下的决定，
+// 不能是「配置解析失败」的副作用。
+func (f depsFile) IdleReclaimPolicy() IdleReclaimPolicy {
+	p := DefaultIdleReclaimPolicy()
+	if f.IdleRelease.AfterSeconds != nil {
+		p.After = time.Duration(*f.IdleRelease.AfterSeconds) * time.Second
+	}
+	if len(f.IdleRelease.Targets) > 0 {
+		p.Targets = f.IdleRelease.Targets
+	}
+	if f.IdleRelease.TTSMinFreeMB > 0 {
+		p.TTSMinFreeMB = f.IdleRelease.TTSMinFreeMB
+	}
+	if f.IdleRelease.TTSGuard != nil {
+		p.TTSGuard = *f.IdleRelease.TTSGuard
+	}
+	return p
+}
+
+// LoadIdleReclaimPolicy 读配置并给出空闲回收策略（main 启动时调一次）。
+//
+// 包一层是为了别让调用方去碰未导出的 depsFile 类型；也保证「配置文件不存在」
+// 和「解析失败」都走同一条路径——回落默认策略（10 分钟 + 守卫），而不是静默关闭。
+func LoadIdleReclaimPolicy() IdleReclaimPolicy {
+	return LoadDepsFile().IdleReclaimPolicy()
 }
 
 // depsJSONPath 依赖配置文件的相对路径（引擎启动后会 chdir 到部署目录）
 const depsJSONPath = "data/deps.json"
 
-// LoadDepsFile 读 data/deps.json（不存在或损坏时返回零值，不报错）
+// LoadDepsFile 读 data/deps.json（不存在时返回零值，不报错）
+//
+// 必须剥掉 UTF-8 BOM：Windows 上某些编辑器、以及 Python 的 `encoding="utf-8-sig"`，
+// 都会写出开头的 EF BB BF。Go 的 json.Unmarshal 见到它直接失败
+// （`invalid character 'ï' looking for beginning of value`），**整个文件解析不出来**。
+//
+// 2026-10-26 实测的代价：原来这里写的是 `_ = json.Unmarshal(...)`，错误被静默吞掉，
+// 于是 h3.reserve_vram / h3.args / tts.idle_unload / ollama.autostart 全部静默失效，
+// 引擎一直吃代码内置默认的 `--reserve-vram 4`，而 deps.json 里明明写着 0。
+// 表现是「配置改了、reload 了、重启了，argv 还是 4」，排查了一整天。
+// 现在的契约：剥 BOM；解析失败必须留痕，不许再静默。
 func LoadDepsFile() depsFile {
 	var conf depsFile
-	if raw, err := os.ReadFile(depsJSONPath); err == nil {
-		_ = json.Unmarshal(raw, &conf)
+	raw, err := os.ReadFile(depsJSONPath)
+	if err != nil {
+		return conf // 文件不存在是正常情况，回落代码内置默认
+	}
+	if len(raw) >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF {
+		raw = raw[3:]
+	}
+	if err := json.Unmarshal(raw, &conf); err != nil {
+		log.Printf("[deps] %s 解析失败（%v）——本次所有配置项回落为代码内置默认值", depsJSONPath, err)
 	}
 	return conf
 }
@@ -125,11 +232,13 @@ func TTSBaseURL() string {
 // NewSupervisor 依据配置构造依赖规格；comfyBase/asrBase 用于推导端口
 func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 	s := &Supervisor{
-		specs:   map[string]*DepSpec{},
-		procs:   map[string]*exec.Cmd{},
-		started: map[string]bool{},
-		lastErr: map[string]string{},
-		client:  &http.Client{Timeout: 1500 * time.Millisecond},
+		specs:      map[string]*DepSpec{},
+		procs:      map[string]*exec.Cmd{},
+		started:    map[string]bool{},
+		lastErr:    map[string]string{},
+		procLogs:   map[string][]*os.File{},
+		startLocks: map[string]*sync.Mutex{},
+		client:     &http.Client{Timeout: 1500 * time.Millisecond},
 	}
 
 	var conf = LoadDepsFile()
@@ -197,6 +306,19 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		// 不再默认带 --use-sage-attention：该 venv 里 sageattention 实际没装，
 		// 带上会让进程「启动即退出」（ComfyUI 直接 ERROR 退出，不是降级运行）。
 	}
+	// 配置层覆盖（data/deps.json 的 "h3" 段）：先于环境变量，便于「改配置 → reload → 重启依赖」。
+	//
+	// 加这一段的原因（2026-10-26）：`--reserve-vram 4` 在 24GB 卡上是**算术不可满足**的
+	// —— ComfyUI 全量加载要求「模型 + 4GB」同时空闲（model_management.py:944），
+	// 而 H3 权重约 20GB、桌面 3.1GB，空闲只剩 0.3–0.9GB。
+	// 想验证「降到 1 会不会显著变快」时，原来只能改环境变量并重启**引擎**（因为
+	// H3_ARGS 只在 NewSupervisor 里读一次）。做成配置后，A/B 只需 reload + 重启该依赖。
+	h3Args = applyH3Config(h3Args, conf.H3.Args, conf.H3.ReserveVRAM)
+	// cache_none=false 时去掉 --cache-none（A/B 用；默认仍带着，见 depsFile.H3 注释）
+	if conf.H3.CacheNone != nil && !*conf.H3.CacheNone {
+		h3Args = dropArg(h3Args, "--cache-none")
+	}
+
 	// H3_ARGS 允许整体覆盖（例如装上 sageattention 后想重新开启）
 	if raw := strings.TrimSpace(os.Getenv("H3_ARGS")); raw != "" {
 		h3Args = append([]string{filepath.Join(h3Home, "main.py")}, strings.Fields(raw)...)
@@ -475,12 +597,78 @@ func looksLikeScriptPath(arg string) bool {
 	return false
 }
 
+// ensureTempEnv 给托管进程指定一个**确定可写**的临时目录。
+//
+// 由来（2026-10-26 现场）：引擎拉起的 ComfyUI-H3 一起就退，日志里是
+//   FileNotFoundError: No usable temporary directory found in
+//   ['C:\Users\...\AppData\Local\Temp', 'C:\Users\...\AppData\Local\Temp\2']
+// 而用同一个 venv 的 python 从交互 shell 跑完全正常（连 `import torch._dynamo` 都过）。
+// 也就是说：不是 torch/权重坏了，是**引擎派生的这个子进程在 %TEMP% 里建不了文件**。
+// 这类"父进程能写、子进程不能写"的差异不值得继续猜（job 对象 / 令牌 / 安全软件都可能），
+// 直接把 TEMP/TMP 指到项目内目录——依赖自己的日志就写在这里，一定可写。
+//
+// 顺带的好处：临时文件不再散落在系统 Temp，出问题好找。
+func ensureTempEnv(env []string) []string {
+	if len(env) == 0 {
+		env = os.Environ()
+	}
+	dir := ""
+	if wd, err := os.Getwd(); err == nil {
+		dir = filepath.Join(wd, "data", "tmp")
+	}
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "flowedge")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[deps] 临时目录不可用（%v），子进程沿用原 TEMP", err)
+		return env
+	}
+	out := make([]string, 0, len(env)+3)
+	for _, kv := range env {
+		u := strings.ToUpper(kv)
+		if strings.HasPrefix(u, "TEMP=") || strings.HasPrefix(u, "TMP=") || strings.HasPrefix(u, "TMPDIR=") {
+			continue // 旧值一律丢掉：留着就可能挑到那个"建不了文件"的目录
+		}
+		out = append(out, kv)
+	}
+	return append(out, "TEMP="+dir, "TMP="+dir, "TMPDIR="+dir)
+}
+
+// startLock 每个依赖一把单飞锁（懒建，受 s.mu 保护）。
+func (s *Supervisor) startLock(name string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.startLocks == nil {
+		s.startLocks = map[string]*sync.Mutex{}
+	}
+	mu, ok := s.startLocks[name]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.startLocks[name] = mu
+	}
+	return mu
+}
+
 // Start 启动依赖（已就绪则直接返回）
+//
+// 并发安全：整个「探活 → 派生 → 等就绪」全程持每个依赖各自的单飞锁。
+//
+// 由来（2026-10-26 现场）：00:05:54 出现了**两个** ComfyUI-H3 进程
+// （一个 25644 抢到 8189 并持有 20GB；一个 28124 卡在 3MB 活了一小时）。
+// 那一晚的三次出片全部 15 分钟超时，单镜从 84.9s 退化到 2269.8s——
+// 典型的「两个实例抢一张 24G 卡」。
+// 原来只靠 s.mu 保护派生那几步，**WaitReady 之前就解锁了**：
+// 冷启动 30–60 秒的窗口里，第二次 Start（双击两次 / 预检自动拉起 + 手动点）
+// 完全可能再派生一个。单飞锁把整个窗口关掉。
 func (s *Supervisor) Start(name string) error {
 	spec, ok := s.specs[name]
 	if !ok {
 		return fmt.Errorf("未知依赖：%s", name)
 	}
+	lock := s.startLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if s.Healthy(name) {
 		return nil
 	}
@@ -496,6 +684,9 @@ func (s *Supervisor) Start(name string) error {
 		time.Sleep(2 * time.Second)
 	}
 
+	// 日志路径必须在**上锁之前**解析：depLogPath 自己会读 s.mu。
+	logPath := s.depLogPath(name)
+
 	s.mu.Lock()
 	if cmd, exists := s.procs[name]; exists && cmd.Process != nil {
 		s.mu.Unlock()
@@ -506,10 +697,16 @@ func (s *Supervisor) Start(name string) error {
 	}
 	cmd := exec.Command(spec.Binary, spec.Args...)
 	cmd.Dir = spec.WorkDir
-	if len(spec.Env) > 0 {
-		cmd.Env = spec.Env
-	}
+	// 临时目录必须在**上锁之前**备好（ensureTempEnv 会建目录，可能慢一拍）。
+	tmpEnv := ensureTempEnv(spec.Env)
+	cmd.Env = tmpEnv
 	cmd.SysProcAttr = hiddenWindowAttr()
+	// 注意：日志接线走无锁的 depLogHandleAt，path 已在上面取好。
+	// 这里正持有 s.mu，任何再抢 s.mu 的调用都会永久死锁（2026-10-26 现场）。
+	logFile := depLogHandleAt(cmd, name, logPath)
+	if logFile != nil {
+		s.procLogs[name] = append(s.procLogs[name], logFile)
+	}
 	if err := cmd.Start(); err != nil {
 		s.lastErr[name] = err.Error()
 		s.mu.Unlock()
@@ -523,6 +720,7 @@ func (s *Supervisor) Start(name string) error {
 	// 回收僵尸进程（否则 Windows 上 cmd.ProcessState 永远不更新）
 	go func() {
 		_ = cmd.Wait()
+		s.closeDepLog(name)
 		s.mu.Lock()
 		if s.procs[name] == cmd {
 			delete(s.procs, name)
@@ -550,10 +748,90 @@ func (s *Supervisor) Stop(name string) error {
 	}
 	delete(s.procs, name)
 	s.mu.Unlock()
+	err := error(nil)
 	if cmd.Process != nil {
-		return cmd.Process.Kill()
+		err = cmd.Process.Kill()
 	}
-	return nil
+	s.closeDepLog(name)
+	return err
+}
+
+// SetLogDir 指定托管进程日志目录（空 = 丢弃输出）。
+//
+// 由来（2026-10-25）：改造前 `cmd.Start()` 没接 Stdout/Stderr，Go 把子进程输出
+// 直接丢到空设备。于是 H3/ASR/TTS 自己的日志（模型加载耗时、卸载、"loaded
+// partially"、CUDA 报错细节）**一行都没留下**，`运行/logs/` 里只有 engine.log。
+//
+// 代价很实在：排查「H3 为什么跑完就冷」「ASR 到底是不可达还是空结果」
+// 这类问题只能靠反复花 GPU/时间做实验；有了它，打开一条 log 就能读结论。
+// 这也是 §0.6「服务没起 ≠ 没有结果」唯一能落地的前提——不可达要能被看见。
+func (s *Supervisor) SetLogDir(dir string) {
+	s.mu.Lock()
+	s.logDir = dir
+	s.mu.Unlock()
+}
+
+// depLogPath 某个依赖的日志文件路径（未配置目录时返回空）。
+func (s *Supervisor) depLogPath(name string) string {
+	s.mu.Lock()
+	dir := s.logDir
+	s.mu.Unlock()
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, name+".log")
+}
+
+// attachDepLog 解析日志路径并把子进程输出接过去。
+//
+// **调用方不得持有 s.mu**（内部会读 logDir）。Start 的持锁路径用的是
+// depLogHandleAt + 事先取好的 path，不走这里——原因见下面的死锁说明。
+func (s *Supervisor) attachDepLog(cmd *exec.Cmd, name string) *os.File {
+	return depLogHandleAt(cmd, name, s.depLogPath(name))
+}
+
+// depLogHandleAt 纯函数版：给定路径直接接线，**不碰任何锁**。
+//
+// 2026-10-26 现场（必须记住的教训）：Start 在 spawn 路径上持有 s.mu，
+// 原来是 s.attachDepLog(cmd,name) → 内部 depLogPath() 又 s.mu.Lock()
+// ⇒ Go 互斥锁不可重入 ⇒ **永久死锁**。症状极具误导性：
+//   - /api/deps 全部挂住（20s+ 不返回）
+//   - /api/deps/comfy_h3/start 返回 202，但再也不派生任何进程
+//   - /api/health、/api/runs 却完全正常（它们不碰这把锁）
+// 所以：**"服务起不来"先怀疑锁，别往模型/权重上找**。
+// 这里留成无锁纯函数，是让 Start 能安全地在锁内调用。
+func depLogHandleAt(cmd *exec.Cmd, name, path string) *os.File {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("[deps] %s 日志目录不可用（%v），该依赖输出丢弃", name, err)
+		return nil
+	}
+	if st, err := os.Stat(path); err == nil && st.Size() > 8<<20 {
+		_ = os.Rename(path, path+".1")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[deps] %s 日志打开失败（%v），该依赖输出丢弃", name, err)
+		return nil
+	}
+	// 启动分隔线：依赖被停掉再起时，同一份日志里能一眼看出「这是新的一次」。
+	_, _ = fmt.Fprintf(f, "\n=== %s 启动 %s ===\n", name, time.Now().Format("2006-01-02 15:04:05"))
+	cmd.Stdout = f
+	cmd.Stderr = f
+	return f
+}
+
+// closeDepLog 关闭某个依赖的日志句柄（Stop 与进程退出时都调，可重复）。
+func (s *Supervisor) closeDepLog(name string) {
+	s.mu.Lock()
+	files := s.procLogs[name]
+	delete(s.procLogs, name)
+	s.mu.Unlock()
+	for _, f := range files {
+		_ = f.Close()
+	}
 }
 
 // Healthy 依赖是否已就绪（健康检查优先，失败再退化为端口探测）
@@ -593,6 +871,19 @@ func (s *Supervisor) WaitReady(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if s.Healthy(name) {
+			// 端口通了，但要分清「谁在提供服务」。
+			// 我们自己派生的进程已经退出、端口却有人应答 ⇒ 是外部（用户手动起、
+			// 别的工具拉起）实例。这件事必须留痕：否则「停止」点了没反应、
+			// 「启动」看起来成功，人和 agent 都会以为是自己的进程在跑。
+			s.mu.Lock()
+			_, ours := s.procs[name]
+			s.mu.Unlock()
+			if spec.Exclusive != "" || name == "comfy_h3" || name == "comfyui" {
+				if !ours {
+					log.Printf("[deps] %s 的端口由**非本进程托管的实例**提供（我们派生的那个已退出）；"+
+						"停止本服务不会影响它，显存仍被它占着", label)
+				}
+			}
 			return nil
 		}
 		s.mu.Lock()
@@ -621,13 +912,14 @@ func (s *Supervisor) Status() []DepStatus {
 	sort.Strings(names)
 	for _, n := range names {
 		spec := s.specs[n]
+	healthy := s.Healthy(n)
 		st := DepStatus{
 			Name:      spec.Name,
 			Label:     spec.Label,
 			Endpoint:  spec.Endpoint,
 			Autostart: spec.Autostart,
 			Hint:      spec.Hint,
-			Running:   s.Healthy(n),
+			Running:   healthy,
 		}
 		s.mu.Lock()
 		if cmd, ok := s.procs[n]; ok {
@@ -636,8 +928,26 @@ func (s *Supervisor) Status() []DepStatus {
 				st.PID = cmd.Process.Pid
 			}
 		}
+		managedAlive := st.Managed && st.PID > 0
 		st.LastError = s.lastErr[n]
 		s.mu.Unlock()
+
+		// 「忙」≠「没起」：进程活着但健康检查不回，绝不能报「未启动」。
+		// 报成未启动会诱导用户点「启动」再派生一份，两个实例抢一张卡
+		// （2026-10-26 那晚 27 倍慢的起点就是这么来的）。
+		if healthy {
+			st.State = "ok"
+		} else if managedAlive {
+			st.Busy = true
+			st.Running = true
+			st.State = "busy"
+			if st.Hint == "" {
+				st.Hint = "进程还活着，但忙到不回健康检查（生成中/换页中）。此时不要再点启动，" +
+					"否则会多出一份实例抢显存"
+			}
+		} else {
+			st.State = "stopped"
+		}
 		if spec.Binary != "" {
 			st.Command = spec.Binary + " " + strings.Join(spec.Args, " ")
 		}
@@ -859,8 +1169,16 @@ func normalBase(raw string) string {
 // 而主 ComfyUI 常在热态。之前"已在启动中"的分支写死 3s，等于把正常冷启判成失败。
 func readyTimeout(name string) time.Duration {
 	switch name {
-	case "asr", "tts":
-		return 300 * time.Second // 首次要下载/预热模型（Kokoro 还要载入 pipeline）
+	case "asr":
+		return 300 * time.Second // 首次要下载/预热模型
+	case "tts":
+		// Breeze TTS 2 的冷启动包含 CUDA Graph 预热：编译缓存热时 ~117s，冷编译实测
+		// ~245s，而启动瞬间显存被别的实例占着时会拖到 300s 以上（图捕获要吃满 24GB 卡）。
+		// 原来和 asr 共用 300s，只剩 55s 余量，2026-10-26 实测被卡过两次——表现为
+		// 「服务其实起来了，但引擎记了一条启动失败」。
+		// Audio8 / Kokoro 走同一分支：它们更快，放宽只会抬高「判定就绪」的上限，
+		// 不影响就绪判定的正确性（探活一成功就返回，不会真等满）。
+		return 600 * time.Second
 	case "comfy_h3":
 		return 180 * time.Second // 独立 venv + 20GB 权重，实测冷启 ~50s
 	case "comfy_moss":

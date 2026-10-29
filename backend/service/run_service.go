@@ -46,16 +46,17 @@ type RunService struct {
 	engine *EngineV2
 	queue  *JobQueue
 
-	// runAsync 执行调度：默认走队列（满则阻塞）或裸 goroutine。
+	// runAsync 执行调度：默认走队列（入队即返回，不阻塞调用方），或裸 goroutine。
 	// 抽成字段是为了让测试能同步执行——否则只能 sleep 等异步结果。
-	runAsync func(job model.Job, fn func())
+	// 带 class 是因为队列现在按资源分道（GPU 串行 / CPU 并行，见 queue.go）。
+	runAsync func(job model.Job, class JobClass, fn func())
 }
 
 func NewRunService(db *gorm.DB, engine *EngineV2, queue *JobQueue) *RunService {
 	s := &RunService{db: db, engine: engine, queue: queue}
-	s.runAsync = func(job model.Job, fn func()) {
+	s.runAsync = func(job model.Job, class JobClass, fn func()) {
 		if queue != nil {
-			queue.Enqueue(job, fn)
+			queue.EnqueueClass(job, class, fn)
 			return
 		}
 		go fn()
@@ -65,7 +66,7 @@ func NewRunService(db *gorm.DB, engine *EngineV2, queue *JobQueue) *RunService {
 
 // SetSynchronous 测试用：把任务改成同步执行，返回时状态已落库。
 func (s *RunService) SetSynchronous() {
-	s.runAsync = func(_ model.Job, fn func()) { fn() }
+	s.runAsync = func(_ model.Job, _ JobClass, fn func()) { fn() }
 }
 
 // Resume 断点续跑：复用已完成节点输出，只重跑失败/未执行节点。
@@ -133,10 +134,10 @@ func (s *RunService) Resume(runID uint, fromNode string, nodesOverride []byte) (
 	job := model.Job{
 		RunID:      run.ID,
 		WorkflowID: run.WorkflowID,
-		Status:     "running",
-		Trigger:    "resume",
-		CreatedAt:  time.Now(),
-		StartedAt:  run.StartedAt,
+		// 排队就是排队：running 由队列在真正起跑那一刻写入（2026-10-27 复盘）。
+		Status:    "pending",
+		Trigger:   "resume",
+		CreatedAt: time.Now(),
 	}
 	s.db.Create(&job)
 
@@ -145,20 +146,30 @@ func (s *RunService) Resume(runID uint, fromNode string, nodesOverride []byte) (
 		nodesJSON = nodesOverride
 	}
 
-	s.runAsync(job, func() {
+	// 续跑也要按资源分道：续一条 voice 不该排在 20 分钟的长片后面。
+	// 解不出节点就按 GPU 处理（保守，见 JobClassForNodes）。
+	var graphNodes []model.NodeInstance
+	_ = json.Unmarshal(nodesJSON, &graphNodes)
+
+	s.runAsync(job, JobClassForNodes(graphNodes), func() {
 		// 走带 runID 的可取消入口：续跑的事件也要归属性，否则执行面板看不到重跑过程
 		nodeStates, err := s.engine.ResumeFromWithRunID(
 			nodesJSON, []byte(wf.Edges), prev, fromNode, run.ID, persist)
 
 		endNow := time.Now()
 		run.EndedAt = &endNow
+		status := "done"
+		errText := ""
 		if err != nil {
 			if ErrorCodeOf(err) == model.ErrorCodeCancelled {
 				run.Status = "cancelled"
+				status = "interrupted"
 			} else {
 				run.Status = "failed"
+				status = "failed"
 			}
 			run.Error = err.Error()
+			errText = err.Error()
 		} else {
 			run.Status = "success"
 		}
@@ -166,20 +177,11 @@ func (s *RunService) Resume(runID uint, fromNode string, nodesOverride []byte) (
 		run.NodeStates = json.RawMessage(statesJSON)
 		s.db.Save(&run)
 
-		done := model.Job{
-			RunID: run.ID, WorkflowID: run.WorkflowID,
-			Status: "done", Trigger: "resume", CreatedAt: *run.StartedAt,
-			StartedAt: run.StartedAt, EndedAt: &endNow,
-		}
-		if err != nil {
-			if ErrorCodeOf(err) == model.ErrorCodeCancelled {
-				done.Status = "interrupted"
-			} else {
-				done.Status = "failed"
-			}
-			done.Error = err.Error()
-		}
-		s.db.Save(&done)
+		// 更新受理时那一行，而不是再插一条：旧写法每次续跑都留一条
+		// 永远停在 running 的僵尸 job（启动回收时被误算成"被中断"）。
+		s.db.Model(&model.Job{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+			"status": status, "error": errText, "ended_at": endNow,
+		})
 	})
 
 	return out, nil

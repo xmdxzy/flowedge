@@ -63,6 +63,11 @@ export interface PreflightResult {
   ok: boolean
   missing: DepRequirement[] | null
   fixable: number
+  /**
+   * 「能跑但不便宜」的提醒：显存会不会换页、同参数是不是刚跑过。
+   * 不改变 ok，也不拦出片——拦住等于把「慢」升级成「不可用」。
+   */
+  warnings?: string[] | null
 }
 
 // ---- 运行 ----
@@ -155,10 +160,16 @@ export interface ArtifactListResponse {
 export interface DepStatus {
   name: string
   label: string
-  /** 端口/健康检查通过 */
+  /** 端口/健康检查通过，**或**进程活着只是忙（busy=true） */
   running: boolean
   /** 由引擎拉起（可停止） */
   managed: boolean
+  /**
+   * 进程活着但忙到不回健康检查（生成中/换页中）。
+   * 这时**绝不能**显示「未启动」：用户会点启动再派生一份，两个实例抢一张卡。
+   */
+  busy?: boolean
+  state?: 'ok' | 'busy' | 'stopped'
   autostart: boolean
   pid?: number
   endpoint: string
@@ -170,6 +181,23 @@ export interface DepStatus {
 export interface DepListResponse {
   items: DepStatus[] | null
   count: number
+}
+
+/** POST /api/deps/:name/unload 的结果（对应 backend/service/deps_unload.go） */
+export interface UnloadResult {
+  name: string
+  /** 该依赖有没有卸载接口（ASR/TTS 没有，权重不在显存里） */
+  supported: boolean
+  /** 本次实际回收的显存（拿不到读数时为 0） */
+  freed_mb: number
+  /** 卸载后的设备级空闲显存 */
+  free_mb: number
+  note: string
+}
+
+/** 只有这两类依赖能"卸权重不杀进程"（ComfyUI 走 /free，Ollama 走 keep_alive=0） */
+export function depSupportsUnload(name: string): boolean {
+  return name.startsWith('comfy') || name === 'ollama'
 }
 
 export interface DepActionResponse {

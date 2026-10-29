@@ -308,6 +308,16 @@ class Verdict:
         return "OK"
 
 
+def empty_stats() -> dict:
+    """零值 stats：segments 为空提前返回时也要有完整结构。
+
+    2026-10-26 实测：原来这里 return 空 dict，main 打印 stats['frames'] 直接
+    KeyError: 'frames' 崩溃 —— 崩溃信息盖住了真正的 FAIL 原因，极易误诊成
+    「分镜表坏了」。键名给错才是真因（check 只读 segments，不读 shots）。
+    """
+    return {"frames": [], "total_seconds": None, "shots": [], "lines": 0, "stills": 0}
+
+
 def check_plan(plan: dict, require_gates: bool = True) -> tuple[Verdict, dict]:
     v = Verdict()
     raw_gates = plan.get("gates")
@@ -316,7 +326,7 @@ def check_plan(plan: dict, require_gates: bool = True) -> tuple[Verdict, dict]:
         if require_gates:
             v.add("FAIL", "gates_missing",
                   "plan 没有 gates：本片子的节奏/一致性/验收标准还没设计。"
-                  "先跑 film-gates.py plan 生成草案并改写（确需跳过加 --no-gates）")
+                  "先跑 film-gates.py plan 生成草案并改写（确需跳过加 --allow-missing-gates）")
         else:
             v.add("WARN", "gates_missing", "未声明 gates，全部按默认门执行")
         raw_gates = {}
@@ -329,8 +339,11 @@ def check_plan(plan: dict, require_gates: bool = True) -> tuple[Verdict, dict]:
 
     segments = plan.get("segments") or []
     if not segments:
-        v.add("FAIL", "segments_empty", "plan.segments 为空")
-        return v, g, {}
+        v.add("FAIL", "segments_empty",
+              "plan.segments 为空。注意：本工具只读 segments，结构化模式（storyboard 产出）"
+              "用的是 shots，需先把 shots 复制成 segments 别名再校验；"
+              "Go 侧 ParseShotPlan 两个键都认，此处只认 segments")
+        return v, g, empty_stats()
 
     # ---------- timing：网格 / 每镜停留 / 总长 ----------
     frames: list[int] = []
@@ -518,6 +531,8 @@ def main() -> int:
 
     p3 = sub.add_parser("show", help="打印合并后的门（默认门 + 本片覆盖）")
     p3.add_argument("--plan", required=True)
+    p3.add_argument("--allow-missing-gates", action="store_true",
+                    help="允许没有 gates（降级为告警）")
 
     args = ap.parse_args()
 
@@ -537,7 +552,7 @@ def main() -> int:
         plan = json.load(f)
 
     if args.cmd == "show":
-        _, g, _ = check_plan(plan, require_gates=not args.allow_missing_gates)
+        _, g, _ = check_plan(plan, require_gates=not getattr(args, "allow_missing_gates", False))
         print(json.dumps(g, ensure_ascii=False, indent=2))
         return 0
 
@@ -547,8 +562,10 @@ def main() -> int:
                           "stats": stats}, ensure_ascii=False, indent=2))
     else:
         print(f"门检结论：{v.worst()}")
-        print(f"  段帧数 {stats['frames']}  总长 {stats['total_seconds']}s "
-              f"镜头数 {stats['shots']}  台词 {stats['lines']} 句  定妆图 {stats['stills']} 张")
+        st = {**empty_stats(), **(stats or {})}
+        total_txt = "—" if st["total_seconds"] is None else f"{st['total_seconds']}s"
+        print(f"  段帧数 {st['frames']}  总长 {total_txt} "
+              f"镜头数 {st['shots']}  台词 {st['lines']} 句  定妆图 {st['stills']} 张")
         for it in v.items:
             print(f"  [{it['level']}] {it['gate']}: {it['msg']}")
     return 0 if v.ok() else 2

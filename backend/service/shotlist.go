@@ -119,6 +119,31 @@ type shotResult struct {
 	Note       string  `json:"note,omitempty"`
 }
 
+// batchRunLen 从 start 数连续可同批的镜数（含 start；<2 表示不能批量）。
+// 可批量 = 全组非台词（台词镜要先出音轨才能喂 ref_audio）；组内上一镜不声明
+// continue（下一镜要等它的末帧）；start 自己不是续接镜；每镜缓存未命中
+// （命中了就该直接复用，进组只会白等）；lowVRAM 判档一致（批量图只有一份模型链）。
+// 纯函数，便于单测；调用方提供 lowVRAM/cacheMiss 两个判据。
+func batchRunLen(shots []Shot, start, maxN int, prevContinued bool, lowVRAM func(int) bool, cacheMiss func(int) bool) int {
+	if start >= len(shots) || shots[start].HasDialogue() || prevContinued {
+		return 0
+	}
+	if !cacheMiss(start) {
+		return 0
+	}
+	n := 1
+	for j := start + 1; j < len(shots) && n < maxN; j++ {
+		if shots[j].HasDialogue() || shots[j-1].Transition == "continue" {
+			break
+		}
+		if !cacheMiss(j) || lowVRAM(j) != lowVRAM(start) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
 // execShotListNode 分镜执行器：五层门预检 → 逐镜生成 → 音频治理 → 按 transition 装配
 //
 // 相对旧版的三处升级（nodecontract 早就写着 shotlist「承载全部五层门」，这里兑现）：
@@ -196,6 +221,21 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	if v, ok := node.Data["interp"].(bool); ok {
 		interp = v
 	}
+	// 音频后期（装配后）：响度归一默认开，BGM 默认关（没有素材就不该假装有配乐）
+	audioMaster := true
+	if v, ok := node.Data["audio_master"].(bool); ok {
+		audioMaster = v
+	}
+	lufs := fieldFloat(node, "lufs", -16)
+	if lufs > 0 {
+		lufs = -16 // LUFS 天然为负：传正数视为没配
+	}
+	bgmPath, _ := node.Data["bgm"].(string)
+	bgmGain := fieldFloat(node, "bgm_gain", -18)
+	bgmDuck := true
+	if v, ok := node.Data["bgm_duck"].(bool); ok {
+		bgmDuck = v
+	}
 	audioCheck := true
 	if v, ok := node.Data["audio_check"].(bool); ok {
 		audioCheck = v
@@ -204,6 +244,13 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	requireGates := false
 	if v, ok := node.Data["require_gates"].(bool); ok {
 		requireGates = v
+	}
+	// 多镜批量提交（P2 结构优化）：batch_size ≥ 2 时，把「连续、非台词、参数一致、
+	// 缓存未命中」的镜合并成一张图提交（换权重 3N→3，直连实测 3 镜 ~2 倍速）。
+	// 0/1 = 关。批量失败自动回退逐镜，不构成新门槛。
+	batchSize := int(fieldFloat(node, "batch_size", 0))
+	if batchSize > 8 {
+		batchSize = 8 // 屏障节点只开了 8 个槽（comfy_media_batch.go）
 	}
 
 	// 片长上限保护：8 镜 × 15s 已经很极端，再多应该拆成多集
@@ -272,130 +319,45 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	runID := runIDFrom(ctx)
 	reusedCount := 0
 
-	for i := range plan.Shots {
-		// 镜头之间响应取消。旧版循环体完全不看 ctx，点了停止也要等整片跑完。
-		if cerr := ctx.Err(); cerr != nil {
-			log.Printf("[shotlist] 第 %d/%d 镜前收到取消", i+1, len(plan.Shots))
-			return nil, fmt.Errorf("已取消（完成 %d/%d 镜，已完成部分已落盘，重跑会复用）：%w",
-				len(results), len(plan.Shots), cerr)
+	// 本次运行的工作量可以直接从分镜表算出来（帧 × 分辨率 × 步数 + 装配/后期）。
+	// 登记成预测之后，**第一次**跑也有真 ETA —— 否则只能等同类节点跑过一次
+	// （ETAFor 用的历史均值），日志里的 eta_ms 长期恒为 0，进度条等于空转。
+	{
+		totalFrames := 0
+		for _, sh := range plan.Shots {
+			totalFrames += sh.Frames
 		}
-		// 预算总闸：on_exceed=fail 时超了就地停机（已完成的镜已落盘，重跑复用）
-		if wallCap > 0 && onExceed == "fail" {
-			used := time.Since(nodeStart).Seconds()
-			if used > float64(wallCap) {
-				return nil, fmt.Errorf("预算门：已用 %.0fs 超过总预算 %ds（on_exceed=fail），停机；已完成 %d/%d 镜已落盘，重跑会复用",
-					used, wallCap, len(results), len(plan.Shots))
-			}
-		}
-		sh := plan.Shots[i]
-		// 只有上一镜声明 continue 时才用末帧引导；其余一律独立生成（多角度才成立）
-		continuity := i > 0 && plan.Shots[i-1].Transition == "continue" && prevLastFrame != ""
-		// 提示词：富模式手写六段式优先；结构化模式字段编译
-		prompt := sh.Prompt
-		if strings.TrimSpace(prompt) == "" {
-			prompt = CompileShotPrompt(plan, sh, continuity)
-		}
+		pred := time.Duration(shotCostSeconds(totalFrames, width, height, steps)*float64(time.Second)) +
+			time.Duration(len(plan.Shots))*10*time.Second + 20*time.Second
+		e.SetRunPrediction(runID, pred)
+		defer e.ClearRunPrediction(runID)
+	}
 
-		// 台词段：合成念稿音轨（TTS）。失败 = 该镜失败——不能拿假音频糊弄，
-		// fully_copy 会把任何垃圾原样带进成片。
-		dialogue := sh.HasDialogue()
-		var dubPath string
-		var dub *DubTrackReport
-		if dialogue && backend == "h3" {
-			lines := sh.Lines
-			if len(lines) == 0 {
-				// 结构化模式的台词在 dialogue 字段（「身份：原话」）
-				if t := sh.DialogueText(); t != "" {
-					lines = []PlanLine{{Speaker: "S1", Text: t}}
-				}
-			}
-			dubPath = dubTrackTempPath(outDir, sh.ID)
-			gain := sh.AmbienceGain
-			if gain <= 0 {
-				gain = ambienceGain // 节点级兜底（默认 0.85）
-			}
-			dub, err = SynthesizeDubTrack(e.tts, lines, dubPath,
-				float64(sh.Frames)/24.0, sh.Lead, gain, plan.AmbienceFile(sh))
-			if err != nil {
-				return nil, fmt.Errorf("第 %d 镜念稿音轨合成失败：%w", sh.ID, err)
-			}
-		}
+	// 定点重拍：单镜验收不过就只重跑那一镜，不整片重来。
+	// 实现方式是同一段生成代码跑多轮（pass=0 首拍，pass>0 只跑 needsReshoot 里的镜），
+	// 而不是复制一份生成逻辑——两份逻辑迟早会漂移。
+	reshootMax := int(fieldFloat(node, "reshoot_max", 1))
+	if reshootMax < 0 {
+		reshootMax = 0
+	}
+	needsReshoot := make([]bool, len(plan.Shots))
+	reshootCount := 0
+	cacheDir := shotCacheDir(outDir)
 
-		req := MediaRequest{
-			Kind: "h3", Prompt: prompt,
-			Width: width, Height: height,
-			Frames: sh.Frames, FPS: 24, Steps: steps,
-			Turbo: turbo, LowVRAM: true,
-		}
-		switch {
-		case dubPath != "":
-			// 台词段必须走 ref2va：只有它吃 ref_audio（念稿 1:1 透传 + 口型同步）。
-			// 与末帧续接互斥时音频确定性优先——i2v 根本没有音频输入口。
-			req.Kind = "h3_r2v"
-			req.RefImages = refImgs
-			req.RefAudios = []string{dubPath}
-		case len(refImgs) > 0 && !continuity:
-			// 有定妆图且不是续接镜：身份交给参考图（ref2va 自己管身份，
-			// 与 AddGuide 互斥，所以这里显式不让位首帧）
-			req.Kind = "h3_r2v"
-			req.RefImages = refImgs
-		case continuity:
-			req.Kind = "h3_i2v"
-			req.Image = prevLastFrame
-		}
-
-		// 生成 + 段级门：台词段 ASR 验词，不过按 segment_retry 重跑
-		// （采样有随机性，重跑比放过一镜乱语便宜得多）。
-		var part string
-		var gerr error
-		var genElapsed time.Duration
-		attempts := 0
-		gateNote := ""
-		for {
-			attempts++
-			e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "generating", 0)
-			genStart := time.Now()
-			part, _, gerr = e.t2i.GenerateMedia(req)
-			genElapsed = time.Since(genStart)
-			if gerr != nil {
-				e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "failed", genElapsed)
-				return nil, fmt.Errorf("第 %d 镜生成失败（已完成 %d/%d 镜并已落盘）：%w",
-					sh.ID, len(results), len(plan.Shots), gerr)
-			}
-			if !dialogue {
-				break
-			}
-			expect := sh.DialogueText()
-			passed, checked := verifyDialogueLine(e.asr, part, expect)
-			if !checked {
-				// ASR 不可达 = 「没验」，不是「念对了」。显式记下，不冒充通过。
-				gateNote = "台词校验未执行（ASR 不可达），不等于念对"
-				break
-			}
-			if passed {
-				gateNote = "ASR 验词通过"
-				break
-			}
-			gateNote = fmt.Sprintf("台词「%s」验词未过（第 %d 次）", expect, attempts)
-			if attempts > segRetry || onSegFail != "retry" {
-				e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "failed", genElapsed)
-				return nil, fmt.Errorf("第 %d 镜段级门未通过：台词「%s」验词 %d 次未转出（已完成 %d/%d 镜已落盘）",
-					sh.ID, expect, attempts, len(results), len(plan.Shots))
-			}
-			log.Printf("[shotlist] 第 %d 镜第 %d 次验词未过，重跑（采样有随机性）", sh.ID, attempts)
-		}
-
+	// finishShot 单镜产出后的共用收尾：结果落位 → 音频治理 → 缓存 → 进度 → 末帧。
+	// 单镜路径与批量路径都走这里，两份逻辑迟早漂移（AGENTS §0.12④）。
+	finishShot := func(i, pass int, sh Shot, part string, genElapsed time.Duration,
+		attempts int, gateNote string, dub *DubTrackReport, reusedShot bool, cacheKey string) {
 		res := shotResult{ID: sh.ID, File: part, Frames: sh.Frames, Seconds: float64(sh.Frames) / 24.0,
-			Transition: sh.Transition, Attempts: attempts, Gate: gateNote}
+			Transition: sh.Transition, Attempts: attempts, Gate: gateNote, Reused: reusedShot}
 		if dub != nil {
 			res.Note = fmt.Sprintf("念稿音轨 %.2fs（%s 后端，台词 %d 句）", dub.Seconds, dub.Backend, len(dub.Lines))
 		}
-
 		// 氛围段音频治理（三道防线里的第三道）：
 		// 提示词层已经把声音字段填满，但模型仍有概率即兴说话。这里做客观抽检，
 		// 检测到人声就不再只是"压低音量"，而是中置相消把它从信号里减掉。
 		// 台词段**不能**走这条——中置相消会把台词本身消掉。
-		if audioCheck && backend == "h3" && !dialogue {
+		if audioCheck && backend == "h3" && !sh.HasDialogue() && !reusedShot {
 			if speech, checked := audioHasSpeech(e.asr, part); !checked {
 				res.Note = appendNote(res.Note, "ASR 不可达，人声抽检未执行（不等于没人声）")
 			} else if speech {
@@ -421,9 +383,22 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 				}
 			}
 		}
-		clips = append(clips, part)
-		transitions = append(transitions, sh.Transition)
-		results = append(results, res)
+		// 缓存要在音频治理**之后**写：写进去的必须是最终交付的那一版，
+		// 否则复用回来的镜头会带着没处理的人声。
+		if !reusedShot && cacheKey != "" {
+			shotCacheStore(cacheDir, cacheKey, part)
+		}
+		if pass == 0 {
+			clips = append(clips, part)
+			transitions = append(transitions, sh.Transition)
+			results = append(results, res)
+		} else {
+			// 重拍：就地替换该镜，保留原轮次信息（Attempts 累加，便于回溯总成本）
+			res.Attempts += results[i].Attempts
+			res.Note = appendNote(res.Note, fmt.Sprintf("定点重拍（第 %d 轮）", pass))
+			clips[i], transitions[i], results[i] = part, sh.Transition, res
+			reshootCount++
+		}
 
 		// 立刻落盘：这是「第 5 镜失败不丢前 4 镜」的全部依据。
 		e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "done", genElapsed)
@@ -438,6 +413,322 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			tmp := filepath.Join(os.TempDir(), fmt.Sprintf("flowedge-shot-%d-%d.png", time.Now().UnixNano(), sh.ID))
 			if err := extractLastFrame(part, tmp); err == nil {
 				prevLastFrame = tmp
+			}
+		}
+	}
+
+	for pass := 0; pass <= reshootMax; pass++ {
+		for i := 0; i < len(plan.Shots); i++ {
+			if pass > 0 && !needsReshoot[i] {
+				continue // 修复轮只碰坏镜
+			}
+			// 镜头之间响应取消。旧版循环体完全不看 ctx，点了停止也要等整片跑完。
+			if cerr := ctx.Err(); cerr != nil {
+				log.Printf("[shotlist] 第 %d/%d 镜前收到取消", i+1, len(plan.Shots))
+				return nil, fmt.Errorf("已取消（完成 %d/%d 镜，已完成部分已落盘，重跑会复用）：%w",
+					len(results), len(plan.Shots), cerr)
+			}
+			// 预算总闸：on_exceed=fail 时超了就地停机（已完成的镜已落盘，重跑复用）
+			// 修复轮不查预算：门已经判不过了，这时候停下等于交一条坏片。
+			if pass == 0 && wallCap > 0 && onExceed == "fail" {
+				used := time.Since(nodeStart).Seconds()
+				if used > float64(wallCap) {
+					return nil, fmt.Errorf("预算门：已用 %.0fs 超过总预算 %ds（on_exceed=fail），停机；已完成 %d/%d 镜已落盘，重跑会复用",
+						used, wallCap, len(results), len(plan.Shots))
+				}
+			}
+			// ---- 批量分支（仅首轮）：连续可批量镜合成一张图提交，失败回退单镜 ----
+			// 收益与边界见 comfy_media_batch.go 头注。任何条件不满足就地放弃，
+			// 落回下面的单镜路径——批量是加速器，不是新门槛。
+			if batchSize >= 2 && pass == 0 {
+				continuity0 := i > 0 && plan.Shots[i-1].Transition == "continue" && prevLastFrame != ""
+				// 组级参数：全组非台词 ⇒ pdd/steps/kind 天然一致；r2v 的 PDD 限制与单镜路径对齐
+				groupPDD := true
+				if v, ok := node.Data["pdd"].(bool); ok {
+					groupPDD = v
+				}
+				groupKind := "h3"
+				if len(refImgs) > 0 {
+					groupKind = "h3_r2v"
+				}
+				if groupKind == "h3_r2v" {
+					groupPDD = false
+				}
+				groupSteps := steps
+				if groupPDD {
+					groupSteps = 8
+				}
+				keyAt := func(j int) string {
+					shj := plan.Shots[j]
+					pj := shj.Prompt
+					if strings.TrimSpace(pj) == "" {
+						pj = CompileShotPrompt(plan, shj, false)
+					}
+					return shotCacheKey(pj, width, height, shj.Frames, groupSteps, backend, turbo, groupPDD)
+				}
+				lowAt := func(j int) bool { return shotNeedsLowVRAM(node, width, height, plan.Shots[j].Frames) }
+				missAt := func(j int) bool { return shotCacheHit(cacheDir, keyAt(j)) == "" }
+				if n := batchRunLen(plan.Shots, i, batchSize, continuity0, lowAt, missAt); n >= 2 {
+					reqs := make([]MediaRequest, 0, n)
+					keys := make([]string, 0, n)
+					for k := i; k < i+n; k++ {
+						shk := plan.Shots[k]
+						pk := shk.Prompt
+						if strings.TrimSpace(pk) == "" {
+							pk = CompileShotPrompt(plan, shk, false)
+						}
+						r := MediaRequest{
+							Kind: groupKind, Prompt: pk, Width: width, Height: height,
+							Frames: shk.Frames, FPS: 24, Steps: groupSteps,
+							Turbo: turbo, LowVRAM: lowAt(k), PDD: groupPDD, Ctx: ctx,
+						}
+						if groupKind == "h3_r2v" {
+							r.RefImages = refImgs
+						}
+						reqs = append(reqs, r)
+						keys = append(keys, keyAt(k))
+					}
+					for k := range reqs {
+						e.emitShotProgress(runID, node.ID, i+k, len(plan.Shots), plan.Shots[i+k].ID, "generating", 0)
+					}
+					limit := time.Duration(0)
+					for k := range reqs {
+						limit += ShotGenerationLimit(reqs[k].Frames, width, height, reqs[k].Steps)
+					}
+					wd := armShotWatchdog(limit, func() {
+						log.Printf("[shotlist] 批量 %d 镜跑到 %.1f 倍逐镜基准仍未完成，中止整批",
+							len(reqs), shotAbortFactor)
+						e.interruptComfy()
+					})
+					batchStart := time.Now()
+					outs, berr := e.t2i.GenerateH3Batch(ctx, reqs, func(phase string) {
+						switch phase {
+						case "queued":
+							wd.Pause()
+							for k := range reqs {
+								e.emitShotProgress(runID, node.ID, i+k, len(plan.Shots), plan.Shots[i+k].ID, "queued", 0)
+							}
+						case "running":
+							wd.Resume()
+						}
+					})
+					batchElapsed := time.Since(batchStart)
+					wd.Stop()
+					if berr == nil {
+						log.Printf("[shotlist] 批量 %d 镜一张图完成，用时 %s（逐镜基线合计约 %s）",
+							len(reqs), batchElapsed.Round(time.Second),
+							(time.Duration(shotCostSeconds(sumFrames(reqs), width, height, reqs[0].Steps)*float64(time.Second))).Round(time.Second))
+						for k, out := range outs {
+							finishShot(i+k, pass, plan.Shots[i+k], out.Path, batchElapsed, 1,
+								fmt.Sprintf("批量图 %d 镜合提交", len(reqs)), nil, false, keys[k])
+						}
+						i += len(reqs) - 1
+						continue
+					}
+					log.Printf("[shotlist] 批量 %d 镜失败（%.200s），回退逐镜生成", len(reqs), berr.Error())
+					// 不 return：批量只是加速，回退后从第 i 镜开始照常逐镜
+				}
+			}
+
+			sh := plan.Shots[i]
+			// 只有上一镜声明 continue 时才用末帧引导；其余一律独立生成（多角度才成立）
+			continuity := i > 0 && plan.Shots[i-1].Transition == "continue" && prevLastFrame != ""
+			// 提示词：富模式手写六段式优先；结构化模式字段编译
+			prompt := sh.Prompt
+			if strings.TrimSpace(prompt) == "" {
+				prompt = CompileShotPrompt(plan, sh, continuity)
+			}
+
+			// 台词段：合成念稿音轨（TTS）。失败 = 该镜失败——不能拿假音频糊弄，
+			// fully_copy 会把任何垃圾原样带进成片。
+			dialogue := sh.HasDialogue()
+			// 非台词镜走 PDD 8 步；台词镜必须保 12 步（音频短板）。
+			pdd := !dialogue
+			if v, ok := node.Data["pdd"].(bool); ok {
+				pdd = v && !dialogue
+			}
+			shotSteps := steps
+			if pdd {
+				shotSteps = 8
+			}
+			var dubPath string
+			var dub *DubTrackReport
+			if dialogue && backend == "h3" {
+				lines := sh.Lines
+				if len(lines) == 0 {
+					// 结构化模式的台词在 dialogue 字段（「身份：原话」）
+					if t := sh.DialogueText(); t != "" {
+						lines = []PlanLine{{Speaker: "S1", Text: t}}
+					}
+				}
+				dubPath = dubTrackTempPath(outDir, sh.ID)
+				gain := sh.AmbienceGain
+				if gain <= 0 {
+					gain = ambienceGain // 节点级兜底（默认 0.85）
+				}
+				dub, err = SynthesizeDubTrack(e.tts, lines, dubPath,
+					float64(sh.Frames)/24.0, sh.Lead, gain, plan.AmbienceFile(sh))
+				if err != nil {
+					return nil, fmt.Errorf("第 %d 镜念稿音轨合成失败：%w", sh.ID, err)
+				}
+			}
+
+			lowVRAM := shotNeedsLowVRAM(node, width, height, sh.Frames)
+
+			req := MediaRequest{
+				Kind: "h3", Prompt: prompt,
+				Width: width, Height: height,
+				Frames: sh.Frames, FPS: 24, Steps: shotSteps,
+				Turbo: turbo, LowVRAM: lowVRAM, PDD: pdd,
+				// 把取消信号带进生成链路：节点超时/点停止时，ComfyUI 里那条
+				// 提交要立刻从队列里撤掉，而不是继续烧到它自己的预算耗尽。
+				Ctx: ctx,
+			}
+			switch {
+			case dubPath != "":
+				// 台词段必须走 ref2va：只有它吃 ref_audio（念稿 1:1 透传 + 口型同步）。
+				// 与末帧续接互斥时音频确定性优先——i2v 根本没有音频输入口。
+				req.Kind = "h3_r2v"
+				req.RefImages = refImgs
+				req.RefAudios = []string{dubPath}
+			case len(refImgs) > 0 && !continuity:
+				// 有定妆图且不是续接镜：身份交给参考图（ref2va 自己管身份，
+				// 与 AddGuide 互斥，所以这里显式不让位首帧）
+				req.Kind = "h3_r2v"
+				req.RefImages = refImgs
+			case continuity:
+				req.Kind = "h3_i2v"
+				req.Image = prevLastFrame
+			}
+
+			// Ref2VA 的 PDD 8 步尚未验证出收益（实测反而 3m40s/镜），先只给 FL2VA 用；
+			// 等有同条件 Ref2VA A/B 再放开，避免“接了加速反而更慢”。
+			if pdd && req.Kind == "h3_r2v" {
+				pdd = false
+				shotSteps = steps
+				req.PDD = false
+				req.Steps = shotSteps
+			}
+
+			// 镜头复用：提示词与全部影响画面的参数都没变时，直接拿上次的产物。
+			// 这是「失败重跑不重烧」的全部依据（见 shot_cache.go 的由来）：
+			// 原来文案承诺复用、代码却从没查过任何存储，一晚 6 次失败每次从第 1 镜重来。
+			cacheKey := ""
+			if !dialogue {
+				cacheKey = shotCacheKey(prompt, width, height, sh.Frames, shotSteps, backend, turbo, pdd)
+			}
+			reusedShot := false
+
+			// 生成 + 段级门：台词段 ASR 验词，不过按 segment_retry 重跑
+			// （采样有随机性，重跑比放过一镜乱语便宜得多）。
+			var part string
+			var gerr error
+			var genElapsed time.Duration
+			attempts := 0
+			gateNote := ""
+			if cacheKey != "" {
+				if cached := shotCacheHit(cacheDir, cacheKey); cached != "" {
+					part, reusedShot = cached, true
+					reusedCount++
+					gateNote = "复用上次产物（提示词与参数未变）"
+					e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "reused", 0)
+					log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 命中复用缓存，跳过生成：%s",
+						i+1, len(plan.Shots), sh.ID, filepath.Base(cached))
+				}
+			}
+			for !reusedShot {
+				attempts++
+				e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "generating", 0)
+				genStart := time.Now()
+				// 看门狗：跑到「明显不可能正常完成」就掐断，别等节点预算烧完（见 shot_watchdog.go）
+				limit := ShotGenerationLimit(sh.Frames, width, height, shotSteps)
+				wd := armShotWatchdog(limit, func() {
+					logShotAborted(sh.ID, i+1, len(plan.Shots), limit)
+					e.interruptComfy()
+				})
+				// 排队期间暂停计时：否则"排队 6 分钟"会被算成"生成 6 分钟"，
+				// 健康镜头会在 5 倍基准处被误杀（run 224 就是这么死的）。
+				req.OnPhase = func(phase string) {
+					switch phase {
+					case "queued":
+						wd.Pause()
+						// 让界面/事件流看得见"在排队"，而不是只有一个转圈的"生成中"。
+						// 实测排队 6 分钟时日志与进度条都没说过一句，看起来像卡死。
+						e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "queued", 0)
+					case "running":
+						wd.Resume()
+					}
+				}
+				part, _, gerr = e.t2i.GenerateMedia(req)
+				genElapsed = time.Since(genStart)
+				wd.Stop()
+				req.OnPhase = nil
+				if gerr != nil {
+					e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "failed", genElapsed)
+					// 逐镜耗时与错误必须落 engine.log。
+					// 由来（2026-10-26）：查 run 203 那次失败时，日志里只有「超时」，
+					// 逐镜实际用了多久得去 sqlite 里挖 shot_progress 的 elapsed_ms 才知道
+					// （第 2 镜 2269.8s，是第 1 镜的 27 倍）。一条日志能省掉整套考古。
+					if wd.Aborted() {
+						log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 被看门狗中止，用时 %s（省下约 %s 的无效 GPU 时间）",
+							i+1, len(plan.Shots), sh.ID, genElapsed.Round(time.Second),
+							(limit - genElapsed).Round(time.Second))
+						return nil, fmt.Errorf("第 %d 镜跑满 %.0f 倍基准仍未完成，已主动中止（避免白烧到节点超时）"+
+							"——先确认 8188/8189 上各只有一个实例、关掉占显存的程序再重跑",
+							sh.ID, shotAbortFactor)
+					}
+					log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 生成失败，用时 %s，疑似 OOM=%v：%.200s",
+						i+1, len(plan.Shots), sh.ID, genElapsed.Round(time.Second), IsOOMError(gerr), gerr.Error())
+					return nil, fmt.Errorf("第 %d 镜生成失败（已完成 %d/%d 镜并已落盘）：%w",
+						sh.ID, len(results), len(plan.Shots), gerr)
+				}
+				log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 生成完成，用时 %s（第 %d 次）",
+					i+1, len(plan.Shots), sh.ID, genElapsed.Round(time.Second), attempts)
+				// 慢镜就地喊一声：那一晚 27 倍慢没有任何一行日志提示，
+				// 用户只能连着重试，每次白烧 15 分钟（见 JudgeShotSpeed 注释）。
+				if freeMB, ferr := e.t2i.FreeVRAMMB(); ferr == nil {
+					if warn := JudgeShotSpeed(sh.Frames, width, height, steps, genElapsed, freeMB); warn != "" {
+						log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 异常慢：%s", i+1, len(plan.Shots), sh.ID, warn)
+					}
+				} else if warn := JudgeShotSpeed(sh.Frames, width, height, steps, genElapsed, 0); warn != "" {
+					log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 异常慢：%s", i+1, len(plan.Shots), sh.ID, warn)
+				}
+				if !dialogue {
+					break
+				}
+				expect := sh.DialogueText()
+				passed, checked := verifyDialogueLine(e.asr, part, expect)
+				if !checked {
+					// ASR 不可达 = 「没验」，不是「念对了」。显式记下，不冒充通过。
+					gateNote = "台词校验未执行（ASR 不可达），不等于念对"
+					break
+				}
+				if passed {
+					gateNote = "ASR 验词通过"
+					break
+				}
+				gateNote = fmt.Sprintf("台词「%s」验词未过（第 %d 次）", expect, attempts)
+				if attempts > segRetry || onSegFail != "retry" {
+					e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "failed", genElapsed)
+					return nil, fmt.Errorf("第 %d 镜段级门未通过：台词「%s」验词 %d 次未转出（已完成 %d/%d 镜已落盘）",
+						sh.ID, expect, attempts, len(results), len(plan.Shots))
+				}
+				log.Printf("[shotlist] 第 %d 镜第 %d 次验词未过，重跑（采样有随机性）", sh.ID, attempts)
+			}
+
+			finishShot(i, pass, sh, part, genElapsed, attempts, gateNote, dub, reusedShot, cacheKey)
+		}
+
+		// 本轮生成完立刻逐镜验收，决定下一轮重拍谁。
+		// 判据是「这一镜自己能不能用」，与成片终检解耦：
+		// 成片 FAIL 往往就是某镜没有音轨 / 帧数不足 / 音画漂了。
+		if pass < reshootMax && len(clips) == len(plan.Shots) {
+			bad := markNeedsReshoot(clips, plan.Shots, 0.2)
+			if len(bad) == 0 {
+				break // 都合格，不必再拍一轮
+			}
+			for _, i := range bad {
+				needsReshoot[i] = true
 			}
 		}
 	}
@@ -464,15 +755,88 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			final = f2
 		}
 	}
+	// ---- 装配后处理：音画对齐 → 响度归一 → 可选 BGM ----
+	// 每一步都只重编码音轨、视频流 copy，且失败不阻断产出（降级为 WARN）。
+	// 顺序不可换：先对齐（否则响度链会以错误时长工作），再归一，最后混 BGM。
+	postNotes := make([]string, 0, 3)
+	if d, fixed, aerr := alignAVToVideo(final, 0.05); aerr != nil {
+		verdict.Add("WARN", "post.av_align", "音画对齐未执行："+aerr.Error())
+		postNotes = append(postNotes, "音画对齐失败")
+	} else if fixed {
+		msg := fmt.Sprintf("音画对齐：修正 %.3fs 时长差", d)
+		verdict.Add("OK", "post.av_align", msg)
+		postNotes = append(postNotes, msg)
+	}
+	if audioMaster {
+		m2 := strings.TrimSuffix(final, filepath.Ext(final)) + "-master" + filepath.Ext(final)
+		if merr := masterLoudness(final, m2, lufs, -1.5, 11); merr != nil {
+			verdict.Add("WARN", "post.loudness", "响度归一未执行："+merr.Error())
+			postNotes = append(postNotes, "响度归一失败")
+		} else {
+			final = m2
+			postNotes = append(postNotes, fmt.Sprintf("响度归一 %.0f LUFS", lufs))
+		}
+	}
+	if strings.TrimSpace(bgmPath) != "" {
+		if !filepath.IsAbs(bgmPath) {
+			if abs, aerr := filepath.Abs(bgmPath); aerr == nil {
+				bgmPath = abs
+			}
+		}
+		if _, serr := os.Stat(bgmPath); serr != nil {
+			verdict.Add("WARN", "post.bgm", "BGM 文件不存在，未混音："+bgmPath)
+			postNotes = append(postNotes, "BGM 缺失")
+		} else {
+			m3 := strings.TrimSuffix(final, filepath.Ext(final)) + "-bgm" + filepath.Ext(final)
+			if berr := mixBGM(final, bgmPath, m3, bgmGain, bgmDuck); berr != nil {
+				verdict.Add("WARN", "post.bgm", "BGM 混音未执行："+berr.Error())
+				postNotes = append(postNotes, "BGM 混音失败")
+			} else {
+				final = m3
+				postNotes = append(postNotes, "BGM 已混入")
+			}
+		}
+	}
 	if abs, aerr := filepath.Abs(final); aerr == nil {
 		final = abs
 	}
+
 	// 成片自检：数帧 + 音画时长比对。肉眼看时长看不出「中间整段画面丢失」，
-	// 但流水线必须自己知道。自检失败不影响产出，只把问题显式挂到输出上。
+	// 但流水线必须自己知道。
 	check, _ := inspectMedia(final)
 	if !check.OK {
 		for _, is := range check.Issues {
 			log.Printf("[shotlist] 成片自检未通过：%s", is)
+		}
+	}
+
+	// ---- 终检门：把成片当「外来素材」再审一遍，并把结论并进 verdict ----
+	// 以前这层只在外面用 verify-media.py 跑：人忘了跑就等于没检。
+	// 现在 FAIL 会进 gate_ok/gate_verdict，调用方按门决策，不靠记性。
+	expectedFrames := 0
+	for _, r := range results {
+		expectedFrames += r.Frames
+	}
+	finalChecks := make([]gateCheck, 0, 8)
+	if finfo, perr := probeGateMedia(final); perr != nil {
+		verdict.Add("WARN", "final.probe", "终检未执行（读不到媒体信息）："+perr.Error())
+	} else {
+		finalChecks = runGateChecks(ctx, final, finfo, filmFinalRules(gates, node, expectedFrames))
+		for _, c := range finalChecks {
+			if c.OK {
+				verdict.Add("OK", "final."+c.Name, c.Detail)
+				continue
+			}
+			level := "FAIL"
+			if strings.EqualFold(c.Level, "warn") {
+				level = "WARN"
+			}
+			verdict.Add(level, "final."+c.Name, "终检未通过："+c.Detail)
+		}
+	}
+	if verdict.HasFail() {
+		for _, it := range verdict.Fails() {
+			log.Printf("[shotlist] 终检 FAIL %s: %s", it.Gate, it.Msg)
 		}
 	}
 
@@ -505,9 +869,12 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		"shots":        len(results),
 		"seconds":      total,
 		"shots_reused": reusedCount,
+		"reshoots":     reshootCount,
 		"detail":       planJSON,
 		"check":        toJSON(check),
 		"check_ok":     check.OK,
+		"final_check":  toJSON(finalChecks),
+		"post":         strings.Join(postNotes, "；"),
 		"gate_report":  toJSON(gateReport),
 		"consistency":  toJSON(consistencyIssues),
 		"gate_ok":      !verdict.HasFail(),
@@ -604,18 +971,130 @@ func toJSON(v interface{}) string {
 	return string(b)
 }
 
+// shotSecPerFrame 健康状态下的单帧生成成本（秒/帧），**只在基准参数下成立**。
+//
+// 原始依据：run 202 / run 208 实测 73–82s / 56–73 帧 ≈ 1.1–1.2 秒/帧，
+// 那一档是 608×352、12 步（turbo LoRA）——**但那是小模型 + 图像时代的数**。
+//
+// 2026-10-26 重新标定到 4.5。同一档参数（56 帧 / 608×352 / 12 步）在 MiniMax H3
+// （20GB 权重、12 步采样）上的成功样本是 84 / 129 / 167 / 190 / 322 / 352 / 509s，
+// 单条 prompt 总耗时 477s，中位约 240s ⇒ 4.3 秒/帧；取 4.5 留余量。
+//
+// 不改的代价（10-26 现场实测，一天之内）：
+//
+//	基准 67s ⇒ 看门狗上限 5×67 = 335s；而 H3 换页时一步就要 69s、整镜 828s，
+//	于是每一镜都在第 5 步左右被误杀，10:26 / 10:50 / 11:11 连杀三次。
+//	更讽刺的是日志里那两行「省下约 -1m38s / -7m28s」是**负数**：
+//	/interrupt 是协作式的，要等当前步跑完，中止本身反而倒赔时间。
+//
+// 改后：基准 252s ⇒ 看门狗 1260s（21min，覆盖 828s 的换页档），
+// 慢镜告警 756s（509s 的真实慢镜不再误报），仍能掐住 2701s（10.7 倍）那种真换页地狱。
+//
+// **预算公式和「慢镜告警」必须共用这一个常数族**，否则两边会各自漂移：
+// 预算按 A 算、告警按 B 算，就会出现「明明超预算了却不告警」这种事。
+const shotSecPerFrame = 4.5
+
+// 基准参数：4.5 秒/帧 只对这三个数成立。
+const (
+	shotBaseWidth  = 608
+	shotBaseHeight = 352
+	shotBaseSteps  = 12
+)
+
+// shotNeedsLowVRAM 决定这一镜是否启用分块注意力/FFN。
+//
+// 24GB 卡在 608×352×124 上不需要分块（实测峰值 23.8GB，仍能全速跑）；
+// 分块会把 attention/FFN 切开，单镜明显变慢。只有工作量超过基准 1.15 倍
+// （例如 736×416×124、512×896×73）才默认开启，避免高分辨率 OOM。
+// 节点显式 low_vram（true/false）优先，给用户留手动覆盖。
+func shotNeedsLowVRAM(node *model.NodeInstance, width, height, frames int) bool {
+	if v, ok := node.Data["low_vram"].(bool); ok {
+		return v
+	}
+	const base = 608 * 352 * 124
+	return int64(width)*int64(height)*int64(frames) > int64(base)*115/100
+}
+
+// shotCostSeconds 单镜的健康成本（秒）= shotSecPerFrame × 帧数 × 像素比 × 步数比。
+//
+// 为什么要带分辨率与步数：原来只有一个 frames×1.2，等于假设"每镜都是 608×352 / 12 步"。
+// 实测 768×448@20 步（run 217 / run 222）的单镜成本是它的约 2.5 倍——那一档每一镜
+// 都会被「慢镜告警」误判成异常，预算也差出一倍多（长镜因此更容易撞节点超时）。
+func shotCostSeconds(frames, width, height, steps int) float64 {
+	if frames <= 0 {
+		return 0
+	}
+	if width <= 0 || height <= 0 {
+		width, height = shotBaseWidth, shotBaseHeight
+	}
+	if steps <= 0 {
+		steps = shotBaseSteps
+	}
+	px := float64(width*height) / float64(shotBaseWidth*shotBaseHeight)
+	st := float64(steps) / float64(shotBaseSteps)
+	return shotSecPerFrame * float64(frames) * px * st
+}
+
+// shotSlowFactor 慢到什么程度才值得喊一声（相对基准的倍数）。
+// 取 3 倍：正常抖动到不了 3 倍；而换页/同卡多实例一来就是 10–27 倍（实测）。
+const shotSlowFactor = 3.0
+
 // ShotListBudget 整节点预算 = 各镜预算之和 + 装配/自检/插帧。
-func ShotListBudget(shotCount, totalFrames int) time.Duration {
+func ShotListBudget(shotCount, totalFrames, width, height, steps int) time.Duration {
 	if shotCount <= 0 {
 		return 2 * time.Hour
 	}
-	d := time.Duration(float64(totalFrames)*1.2)*time.Second +
+	d := time.Duration(shotCostSeconds(totalFrames, width, height, steps)*float64(time.Second)) +
 		time.Duration(shotCount)*90*time.Second +
 		10*time.Minute
 	if d < 15*time.Minute {
 		d = 15 * time.Minute
 	}
 	return d
+}
+
+// JudgeShotSpeed 单镜跑完后的速度判据：返回空串表示正常。
+//
+// 由来（2026-10-26）：那一晚第 2 镜从 84.9s 变成 2269.8s（27 倍），
+// 但当时**没有任何一行日志**说「这一镜不正常」——只有最后一句 node timeout。
+// 于是用户连着重试四次，每次白烧 15 分钟。
+// 这里在每镜结束时就地判一次：慢就喊，并把当时的空闲显存一起写进去，
+// 因为 27 倍慢的成因几乎只有两个——显存换页、或同一张卡上跑了两份同一个实例。
+func JudgeShotSpeed(frames, width, height, steps int, elapsed time.Duration, freeMB int) string {
+	if frames <= 0 || elapsed <= 0 {
+		return ""
+	}
+	base := time.Duration(shotCostSeconds(frames, width, height, steps) * float64(time.Second))
+	if base <= 0 {
+		return ""
+	}
+	ratio := elapsed.Seconds() / base.Seconds()
+	if ratio < shotSlowFactor {
+		return ""
+	}
+	cause := "疑似显存换页（权重在显存/内存之间来回搬）"
+	if freeMB > 0 && freeMB < 1500 {
+		cause = "空闲显存只剩 " + itoaMB(freeMB) + "MB，基本可以确定在换页"
+	} else if freeMB <= 0 {
+		cause = "拿不到空闲显存读数；仍应先怀疑换页或同卡多实例"
+	}
+	return fmt.Sprintf("比基准慢 %.1f 倍（%s / 基准 %s）——%s",
+		ratio, elapsed.Round(time.Second), base.Round(time.Second), cause)
+}
+
+// itoaMB 小工具：避免为了拼一个数字引入 strconv 依赖争议。
+func itoaMB(v int) string {
+	if v <= 0 {
+		return "0"
+	}
+	var buf [12]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
 }
 
 // emitShotProgress 每镜广播一次进度：界面显示「第 3/6 镜」而不是一个转圈的点。
@@ -631,7 +1110,7 @@ func (e *EngineV2) emitShotProgress(runID uint, nodeID string, idx, total, shotI
 			"index":      idx + 1,
 			"total":      total,
 			"shot_id":    shotID,
-			"phase":      phase, // generating / failed / done
+			"phase":      phase, // queued / generating / reused / failed / done
 			"elapsed_ms": elapsed.Milliseconds(),
 		},
 	}

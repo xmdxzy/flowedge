@@ -460,7 +460,7 @@ func assembleShots(clips []string, transitions []string, outPath string) error {
 	// 响度归一：不同镜头的生成音量差异明显，归一后成片才像一条。
 	// 注意：acur 本身已是一个输出标签（如 [ax1]），后面直接接滤镜名；
 	// 再写一个 [afin] 会被 ffmpeg 当成第二个输入 → "More input link labels ... 2 > 1"。
-	parts = append(parts, fmt.Sprintf("%sloudnorm=I=-16:TP=-1.5:LRA=11[amix]", acur))
+	parts = append(parts, fmt.Sprintf("%sloudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.8:level=false[amix]", acur))
 
 	args := []string{"-y", "-v", "error"}
 	for _, c := range clips {

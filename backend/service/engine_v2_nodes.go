@@ -499,7 +499,21 @@ func (e *EngineV2) execTTSNode(node *model.NodeInstance, upstream map[string]int
 		voice = ""
 	}
 
-	release := e.enterSide(sideAudio)
+	// 显存仲裁只在 TTS **真的吃显存**时才需要（2026-10-27 实测教训）。
+	//
+	// 原先这里无条件 enterSide(sideAudio)，而 enterSide 会做两件事：
+	//   ① 抢 heavyMu（全局只剩一个重节点在跑）→ CPU 上跑得动的 voice 被整段挡在
+	//      一条图像/视频任务后面（实测 voice 排队 102s 才说完一句）；
+	//   ② 换侧时 releaseDiffusionAndWait → 把**正在生成图**的 flux 卸掉，
+	//      那个 image 任务当场 `comfyui generation failed` 崩掉。
+	// 而 Kokoro-82M 跑在 CPU 上（deps.json tts.device=cpu，实测 RTF≈0.75），
+	// 一个字节显存都不占：既不需要 heavyMu，也不需要别人让位。
+	//
+	// 判据沿用队列的 ttsOnCPU()（同一份配置、同一个判断），避免两处各拍一套。
+	release := func() {}
+	if !ttsOnCPU() {
+		release = e.enterSide(sideAudio)
+	}
 	defer release()
 
 	// TTS 依赖没起时按需拉起。

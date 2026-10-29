@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,6 +48,7 @@ type MediaRequest struct {
 	Segments  int  // H3：分几段生成再拼接（每段 124 帧 ≈ 5 秒）
 	Interp    bool // 出片后帧率翻倍（ffmpeg minterpolate，CPU，不占显存）
 	Turbo     bool // H3 turbo LoRA：20 步 → 8 步（约 2.5 倍速）
+	PDD       bool // H3 PDD 8-step Acc LoRA：非台词镜 8 步（与 Turbo 互斥）
 
 	// h3_r2v（ref2va）：参考图 + 参考音频 → 口型同步的视频。
 	//
@@ -55,12 +57,22 @@ type MediaRequest struct {
 	// 不再由模型即兴生成（那正是"伪中文乱语"的来源）。
 	RefImages []string // 参考图（≤9），锁定角色外貌；提示词里用 <Picture i> 引用
 	RefAudios []string // 参考音频（≤3），念稿/音色基准；提示词里用 <Audio j> 引用
+
+	// Ctx 取消信号。节点超时 / 用户点停止时，必须把 ComfyUI 里那条提交**从队列里删掉**，
+	// 而不是让它在引擎已经宣布失败之后继续烧 GPU（实测白烧 21 分钟，见 comfy_queue.go）。
+	// 为空等价于 Background（老调用方行为不变）。
+	Ctx context.Context
+
+	// OnPhase 生成阶段变化回调："queued"（在 ComfyUI 队列里等着）/ "running"（正在算）。
+	// 用途：看门狗在排队期间暂停计时——run 224 就是被"排队 6 分钟"耗到 5 倍基准误杀的。
+	OnPhase func(phase string)
 }
 
 // MediaOutput 一个产出文件
 type MediaOutput struct {
-	Kind string // image | video | audio
-	Path string
+	Kind   string // image | video | audio
+	Path   string
+	NodeID string // 产出它的输出节点 id；批量图靠它把产物映射回各镜
 }
 
 // UploadImage 把本地图片上传到 ComfyUI 的 input 目录，返回可被 LoadImage 引用的文件名
@@ -131,6 +143,20 @@ func (s *Text2ImageService) RunGraph(graph map[string]interface{}, timeout time.
 // 启动参数也不同），占另一个端口；flux/Wan 继续走默认实例。两个实例靠
 // 「谁在跑就用谁」的端口探测区分，不能共用一个 BaseURL。
 func (s *Text2ImageService) RunGraphAt(base string, graph map[string]interface{}, timeout time.Duration) ([]MediaOutput, error) {
+	return s.RunGraphAtCtx(context.Background(), base, graph, timeout, nil)
+}
+
+// RunGraphAtCtx 指定实例提交，并支持取消（这是一条**可中断**的生成链路）。
+//
+// 为什么要有：原来这条链路完全不看 ctx——节点已经判超时失败，它还在轮询 /history，
+// 直到自己 20 分钟的预算烧完。实测 run 224：引擎 08:56:21 宣布失败，那条提交
+// 跑到 09:02:42 才返回，中间 6 分钟 GPU 全白烧；而看门狗在 5m35s 就触发过了，
+// 因为那条 prompt 当时还在**排队**，/interrupt 对它无效。
+// 现在 ctx 一断就：删 pending → 停 running → 立刻返回。
+func (s *Text2ImageService) RunGraphAtCtx(ctx context.Context, base string, graph map[string]interface{}, timeout time.Duration, onPhase func(string)) ([]MediaOutput, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if base == "" {
 		return nil, fmt.Errorf("comfyui not configured")
 	}
@@ -150,6 +176,10 @@ func (s *Text2ImageService) RunGraphAt(base string, graph map[string]interface{}
 			return nil, err
 		}
 	}
+
+	// 预检通过后再腾显存：图本身是坏的就不该付这个代价，
+	// 更不该因为一次 400 把别的实例的热模型赶走（见 comfy_evict.go）。
+	s.evictSiblingsFor(base)
 
 	payload, _ := json.Marshal(map[string]interface{}{"prompt": graph})
 	resp, err := s.httpClient().Post(base+"/prompt", "application/json", bytes.NewBuffer(payload))
@@ -174,8 +204,33 @@ func (s *Text2ImageService) RunGraphAt(base string, graph map[string]interface{}
 	}
 
 	deadline := time.Now().Add(timeout)
+	// 提交时队列非空 = 本次注定要先排队。说明白，别让进度条空转
+	// （实测排了 6 分钟，日志里一个字都没有，看起来像"卡死"）。
+	if r, p := s.QueueBusy(base); r > 0 || p > 0 {
+		log.Printf("[queue] %s 提交时队列非空（运行中 %d / 排队 %d）：本次生成会排在后面，等待时间不计入生成预算",
+			strings.TrimRight(base, "/"), r, p)
+	}
+	phase := ""
+	reportPhase := func(p string) {
+		if p == "" || p == phase {
+			return
+		}
+		phase = p
+		if onPhase != nil {
+			onPhase(p)
+		}
+	}
+	reportPhase("queued") // 刚提交一定是排队态；真正开始算时再切 running
+	missing := 0
 	for time.Now().Before(deadline) {
-		time.Sleep(1500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			gone, wasRunning := s.AbortPrompt(base, queued.PromptID)
+			log.Printf("[queue] 生成被取消，已中止 prompt=%s（曾在运行=%v，已离开队列=%v）",
+				shortID(queued.PromptID), wasRunning, gone)
+			return nil, fmt.Errorf("已取消（prompt=%s 已离开队列=%v）：%w", shortID(queued.PromptID), gone, ctx.Err())
+		case <-time.After(1500 * time.Millisecond):
+		}
 
 		hresp, err := s.httpClient().Get(base + "/history/" + queued.PromptID)
 		if err != nil {
@@ -191,20 +246,79 @@ func (s *Text2ImageService) RunGraphAt(base string, graph map[string]interface{}
 			continue
 		}
 		entry, ok := hist[queued.PromptID]
-		if !ok {
+		if ok {
+			missing = 0
+			if entry.Status.StatusStr == "error" {
+				return nil, fmt.Errorf("comfyui 执行失败（prompt_id=%s），首个报错节点见 ComfyUI 日志", queued.PromptID)
+			}
+			outs := s.collectOutputsAt(base, entry)
+			if len(outs) == 0 {
+				continue // 还没产出
+			}
+			return outs, nil
+		}
+		// history 里没有：要么还在排队，要么在跑，要么已经被人从队列里弄走了。
+		// 后一种要能尽快失败——否则会一直等到 timeout，把"已经作废的提交"当成"还在生成"。
+		//
+		// 但判据必须**保守**：ComfyUI 在"离开队列"和"写进 history"之间有一个真空期，
+		// 而实例正忙于加载权重时（实测 23:22 那次：TE 15GB staging 中），
+		// /history/<id> 与 /queue 都可能短暂读不到它。真空期一过就被判"作废"，
+		// 等于把一次本来正常的生成杀掉（2026-10-26 run 260 就是这么死的）。
+		// 所以：连续 miss 阈值放宽到 ≈12 秒，并在判决前再做一次双向复核。
+		running, pending, qerr := s.QueueIDs(base)
+		if qerr != nil {
 			continue
 		}
-		if entry.Status.StatusStr == "error" {
-			return nil, fmt.Errorf("comfyui 执行失败（prompt_id=%s），首个报错节点见 ComfyUI 日志", queued.PromptID)
+		if containsID(running, queued.PromptID) {
+			reportPhase("running")
+		} else if containsID(pending, queued.PromptID) {
+			reportPhase("queued")
 		}
-
-		outs := s.collectOutputsAt(base, entry)
-		if len(outs) == 0 {
-			continue // 还没产出
+		if !containsID(running, queued.PromptID) && !containsID(pending, queued.PromptID) {
+			missing++
+			if missing >= droppedAfterMisses {
+				// 判决前复核：history 里出现了（哪怕 error）就不算丢
+				if _, found, _ := s.historyEntryAt(base, queued.PromptID); found {
+					missing = 0
+					continue
+				}
+				if r2, p2, err2 := s.QueueIDs(base); err2 == nil &&
+					(containsID(r2, queued.PromptID) || containsID(p2, queued.PromptID)) {
+					missing = 0
+					continue
+				}
+				return nil, fmt.Errorf("提交 %s 已不在 ComfyUI 队列里（连续 %d 次、约 %d 秒既不在队列也不在历史；"+
+					"被中断/清空/实例重启），本次生成作废",
+					shortID(queued.PromptID), missing, missing*3/2)
+			}
+		} else {
+			missing = 0
 		}
-		return outs, nil
 	}
 	return nil, fmt.Errorf("生成超时（%s）", timeout)
+}
+
+// droppedAfterMisses 连续多少次"既不在队列、也不在历史"才判定提交作废。
+// 每次轮询 1.5 秒，8 次 ≈ 12 秒——足够跨过 ComfyUI 的队列↔历史真空期。
+const droppedAfterMisses = 8
+
+// historyEntryAt 读一条提交的 history（found=false 表示还没有记录）。
+func (s *Text2ImageService) historyEntryAt(base, promptID string) (comfyHistoryEntry, bool, error) {
+	resp, err := s.httpClient().Get(strings.TrimRight(base, "/") + "/history/" + promptID)
+	if err != nil {
+		return comfyHistoryEntry{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return comfyHistoryEntry{}, false, fmt.Errorf("GET /history → %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	var hist map[string]comfyHistoryEntry
+	if err := json.Unmarshal(body, &hist); err != nil {
+		return comfyHistoryEntry{}, false, err
+	}
+	entry, ok := hist[promptID]
+	return entry, ok, nil
 }
 
 // collectOutputs 从 history 条目里挑出可下载的产物并落盘
@@ -221,7 +335,7 @@ func (s *Text2ImageService) collectOutputsAt(base string, entry comfyHistoryEntr
 	_ = os.MkdirAll(dir, 0755)
 
 	var outs []MediaOutput
-	for _, o := range entry.Outputs {
+	for nodeID, o := range entry.Outputs {
 		// SaveVideo / SaveAnimatedWEBP 的产物分别落在 gifs / videos 下，
 		// 只看 images 会拿到空列表（视频「生成成功但没有文件」就是这个坑）。
 		all := append(append(append([]comfyFileRef{}, o.Images...), o.Gifs...), o.Videos...)
@@ -251,7 +365,7 @@ func (s *Text2ImageService) collectOutputsAt(base string, entry comfyHistoryEntr
 			if abs, e := filepath.Abs(dest); e == nil {
 				dest = abs
 			}
-			outs = append(outs, MediaOutput{Kind: kind, Path: dest})
+			outs = append(outs, MediaOutput{Kind: kind, Path: dest, NodeID: nodeID})
 		}
 	}
 	return outs
@@ -525,6 +639,25 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		// 低显存模式：把注意力与 FFN 分块。峰值显存下来，代价是稍慢。
 		stepsExplicit := req.Steps > 0
 
+		// PDD 8 步（阿里 PAI 官方加速 LoRA）：只给非台词镜用。
+		// 与 turbo 互斥；权重缺失必须显式报错，不能静默退回 12 步。
+		pddOn := false
+		if req.PDD {
+			if req.Turbo {
+				return nil, fmt.Errorf("H3 PDD 与 turbo 不能同时开")
+			}
+			lora := H3PDDLoRAFile(req.Kind)
+			if lora == "" {
+				return nil, fmt.Errorf("H3 PDD 8 步 LoRA 缺失（kind=%s）", req.Kind)
+			}
+			graphExtra["40"] = map[string]interface{}{"class_type": "LoraLoaderModelOnly", "inputs": map[string]interface{}{
+				"model": modelRef, "lora_name": lora, "strength_model": 1.0,
+			}}
+			modelRef = link("40", 0)
+			pddOn = true
+			steps = 8
+		}
+
 		// 涡轮 LoRA：蒸馏采样步数，是长片最省时间的一招。
 		// 没有权重文件时静默跳过（用 base 的 20 步），不让工作流失败。
 		//
@@ -553,7 +686,7 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		// （12 / 3）；turbo 蒸馏卡要求 12 / 6，否则音频轨容易爆音、错位。
 		// 官方：Base 12/3；turbo LoRA 模型卡 12/6。
 		shiftAudio := h3ShiftAudioBase
-		if turboOn {
+		if turboOn || pddOn {
 			shiftAudio = h3ShiftAudioTurbo
 		}
 		graphExtra["41"] = map[string]interface{}{"class_type": "MiniMaxH3SigmaShift", "inputs": map[string]interface{}{
@@ -648,7 +781,7 @@ func (s *Text2ImageService) GenerateMedia(req MediaRequest) (string, string, err
 	case "h3", "h3_i2v", "h3_r2v":
 		timeout = 45 * time.Minute // 40GB 权重 + 40GB 内存工作集，慢是正常的
 	}
-	outs, err := s.RunGraphAt(base, graph, timeout)
+	outs, err := s.RunGraphAtCtx(req.Ctx, base, graph, timeout, req.OnPhase)
 	if err != nil {
 		return "", "", err
 	}

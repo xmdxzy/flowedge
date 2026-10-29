@@ -7,7 +7,9 @@ import {
   reloadDeps,
   startAndWaitDep,
   stopDep,
+  unloadDep,
 } from '../api/client'
+import { depSupportsUnload } from '../api/types'
 import type { DepStatus, McpConfig } from '../api/types'
 import { toast } from './Toast'
 
@@ -90,6 +92,26 @@ export default function DepsDrawer({ onClose }: Props) {
     }
   }
 
+  // 卸载模型但保留进程：省显存又不付冷启动（和「停止」是两件事）
+  const handleUnload = async (dep: DepStatus) => {
+    setPending(dep.name)
+    try {
+      const res = await unloadDep(dep.name)
+      if (!res.supported) {
+        toast(res.note || `${dep.label} 没有卸载接口`, 'error')
+      } else if (res.freed_mb > 0) {
+        toast(`${dep.label} 已释放约 ${(res.freed_mb / 1024).toFixed(1)}GB 显存（进程保留）`, 'success')
+      } else {
+        toast(`${dep.label} 已请求卸载；拿不到读数，无法确认回收量`, 'success')
+      }
+    } catch (err) {
+      toast(errorText(err), 'error')
+    } finally {
+      setPending('')
+      await load()
+    }
+  }
+
   const handleReload = async () => {
     try {
       await reloadDeps()
@@ -159,25 +181,37 @@ export default function DepsDrawer({ onClose }: Props) {
                     {dep.pid ? <span className="muted2">PID {dep.pid}</span> : null}
                     {dep.autostart ? <span className="chip chip--quiet">自启</span> : null}
                     <span className={`chip ${dep.running ? 'chip--success' : 'chip--quiet'}`}>
-                      {dep.running ? '就绪' : '未启动'}
+                      {dep.busy ? '忙（无响应）' : dep.running ? '就绪' : '未启动'}
                     </span>
                   </div>
-                  {dep.hint && !dep.running && <p className="dep-row__hint">{dep.hint}</p>}
+                  {dep.hint && (!dep.running || dep.busy) && <p className="dep-row__hint">{dep.hint}</p>}
                   {dep.last_error && <pre className="dep-row__err mono">{dep.last_error}</pre>}
                 </div>
                 <div className="dep-row__actions">
                   {dep.running ? (
-                    dep.managed ? (
-                      <button
-                        className="btn btn--ghost btn--sm"
-                        disabled={pending !== ''}
-                        onClick={() => void handleStop(dep)}
-                      >
-                        {pending === dep.name ? '停止中…' : '停止'}
-                      </button>
-                    ) : (
-                      <span className="muted2">外部进程</span>
-                    )
+                    <>
+                      {depSupportsUnload(dep.name) && (
+                        <button
+                          className="btn btn--ghost btn--sm"
+                          disabled={pending !== ''}
+                          title="只释放模型显存，进程保留：下次出片不用等重启"
+                          onClick={() => void handleUnload(dep)}
+                        >
+                          {pending === dep.name ? '处理中…' : '卸载显存'}
+                        </button>
+                      )}
+                      {dep.managed ? (
+                        <button
+                          className="btn btn--ghost btn--sm"
+                          disabled={pending !== ''}
+                          onClick={() => void handleStop(dep)}
+                        >
+                          {pending === dep.name ? '停止中…' : '停止'}
+                        </button>
+                      ) : (
+                        <span className="muted2">外部进程</span>
+                      )}
+                    </>
                   ) : (
                     <button
                       className="btn btn--primary btn--sm"

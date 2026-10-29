@@ -57,6 +57,12 @@ func main() {
 	closeLog := setupLogFile(baseDir)
 	defer closeLog()
 
+	// 临时目录：引擎被某些外壳拉起时，%TEMP% 指向平时那个目录却**建不了文件**。
+	// 必须在任何 os.CreateTemp / 拉依赖之前修好，否则下面两处都会炸（实测）：
+	//   - 贴字节点：贴字失败：临时文件创建不了：open C:\Users\...\Temp\...
+	//   - ComfyUI-H3 一起就退：FileNotFoundError: No usable temporary directory
+	ensureProcessTempDir(baseDir)
+
 	// 子命令：把内嵌的语音服务脚本导出到 exe 旁的 local-services/
 	if len(os.Args) > 1 && (os.Args[1] == "--export-services" || os.Args[1] == "-export-services") {
 		exportServices(baseDir)
@@ -163,12 +169,14 @@ func main() {
 	ttsService := service.NewTTSService(ttsURL)
 	videoService := service.NewVideoService()
 
-	gpuSched := service.NewGPUScheduler(24576)
-	gpuSched.RegisterModel("qwen2.5:7b", "llm", 4500)
-	gpuSched.RegisterModel("qwen2.5:13b", "llm", 8500)
-	gpuSched.RegisterModel("sd_xl_base_1.0", "text2image", 11000)
-	gpuSched.RegisterModel("whisper-large-v3", "asr", 6000)
-	gpuSched.RegisterModel("flux1-schnell-fp8", "text2image", 11000)
+	// 显存驻留路线：模型 → 侧别 → 实测峰值（data/model_residency.json）。
+	// 以前这五条是写死的，而且早就和本机实际在跑的模型对不上——
+	// 预算算术建立在错误的表上，等于没算。现在只改表、不改代码。
+	residency := service.LoadResidencyRoute(filepath.Join(baseDir, "data", "model_residency.json"))
+	gpuSched := service.NewGPUScheduler(residency.TotalVRAMMB)
+	registered := residency.Apply(gpuSched)
+	log.Printf("[residency] 已登记 %d 个模型（总显存 %dMB）：%s",
+		registered, residency.TotalVRAMMB, residency.Describe())
 
 	engine := service.NewEngineV2(llmService, t2iService, asrService, ttsService, videoService, gpuSched, wsHub)
 
@@ -188,6 +196,9 @@ func main() {
 
 	// 依赖进程管理器：ComfyUI / ASR / TTS 可一键托管（先探活，已在跑则复用）
 	depSupervisor := service.NewSupervisor(comfyURL, asrURL, ttsURL)
+	// 托管进程输出落盘到 logs/<name>.log：没这一行，H3/ASR/TTS 自己的
+	// 加载耗时、卸载、真实报错全部被丢进空设备（见 Supervisor.SetLogDir 注释）。
+	depSupervisor.SetLogDir(filepath.Join(baseDir, "logs"))
 	engine.SetSupervisor(depSupervisor)
 	depSupervisor.AutoStartAll()
 
@@ -268,8 +279,10 @@ func main() {
 		c.Next()
 	})
 
-	// 任务队列：默认并发 2（单 GPU 上并行跑两个 flux 只会互相抢显存）
+	// 任务队列：默认 GPU 道并发 1（单卡上并行跑两条扩散任务只会互相抢显存）+
+	// CPU 道并发 2（voice 这类不吃显存的任务不再排在 20 分钟的长片后面）
 	jobQueue := service.NewJobQueue(db, getQueueConcurrency())
+	jobQueue.SetCPUConcurrency(getCPUQueueConcurrency())
 	if n := jobQueue.RecoverInterrupted(); n > 0 {
 		log.Printf("上次异常退出的运行任务 %d 个，已标记为 interrupted", n)
 	}
@@ -289,6 +302,22 @@ func main() {
 		log.Printf("清理上次残留的质量循环临时图 %d 条", n)
 	}
 
+	// 空闲显存回收（2026-10-28）：连续 10 分钟没有任何 GPU 活，就把托管模型的
+	// 权重还回显存——用户的原话是「无任务时释放我的显存，flowedge 白白占用了那么多」。
+	//
+	// 三个前提缺一不可，且都在本会话里实测过：
+	//   ① TTS 的 /unload 现在真的还（修复前返回 ok 却仍占 16274MiB）；
+	//   ② 加载失败会回滚，不留死块（tts_breeze_server.py 的 load() 里 except 调 _release_vram）；
+	//   ③ 卸完能装回来 —— 实测 60s（走 inductor 缓存）比重启进程 137s 还快。
+	// 阈值与守卫见 data/deps.json 的 idle_release 段；没写这一段时用默认值。
+	//
+	// stop 传 nil：本进程没有优雅关闭流程，退出即结束，该 goroutine 随进程消失。
+	if idlePolicy := service.LoadIdleReclaimPolicy(); idlePolicy.After > 0 {
+		go service.NewIdleReclaimer(engine, jobQueue, idlePolicy).Run(nil)
+	} else {
+		log.Printf("[idle-reclaim] 配置里 after_seconds=0，空闲显存回收已关闭")
+	}
+
 	api := r.Group("/api")
 	{
 		wsHandler := handler.NewWSHandler(wsHub)
@@ -300,6 +329,27 @@ func main() {
 		api.POST("/preflight", producer.PreflightPipelines)
 		// 出片：唯一运行入口
 		api.POST("/produce", producer.Produce)
+
+		// 画布面（2026-10-29）：节点目录 / 工作流 CRUD / 图体检 / 干跑。
+		// 画布与出片台是同一份数据（workflows 表）的两个视图：
+		// 流水线只是"命好名、填好默认值的预置图"，模板按 pipelines.json 现生成、不入库。
+		graphHandler := handler.NewGraphHandler(db, pipes)
+		// 与 /api/preflight 用同一个探测器，保证「干跑说齐了」和「出片说没齐」不会打架
+		graphHandler.SetProbe(func() service.Capabilities {
+			return service.ProbeCapabilities(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
+		})
+		graphHandler.SetSupervisor(depSupervisor)
+		api.GET("/node-catalog", graphHandler.Catalog)
+		api.GET("/workflows", graphHandler.ListWorkflows)
+		api.POST("/workflows", graphHandler.CreateWorkflow)
+		api.GET("/workflows/templates", graphHandler.Templates)
+		api.GET("/workflows/:id", graphHandler.GetWorkflow)
+		api.PUT("/workflows/:id", graphHandler.UpdateWorkflow)
+		api.DELETE("/workflows/:id", graphHandler.DeleteWorkflow)
+		// 跑一张画布图：与流水线出片共用队列 / 预检 / 显存门 / 取消语义
+		api.POST("/workflows/:id/run", producer.RunWorkflow)
+		api.POST("/graph/validate", graphHandler.Validate)
+		api.POST("/graph/dry-run", graphHandler.DryRun)
 
 		// 运行看板
 		runHandler := handler.NewRunHandler(db, eventLogger)
@@ -322,6 +372,8 @@ func main() {
 		api.POST("/deps/reload", depHandler.Reload)
 		api.POST("/deps/:name/start", depHandler.Start)
 		api.POST("/deps/:name/stop", depHandler.Stop)
+		// 卸载模型但保留进程：把显存要回来，又不付冷启动代价
+		api.POST("/deps/:name/unload", depHandler.Unload)
 		api.GET("/deps/:name/wait", depHandler.Wait)
 
 		// 对外接入配置生成（MCP 客户端配置）：exe 绝对路径与端口只有引擎自己知道
@@ -375,6 +427,18 @@ func getQueueConcurrency() int {
 	// 真要并行（多卡/纯 CPU 任务）用 FLOWEDGE_QUEUE_CONCURRENCY 显式开。
 	c := 1
 	if v := os.Getenv("FLOWEDGE_QUEUE_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c = n
+		}
+	}
+	return c
+}
+
+// getCPUQueueConcurrency CPU 道并发（默认 2，见 service.JobQueue 的分道说明）。
+// 设为 1 = 退回「全部串行」的旧行为；设大了没有意义（TTS 服务本身单进程排队）。
+func getCPUQueueConcurrency() int {
+	c := 2
+	if v := os.Getenv("FLOWEDGE_QUEUE_CPU_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c = n
 		}
@@ -623,4 +687,34 @@ func setupLogFile(baseDir string) func() {
 	log.SetOutput(io.MultiWriter(os.Stdout, f))
 	log.Printf("=== FlowEdge %s 启动，日志写入 %s ===", version, path)
 	return func() { _ = f.Close() }
+}
+
+// ensureProcessTempDir 保证本进程（以及它派生的依赖）有一个**确定可写**的临时目录。
+//
+// 由来（2026-10-26 实测，两种症状同一个根因）：
+//   - 贴字节点：`贴字失败：临时文件创建不了：open C:\Users\...\AppData\Local\Temp\...`（run 249）
+//   - ComfyUI-H3：`FileNotFoundError: No usable temporary directory found in [...]`，
+//     进程一起就退，表现像"模型/权重坏了"
+// 而同一个 python、同一段 Go 从交互 shell 跑完全正常——差别只在**谁派生的它**。
+// 这类父子进程差异不值得继续猜（job 对象 / 受限令牌 / 安全软件都可能），
+// 统一把 TEMP/TMP/TMPDIR 指到 <部署目录>/data/tmp：依赖日志就写在这里，一定可写。
+//
+// 顺序很重要：必须在 setupLogFile 之后、任何 os.CreateTemp 与拉依赖之前调用。
+func ensureProcessTempDir(baseDir string) {
+	dir := filepath.Join(baseDir, "data", "tmp")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[tmp] 建临时目录失败（%v），沿用系统 TEMP", err)
+		return
+	}
+	// 系统临时目录能写就不动它（尊重机器上的既有配置）
+	if f, err := os.CreateTemp("", "flowedge-probe-*.tmp"); err == nil {
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+		return
+	}
+	_ = os.Setenv("TEMP", dir)
+	_ = os.Setenv("TMP", dir)
+	_ = os.Setenv("TMPDIR", dir)
+	log.Printf("[tmp] 系统临时目录不可写，已切到 %s（托管依赖会继承）", dir)
 }

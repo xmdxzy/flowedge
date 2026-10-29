@@ -22,8 +22,17 @@ type Workflow struct {
 	Name      string          `gorm:"size:255;not null" json:"name"`
 	Nodes     json.RawMessage `gorm:"type:text" json:"nodes"`
 	Edges     json.RawMessage `gorm:"type:text" json:"edges"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+
+	// Origin 这张图从哪来：user（画布保存）/ agent（MCP 生成）。
+	// qc 临时图不带 origin —— 由 name 前缀 `qc:` 标识并由 SweepTransient 清理，
+	// 判定不解析 origin，避免两套语义打架。
+	Origin string `gorm:"size:32;index;default:user" json:"origin,omitempty"`
+	// SchemaVersion 图 schema 版本。不认识的版本只读，不做静默转换：
+	// 静默转换会把"这段图在新版本里语义变了"变成一次沉默的产物漂移。
+	SchemaVersion int `gorm:"default:1" json:"schema_version"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	// 没有触发器/没有 cron：出片只能由人（或 MCP 客户端）显式发起。
 }

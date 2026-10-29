@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -65,6 +65,19 @@ func classifyError(err error) string {
 // ErrorCodeOf 导出给 handler 层判断语义用（例如「主动中止 ≠ 失败」）。
 func ErrorCodeOf(err error) string { return classifyError(err) }
 
+// cancelledIfContextDone 把「上下文已取消之后冒出来的任何错误」改写成取消语义。
+//
+// 由来（2026-10-26 实测 run 242）：用户点停止，节点 2.2 秒就返回了，但界面上
+// 显示的是「失败 · comfyui 执行失败（prompt_id=…）」——因为中止时我们把那条
+// prompt 从队列撤掉，ComfyUI 于是把它记作 error，节点把这句话原样抛了上来。
+// **用户主动中止 ≠ 失败**，状态必须分开，否则重试策略和"成功率"统计都会被污染。
+func cancelledIfContextDone(ctx context.Context, err error) error {
+	if err == nil || ctx == nil || ctx.Err() == nil {
+		return err
+	}
+	return &nodeExecError{Code: model.ErrorCodeCancelled, Err: fmt.Errorf("运行已取消")}
+}
+
 // maxSubWorkflowDepth 子工作流/循环最大嵌套深度
 const maxSubWorkflowDepth = 4
 
@@ -103,6 +116,11 @@ type EngineV2 struct {
 	// P0 可观测性：按节点类型维护耗时 EWMA（毫秒），供长任务 ETA 与进度心跳下发
 	durMu   sync.Mutex
 	durEWMA map[string]float64
+
+	// 本次运行的「预计总耗时」：shotlist 能从分镜表直接算出来，
+	// 第一次跑也能给出真 ETA（ETAFor 要等同类节点跑过一次才有值）。
+	runEtaMu sync.Mutex
+	runEta   map[uint]time.Duration
 
 	memo   *llmMemo // 确定性 LLM 调用备忘（翻译 / 优化 / 拆解）
 	memoMu sync.Mutex
@@ -291,6 +309,52 @@ func (e *EngineV2) ETAFor(typ string) int64 {
 	return int64(v)
 }
 
+// SetRunPrediction 登记本次运行「预计总耗时」。
+//
+// 为什么不能只靠 ETAFor：那一个是**按节点类型的历史均值**，第一次跑某类节点时是 0，
+// 而 shotlist 的工作量是可以由分镜表直接算出来的（帧数 × 分辨率 × 步数，见
+// shotCostSeconds）。实测日志里 eta_ms 长期恒为 0，进度条只能空转，等于没有 ETA。
+// 有了这个预测，第一次跑也能给出「还剩多久」。
+func (e *EngineV2) SetRunPrediction(runID uint, total time.Duration) {
+	if e == nil || runID == 0 || total <= 0 {
+		return
+	}
+	e.runEtaMu.Lock()
+	if e.runEta == nil {
+		e.runEta = make(map[uint]time.Duration)
+	}
+	e.runEta[runID] = total
+	e.runEtaMu.Unlock()
+}
+
+// predictedRemaining 按预测总量与已用时长算剩余（毫秒）。无预测返回 ok=false。
+func (e *EngineV2) predictedRemaining(runID uint, elapsed time.Duration) (int64, bool) {
+	if e == nil || runID == 0 {
+		return 0, false
+	}
+	e.runEtaMu.Lock()
+	total, ok := e.runEta[runID]
+	e.runEtaMu.Unlock()
+	if !ok || total <= 0 {
+		return 0, false
+	}
+	rem := total - elapsed
+	if rem < 0 {
+		rem = 0
+	}
+	return rem.Milliseconds(), true
+}
+
+// ClearRunPrediction 运行结束时清掉，避免 map 无限长。
+func (e *EngineV2) ClearRunPrediction(runID uint) {
+	if e == nil || runID == 0 {
+		return
+	}
+	e.runEtaMu.Lock()
+	delete(e.runEta, runID)
+	e.runEtaMu.Unlock()
+}
+
 // SetEventLog 注入事件日志（nil 表示只广播不落库）
 func (e *EngineV2) SetEventLog(l *EventLogger) { e.eventLog = l }
 
@@ -400,6 +464,10 @@ func (e *EngineV2) CancelRun(runID uint) bool {
 // interruptComfy 让 ComfyUI 立刻停手（取消运行时长片一镜要跑 3–5 分钟，
 // 只取消 ctx 会让显存继续被占着）。两个实例都打，打不到就忽略——
 // 取消失败不该阻断取消本身。
+//
+// 2026-10-26 补：光打 /interrupt 不够。实测那条 prompt 当时还在**排队**，
+// /interrupt 只作用于"正在执行"的一条 → 一个像素都没停；它 6 分钟后才开始跑，
+// 又烧了 21 分钟，直到引擎 20 分钟预算耗尽。所以这里先清 pending 再停执行。
 func (e *EngineV2) interruptComfy() {
 	if e.t2i == nil {
 		return
@@ -412,16 +480,11 @@ func (e *EngineV2) interruptComfy() {
 		if base == "" {
 			continue
 		}
-		url := strings.TrimRight(base, "/") + "/interrupt"
-		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(`{"interrupt":true}`))
-		if err != nil {
-			continue
+		if n := e.t2i.ClearPendingQueue(base); n > 0 {
+			log.Printf("[queue] %s 清掉 %d 条还没开始执行的排队提交（孤儿，不撤就会在后面继续烧卡）",
+				strings.TrimRight(base, "/"), n)
 		}
-		req.Header.Set("Content-Type", "application/json")
-		cl := &http.Client{Timeout: 3 * time.Second}
-		if resp, err := cl.Do(req); err == nil {
-			resp.Body.Close()
-		}
+		e.t2i.Interrupt(base, "")
 	}
 }
 
@@ -764,11 +827,17 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					case <-hbStop:
 						return
 					case <-ticker.C:
+						elapsed := time.Since(hbStart)
+						// 有本次运行的预测就用它（真 ETA）；没有才退回同类节点历史均值。
+						eta, ok := e.predictedRemaining(runID, elapsed)
+						if !ok {
+							eta = e.ETAFor(node.Type)
+						}
 						e.emit(runID, Event{Type: "node_progress", NodeID: nid,
 							Data: map[string]interface{}{
 								"type":       node.Type,
-								"elapsed_ms": time.Since(hbStart).Milliseconds(),
-								"eta_ms":     e.ETAFor(node.Type),
+								"elapsed_ms": elapsed.Milliseconds(),
+								"eta_ms":     eta,
 							}})
 					}
 				}
@@ -812,18 +881,39 @@ func (e *EngineV2) runWithContext(ctx context.Context, nodesJSON, edgesJSON []by
 					e.emit(runID, Event{Type: "node_retry", NodeID: nid, Message: fmt.Sprintf("attempt %d/%d", attempt+1, retryCount+1)})
 				}
 				resCh := make(chan execResult, 1)
+				// 每个 attempt 一个可取消的子 ctx：超时时必须**取消它**，
+				// 否则那条协程会继续跑下去。
+				//
+				// 由来（2026-10-26 实测）：run 211 的 sl-1 在 02:20:51 判超时失败，
+				// 而它的逐镜事件在 02:45:25 才写出「shot=1 failed 2701.5s」——
+				// 也就是说**引擎已经宣布失败之后，那条协程又跑了 25 分钟**，
+				// 期间还在发事件、调 ASR、跑 ffmpeg。幽灵事件让事件流与真实状态对不上。
+				nodeCtx, nodeCancel := context.WithCancel(ctx)
 				go func() {
-					o, err := e.executeNode(ctx, execNode, upstream)
+					defer nodeCancel()
+					o, err := e.executeNode(nodeCtx, execNode, upstream)
 					resCh <- execResult{o, err}
 				}()
 				select {
 				case res := <-resCh:
 					out, execErr = res.out, res.err
+					nodeCancel()
+					execErr = cancelledIfContextDone(ctx, execErr)
 				case <-time.After(timeout):
+					nodeCancel() // 先让协程看到取消，再报超时
 					execErr = &nodeExecError{
 						Code: model.ErrorCodeTimeout,
 						Err:  fmt.Errorf("node timeout after %s", timeout),
 					}
+					// 超时必须让 ComfyUI 停手。
+					//
+					// 由来（2026-10-26 实测）：run 203 的 sl-1 在 23:17:17 判超时失败，
+					// 但同一镜的生成一直跑到 23:45:14 才结束——**引擎放弃之后 GPU 又空转了 28 分钟**。
+					// 取消运行那条路径早就这么做（CancelRun → interruptComfy），
+					// 超时这条却漏了：只丢掉了结果，没停掉正在烧卡的活。
+					// 一次超时 ≈ 白烧十分钟级 GPU，这只是「省资源」里最直接的一刀。
+					e.interruptComfy()
+					log.Printf("[timeout] 节点 %s(%s) 超时 %s：已请求 ComfyUI 中断，避免继续空转", nid, node.Type, timeout)
 				}
 				if execErr == nil {
 					break
@@ -993,10 +1083,12 @@ func (e *EngineV2) registerBuiltinNodes() {
 
 	e.nodes = nodeRegistry{
 		// 只保留"出片链路"用得到的节点。画布类的通用节点（if_else / loop /
-		// comfy_workflow / input_source / text_split）与工具类节点（vision / select /
+		// input_source / text_split）与工具类节点（vision / select /
 		// asr / video_compose / subtitles / post_production / scene_grid /
 		// quality_gate / consistency_gate）已随通用画布一起删除：
 		// 它们的入口（用户自己画图）不存在了，留着就是死代码。
+		// comfy 是 2026-10-29 加回的逃生舱（画布上跑用户自备的 ComfyUI 图），
+		// 与已删的 comfy_workflow（引用库里另一张图的壳节点）不是一回事。
 		"start":        plain(e.execStartNode),
 		"llm":          e.execLLMNode,
 		"text2image":   plain(e.execText2ImageNode),
@@ -1006,6 +1098,7 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"text2video":   e.execText2VideoNode,
 		"storyboard":   e.execStoryboardNode,
 		"shotlist":     e.execShotListNode,
+		"comfy":        e.execComfyNode,
 		"tts":          plain(e.execTTSNode),
 		"quality_loop": e.execQualityLoopNode,
 		"end":          plain(e.execEndNode),

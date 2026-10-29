@@ -1,4 +1,4 @@
-﻿# FlowEdge 项目规则（给未来的自己/其他 agent）
+# FlowEdge 项目规则（给未来的自己/其他 agent）
 
 > 这些都踩过一次，别再踩第二次。详细证据链见 skill `local-multimodal-ops`。
 > **产品形态先读 `docs/多模态出片台-v2.md`**：7 条固定流水线 / 21 条 API / 质量循环怎么接。
@@ -110,8 +110,23 @@ agent 的 shell 起不了任何活过本次调用的进程——沙箱每命令�
 
 ### 0.16 v2 后的事实（2026-10-25，先读这条再动手）
 
-FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**，且**图不再由用户画**。
-完整说明见 `docs/多模态出片台-v2.md`。会做错的地方：
+FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**。
+完整说明见 `docs/多模态出片台-v2.md`；画布部分见 `docs/画布与流水线统一-20261029.md`。会做错的地方：
+
+- **画布回来了（2026-10-29，本条覆盖下面所有"图不再由用户画"的说法）**：用户要的就是
+  "自己定义工作流"，v2 删画布是砍症状——旧画布缺的是五道护栏（空画布起步 / 无类型系统 /
+  无成本预估 / 无 dry-run / 节点元数据双写），不是缺能力。现在是**一张图两个视图**：
+  出片台（7 条预置，填字段即出片）+ 画布（任意 DAG，从模板出发改），共用 `workflows` 表、
+  同一个引擎、同一条校验链（结构 → 端口类型 → 参数 → 依赖预检）。
+  新增 9 条 API：`GET /api/node-catalog`、`GET|POST /api/workflows`、
+  `GET /api/workflows/templates`、`GET|PUT|DELETE /api/workflows/:id`、
+  `POST /api/graph/validate`、`POST /api/graph/dry-run`。
+  **加节点只改两处**：`service/nodespec.go`（调度元数据）+ `service/nodecatalog.go`
+  （端口 / 字段 / 成本 / Label）；两张表键集合不一致时 `nodecatalog_test.go` 立刻红。
+  前端调色板、检查器、连线校验**全部**由 catalog 生成，不许硬编码节点类型。
+  **`type_mismatch` 是 warn 不是 error**：`image_edit` 流水线里 `start-1 → up-1` 就是
+  一条"文本接只收图片的超分节点"的死线（纯执行顺序依赖，运行期无害），定成 error 会把
+  自家产品拦下；真正该拦的是 `input_unreachable`（必填输入既没有兼容入边、节点自身也没值）。
 
 - **产品形态是 7 条固定流水线**（`data/pipelines.json`）：`image` / `image_batch` /
   `image_edit` / `video` / `video_from_image` / `film` / `voice`。用户选一条、填字段，
@@ -119,13 +134,15 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**，
   **不是**加画布节点。
 - **唯一运行入口 `POST /api/produce {pipeline, params, invoked_by}`**。再也不会出现
   "先 POST /api/workflows 再 /run" 的两段式。
-- **别再找这些接口**（已删除，不是坏了）：`/api/workflows*`、`/api/modules`、
+- **别再找这些接口**（已删除，不是坏了；**`/api/workflows*` 已在 2026-10-29 恢复**，见上面画布那条）：
+  `/api/modules`、
   `/api/estimate`、`/api/vram/profiles`、`/api/models*`、`/api/instances`、
   `/api/llm/profiles`、`/api/gpu/*`、`/api/runs/:id/step|continue|resume`、
   `/api/preflight` 的旧语义（现在按 `{pipeline, params}` 体检）。对外只剩 21 条。
 - **别再找这些节点**：`if_else`、`loop`、`comfy_workflow`、`input_source`、`text_split`、
   `vision`、`select`、`asr`、`video_compose`、`subtitles`、`post_production`、
-  `scene_grid`、`quality_gate`、`consistency_gate`、`prompt_opt`。节点只剩 12 种；
+  `scene_grid`、`quality_gate`、`consistency_gate`、`prompt_opt`。节点只剩 13 种
+  （2026-10-29 起含 `comfy` 逃生舱，见《画布与流水线统一》§9）；
   旧图会报 `unknown node type`，这是预期。其中**场景锁与提示词优化的库函数保留**
   （`scene_grid.go` / `prompt_opt.go`），因为 `text2video` 内部要用：
   优化开关是 `text2video.data.prompt_opt`，参考图/音频走 `ref_images`/`ref_audio`
@@ -146,10 +163,66 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**，
 - **单镜实测 ≈6.6 分钟**（608×352×124 帧 @12 步，含 H3 冷加载，2026-10-25 本机）：
   film 2 镜 shotlist 13.2 分钟。旧笔记里的"120s/段"是别的参数/实例下的数字，
   **别拿它估时**；估时按"镜数 × 6–7 分钟 + LLM + 装配"报区间。
+  > 2026-10-29 更新：film 默认 steps 20→12、LowVRAM 自动关；1 镜冷启动生成 2m10s（整 run 215.7s）。
+  > 新估时改按「首镜 3–4 分钟 + 后续 1.5–2.5 分钟 + LLM + 装配」，并用当次实测覆盖。
 - **默认队列并发是 1，且 Enqueue 不阻塞**：单卡并行出片只会互相抢显存
   （实测 H3 跑片时并发一条文生图 → 后者 5m15s 超时，像"节点坏了"）。
   旧 `JobQueue.Enqueue` 用信号量满则阻塞，会把 produce 请求卡住；
   现在入队即返回（`queue_test.go` 钉住：不阻塞/FIFO/上限/拒收）。
+- **队列按资源分道（2026-10-27）**：GPU 道串行（默认 1），CPU 道并行（默认 2，
+  `FLOWEDGE_QUEUE_CPU_CONCURRENCY`）。判类走白名单 `cpuOnlyNodeTypes`（当前只有 `start`/`end`），
+  **认不出的节点一律 GPU**——判反的代价是两条任务抢显存。
+  **`tts` 不在白名单里，它看配置**：`JobClassForNodes` 用 `ttsOnCPU()` 读 `deps.json` 的
+  `tts.device`，为 `cpu` 才进 CPU 道。这条是两次反复换来的：Breeze TTS 2 写着 `device=cpu`
+  却 CUDA-only（CPU 合成 500/超时、常驻 8–16GB），Kokoro-82M 才真在 CPU 上跑
+  （实测 RTF 0.33–0.95、零显存，见 `docs/复盘-资源调度与近期失误-20261027.md §6`）——
+  配置不等于事实，但判据必须只有一个来源，否则队列与仲裁会各拍一套。
+- **CPU 上的 TTS 不许进显存仲裁（2026-10-27 实测）**：`execTTSNode` 原无条件
+  `enterSide(sideAudio)`，两个后果都实测到了——voice 排在 image 后面 **102 秒**才说完一句；
+  换侧时 `releaseDiffusionAndWait` 把**正在生成图**的 flux 卸掉，那个 image 当场
+  `comfyui generation failed`。现在 `ttsOnCPU()` 为真时不抢 `heavyMu`、不逼别人让位。
+
+- **GPU 上的 TTS 必须给扩散侧让位，超时必须覆盖冷加载（2026-10-27）**：这是上面那条的
+  镜像面，坑了两次才补齐。实测 Breeze TTS 2（3.47B BF16）驻留 **15.2GB**、冷加载 **180s**、
+  加载完峰值 19.9GB，而 H3 权重就要 20.5GB——两者物理上装不下。原实现有三处缺口：
+  1. `enterSide(sideDiffusion)` 只卸 Ollama，**语音侧没人管** → 配音跑过之后出片，卡上
+     只剩 3–4GB，H3 退化成部分加载（87s → 2269s）。现在扩散侧/语言侧都会调
+     `releaseAudioSide`：优先 `POST :8103/unload`（进程保留、下次自动重载），失败退回停服务。
+  2. `tts` 节点原来**没有 Timeout**，吃 `defaultNodeTimeout=180s`——与冷加载 180s 打平，
+     「服务被卸载后第一次配音」必然失败（run #288 `node timeout after 3m0s`）。现在
+     `ttsTimeout` = 5 分钟 + 每字 200ms。
+  3. HTTP 预算原来 60s 起算，短文本 150s，连加载都走不完。现在
+     `ttsFirstCallBudget=240s` + 每字 1.5s。
+  另：**`tts.idle_unload` 保持 0（不让服务自己空闲卸载）**，但**引擎侧现在有统一回收**
+  （2026-10-28，`service/vram_idle.go`，配置 `data/deps.json` 的 `idle_release` 段）：
+  连续 `after_seconds`（默认 600）秒无 GPU 活 → TTS `/unload` + ComfyUI `/free` +
+  Ollama `keep_alive=0`，**进程全部保留**。为什么必须由引擎判：服务自己的超时只看自己的
+  `last_used`，看不见引擎队列里排队/在跑的活，会在「下一镜 5 秒后就要配音」时把模型卸掉。
+  「出片撞车」仍然只靠 `releaseAudioSide`（`engine.log` 里有 `[vram] 释放语音侧显存（进扩散侧）`）。
+  - **假卸载**（2026-10-28 修掉）：`POST /unload` 曾返回 `{"ok":true,"unloaded":true}` 而进程
+    仍占 **16274 MiB**（设备空闲只从 6737 缩到 6730）。根因是 `FastBreezeStreamingRuntime`
+    与 `model` **循环引用**（`runtime.model` / `model._fast_text_encoder_cudagraph` /
+    `runtime._backbone_graphs` 持有 CUDAGraph），只把 `_state` 置 None 引用计数归不了零 ⇒
+    PyTorch 视这些块为 allocated，`empty_cache()` 无权动。修法见 `_release_vram()`：
+    **断环 → `gc.collect()`×2 → `synchronize` → `empty_cache` → `ipc_collect`**（顺序错了白做）。
+    实测 allocated 8532→270 MB、空闲 6641→**20973 MiB**，回收 14.3GB / 6.1s。
+  - **加载失败会回滚**：`load()` 里 except 调 `_release_vram`，不再「卡在 phase runtime 占 16GB 不 ready」。
+  - **守卫**：`idle_release.tts_guard=true`（默认）= 「卸完空闲仍 ≥ `tts_min_free_mb`(20787)
+    才卸 TTS」，避免「卸了装不回来」。设 false = 接受下次配音前手动腾卡。
+  - **判据**：`/health` 的 `idle_unload` 仍应为 0；新增的 `vram` 段是「卸载真假」的唯一读数
+    （`loaded=false` 而 `allocated_mb` 仍大 ⇒ 没真释放）。空闲时 `loaded=false` 是**预期**，
+    下次合成自动重载（实测 60s，比重启进程 137s 快）。回收日志 grep `[idle-reclaim]`。
+
+- **排队是真的排队，也是真的能取消（2026-10-27）**：入队写 `pending`，被调度起跑那一刻才写
+  `running`+`started_at`（旧实现在 Enqueue 之前就写 running，于是"等 20 分钟"和"在烧卡"
+  在面板/看门狗/ETA 三处一样）。`/runs/:id/cancel` 先试执行中、再试排队中——
+  只修 ComfyUI 那一层不够，引擎自己的队列有一模一样的洞。
+- **显存预检：自家占用排队，外来占用才拦（2026-10-27）**：提交时判一次
+  （`HasGPUWork()` 为真不拦），开跑前再复判三次（间隔 2s，容忍 CUDA 异步释放）。
+  两次 409 误伤（热实例 / 自家队列）都是「只看空闲数字，不看谁占着」。
+  `vramAdvisoryReserveImageMB` 必须逐字对齐 `deps.json` 的 `--reserve-vram`（当前 1 → 1024）。
+- **队列里 `wg.Done()` 必须在 `dispatch()` 之后**：先归零再补位会让 `Wait()` 提前返回，
+  下一条 `Add(1)` 直接 panic `WaitGroup is reused before previous Wait has returned`（实测踩到）。
 - **引擎日志在 `<exe目录>/logs/engine.log`**：常驻时 stdout 被外壳（工作站/bat）收走，
   出事只能看这个文件。8MB 滚一份 `.1`。
 - **一致性门有两层**：`shotlist` 开机前审 plan（轴线/光比/锁句，FAIL 拦下）；
@@ -158,8 +231,86 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**，
 - **部署必须带上 `data/pipelines.json`**（exe 同目录）：缺它引擎 `log.Fatalf` 不启动。
   `build-windows.py` 会复制到 `dist/data/`，`3-应用更新并重启.bat` 会同步到 `运行/data/`；
   手动换 exe 时别忘了这一步。
+- **H3 必须由引擎托管启动，`deps.json` 里 `h3.reserve_vram` 要 0**（2026-10-26 实测）：
+  24GB 卡上 20480(权重)+4096(预留)=24576=整张卡，桌面再占 1.3GB ⇒ **算术上永远差 1.3GB**，
+  ComfyUI 必然退化成"部分加载"（权重留内存、按步换进显存），同一镜 87s → 2269s。
+  手工 bat 起的实例带的是 `--reserve-vram 4`，引擎只会"探活复用"、改不了它的参数——
+  **要改参数必须先停掉手工实例，让引擎自己派生**。改完用进程 argv 复核（不是看配置）。
+- **"中止"= 删 pending + 停 running + 复核**：`/interrupt` 只作用于正在执行的那条，
+  对**排队中**的提交一个像素都不停。实测它 6 分钟后照样开始跑、又烧 21 分钟。
+  实现见 `service/comfy_queue.go`；生成链路必须带 ctx（`RunGraphAtCtx`），
+  否则节点判超时之后它还会自己跑满 20 分钟预算。
+- **`attachDepLog` 不许在持有 `s.mu` 时调用**（2026-10-26 死锁现场）：它会读 `logDir`，
+  再抢同一把不可重入的锁 ⇒ 永久死锁。症状极具误导性：`/api/deps` 全挂（20s+ 不返回）、
+  `/api/deps/{name}/start` 返回 202 却不再派生进程，而 `/api/health`、`/api/runs` 完全正常。
+  Start 的持锁路径用无锁的 `depLogHandleAt`，测试 `deps_deadlock_test.go` 钉住。
+- **镜头复用缓存**在 `<产物目录>/shot-cache/<hash>.mp4`（键=提示词+宽高帧步+后端+turbo）；
+  台词段不缓存（画面取决于当次 TTS 音轨）。要重拍就改提示词或删缓存文件。
+- **H3 的 input/output 必须在工作区内**（2026-10-27 实测）：`SaveVideo` 写
+  `D:/AI/ComfyUI/output` 报 `av.error.PermissionError [Errno 13]`——同一路径交互 shell 可写、
+  只有派生进程写不了，表现为"采样跑完、最后一步全片作废"。把 `deps.json` 的 `h3.args`
+  里 `--input-directory/--output-directory` 指到 `data/comfy/{input,output}`（停旧实例再 start，
+  用进程 argv 复核），引擎照旧走 `/view` 取片。另：`D:\AI\ComfyUI-H3\temp` 被删会让 H3
+  起不来（`os.makedirs ... 拒绝访问`），别让清理脚本碰这个目录。
 - 代码量参考（2026-10-25 实测）：backend 62 个非测试 Go 文件 / 17.3k 行（改前 23.6k），
   测试 43 个文件 / 5.8k 行，API 21 条，节点 12 种。数字明显超出说明有东西被加回来了。
+  （2026-10-29 画布回归后：API 31 条（新增 10 条画布 CRUD/校验/运行）、节点 13 种——
+  画布面 + comfy 逃生舱是有意加的，不算"加回来"。）
+- **H3 提速现状（2026-10-29 实测）**：`运行/data/deps.json` 的 h3.args 已加 `--use-ck-attention`，
+  换提示词 178s→85–95s（约 2×），峰值仍 23.8GB。更深一层：每镜物理盘读 **35.4GB / 113s（313MB/s）**，
+  而盘本身 2.6GB/s；64GB 内存 commit 打满、页面文件峰值 27GB（2 槽，最大 128GB）。
+  `--disable-fast-disk` / `--disable-dynamic-vram` / 关 pinned / Defender 排除模型目录
+  都实测无正收益（换页或方差更大），别再试。根因、A/B 与后续
+  “内存升 128GB / W4A8 + fp8 VAE / 批量构图”方案见 `docs/H3-加速与显存优化-20261029.md`。
+- **2026-10-29 分镜默认值已改**：`shotlist` 不再硬编码 `LowVRAM: true`——≤608×352×124 默认关，
+  >1.15× 基准才自动开（防 OOM），节点 `low_vram` 显式覆盖；`film`/`film_from_plan` 的 steps 20→12。
+  1 镜 `film_from_plan` 冒烟：生成 2m10s、整 run 215.7s（冷启动），124 帧 + AAC，
+  ComfyUI 日志无 `MiniMaxLowVRAMAttention`/`MiniMaxChunkFeedForward`。旧 20 步 shot-cache 键不再命中，
+  升级后首跑会重烧；旧 exe 在 `运行/FlowEdge.exe.old-20261029-182541`。
+- **多镜身份锁实测（2026-10-29）**：只给 `characters` + 普通提示，第 2 镜会漂成黑发女仆；
+  **Ref2VA 六段式（subject_definitions / `<Picture 1>` / retention_analysis）+ 3 张参考图**才锁住
+  （两镜同一蓝发鱼尾/鲸鱼围裙角色）。2 镜实测：2m15s + 2m04s，总 run 271.4s；
+  成片 245 帧 = 2×124−3，差值是 xfade 接缝合法重叠，不是丢段。
+  `verify-media.py` 另报 **WARN silence_gap 0.85s @5.14s**（接缝处可听静音，mean −24.4dB）；
+  交付前需修（首静音裁剪 / 共享环境声床 / 加长 acrossfade）。
+  已试首静音裁剪+自身循环：0.888s→0.489s，但该镜自身还有 0.49/0.26s 静音段，
+  **单靠裁剪不够，必须整片铺连续环境声床（bgm/room-tone 低电平）**。
+- **多镜/高分辨率/音频修复实测（2026-10-29 20:45）**：3 镜六段式 3m23+2m23+4m07，总 611.9s，
+  368 帧，身份一致、ASR 空；但有 3 处接缝静音和 −0.0dB 削波。736×416 单镜 7m32s，整 run 457.5s，
+  ComfyUI history 确认自动 LowVRAM 节点存在，无 OOM。音频修法：`mixBGM` 允许 `bgm_gain=0`，
+  `assembleShots`/`masterLoudness`/`mixBGM` 加 `alimiter=limit=0.8:level=false`；
+  run 349 用缓存 39.3s 重跑，`verify-media` **全绿**（245 帧、mean −23.7、max −1.9、无静音）。
+  **`alimiter` 必须 `level=false`**，否则自动抬回 0dB；中文路径走 PowerShell 请求会变 `??`，
+  要用 UTF-8 文件体或 ASCII 路径。
+- **PDD 8 步实测（2026-10-29 21:20）**：FL2VA/Ref2VA 两份 LoRA 各 1.28GB 已放
+  `D:/AI/Models/comfyui/loras/`，ComfyUI 可枚举。同提示词/seed、608×352×124：
+  CK+base 12 步 **88.7s**（峰值 23,820MB） vs CK+PDD 8 步 **42.5s**（23,858MB），**2.09×**。
+  抽帧构图/角色一致。`h3-bench.py` 已加 `--lora/--shift-audio`。
+  **已接入 FlowEdge**：非台词 **FL2VA** 镜走 PDD 8 步；2 镜生产 1m11+1m49，总 216.1s，
+  `verify-media` 全绿。**Ref2VA PDD 实测反而 3m40+3m50（585.8s）**，代码已把 `h3_r2v`
+  的 PDD 关掉、回 base 12；别再默认给角色片开 PDD。
+- **多镜批量构图已上线（2026-10-30，P2 结构优化）**：`film`/`film_from_plan` 的
+  `batch_size` 字段（默认 3，0/1=关）。连续、非台词、组内无 continue、缓存未命中、
+  lowVRAM 同档的镜合成**一张图**提交（屏障节点强制两阶段），换权重 3N→3。
+  直连 A/B 3 镜 752/654s vs 306/381s（**≈2.05×，峰值显存持平**）；
+  生产同帧数对照 569s → 285s（**2.0×**），verify-media 全绿。
+  屏障节点在 `D:/AI/ComfyUI-H3/custom_nodes/flowedge_batch.py`（**删了它批量就废**，
+  ComfyUI 报 unknown node）；引擎侧 `comfy_media_batch.go`，产物靠 `NodeID=140+i`
+  映射回镜，**改节点 id 布局必须同步**。批量失败自动回退逐镜，不构成新门槛。
+  详见 `docs/H3-加速与显存优化-20261029.md §10.4`。
+- **直连 ComfyUI 的 A/B 必须挪 seed+prompt（2026-10-30 实测）**：ComfyUI 有**节点级
+  输出缓存**——完全相同的图再提交一次，2 秒就"完成"并返回上次的产物（server_s≈0）。
+  `h3-batch-bench.py` 用 `--nonce` 同时挪 seed 与 prompt 尾巴；两臂必须**不同** nonce
+  （相同 nonce 会让 TE 编码节点命中缓存，白送批量臂收益）。
+- **引擎重启后 ComfyUI 会留下孤儿实例（2026-10-30）**：部署换 exe 杀了引擎，但它派的
+  ComfyUI 活着继续占 8189 ⇒ 新引擎 start 再派生一个。判据：`/api/deps` 里
+  `managed:false` + `pid:null`（端口被非托管进程服务）。**先 `taskkill` 孤儿再 start**，
+  起完用进程清单确认只剩一个。另：venv 的 python.exe 是启动器，真实工作进程是它的
+  子进程（系统 python 路径 + venv site-packages）——父子两个 pid 是**正常**的，
+  别当双实例误杀。
+- **pipelines.json 加字段必须带 `bind`**：没有 bind 的字段参数在 API 层被接受
+  （params 里看得见）但**永远不会落到节点 data**——表现为"开关传了却不生效"，
+  且不报任何错。新字段照抄相邻字段的 bind 结构（shotlist 系都是 `sl-1`）。
 
 ## 1–4. 环境硬约束（权重 / 显存 / 进程 / 下载）
 

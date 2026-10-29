@@ -95,6 +95,7 @@ type gateRules struct {
 	durationTol   float64
 	requireAudio  bool
 	loudnessMinDB float64
+	loudnessMaxDB float64
 	maxSilenceGap float64
 	forbidSpeech  bool
 	speechMaxSecs float64
@@ -279,10 +280,14 @@ func runGateChecks(ctx context.Context, path string, info *gateMediaInfo, r gate
 	}
 
 	// 响度 / 静音（仅视频/音频）
-	if info.kind != "image" && (r.loudnessMinDB != 0 || r.maxSilenceGap > 0 || r.forbidSpeech) {
+	if info.kind != "image" && (r.loudnessMinDB != 0 || r.loudnessMaxDB != 0 || r.maxSilenceGap > 0 || r.forbidSpeech) {
 		loud, silences := probeLoudnessAndSilence(path)
 		if r.loudnessMinDB != 0 {
-			add("loudness_min", loud.mean >= r.loudnessMinDB, "warn", "均值 %.1fdB（门限 %.1fdB）", loud.mean, r.loudnessMinDB)
+			add("loudness_min", loud.mean >= r.loudnessMinDB, "warn", "均值 %.1fdB（门限 ≥%.1fdB）", loud.mean, r.loudnessMinDB)
+		}
+		// 响度上限：过载/爆音只能靠上限抓。上下限同源于 gates.audio.loudness_db。
+		if r.loudnessMaxDB != 0 {
+			add("loudness_max", loud.mean <= r.loudnessMaxDB, "warn", "均值 %.1fdB（门限 ≤%.1fdB）", loud.mean, r.loudnessMaxDB)
 		}
 		if r.maxSilenceGap > 0 {
 			worst := 0.0

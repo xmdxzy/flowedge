@@ -64,7 +64,14 @@ def run_parts(run_id: int):
             if files:
                 break
     video = out.get("video")
-    return [f for f in files if f and os.path.exists(f)], video, run
+    transitions = []
+    try:
+        raw = (run.get("params") or {}).get("plan") or ""
+        plan = json.loads(raw) if isinstance(raw, str) else raw
+        transitions = [str(s.get("transition") or "cut").lower() for s in (plan.get("shots") or [])]
+    except Exception:
+        transitions = []
+    return [f for f in files if f and os.path.exists(f)], video, transitions
 
 
 def grab_frame(src: str, dest: str, last: bool = False):
@@ -116,11 +123,14 @@ def compare(a: str, b: str):
     layout = float(np.mean([hist_bc(x, y) for x, y in zip(layout_blocks(ha), layout_blocks(hb))]))
     palette = hist_bc(palette_hsv(ha), palette_hsv(hb))
     luma = abs(float(ha[:, :, 2].mean()) - float(hb[:, :, 2].mean())) / 255.0
-    verdict = ("FAIL" if layout < TH["layout"] else "WARN") if layout < TH["layout"] else "PASS"
-    if palette < TH["palette"]:
+    # 三档而不是两档：i2v 续接的首帧是重编码过的，实测会稳定落在 0.88–0.93，
+    # 那是「轻微曝光/对比变化」，不是换场地。WARN 强制人工看接缝两帧。
+    warn = {"layout": TH["layout"] - 0.03, "palette": TH["palette"] - 0.03, "luma": TH["luma"] - 0.02}
+    verdict = "PASS"
+    if layout < warn["layout"] or palette < warn["palette"] or luma > TH["luma"]:
         verdict = "FAIL"
-    if luma > TH["luma"]:
-        verdict = "FAIL"
+    elif layout < TH["layout"] or palette < TH["palette"] or luma > warn["luma"]:
+        verdict = "WARN"
     return {"layout": round(layout, 3), "palette": round(palette, 3),
             "luma": round(luma, 3), "verdict": verdict}
 
@@ -133,8 +143,9 @@ def main():
     a = ap.parse_args()
 
     video = ""
+    transitions = []
     if a.run:
-        parts, video, _ = run_parts(a.run)
+        parts, video, transitions = run_parts(a.run)
         if not parts:
             raise SystemExit("run %s 没有分段（parts 空）——可能是单镜头或没有落 detail" % a.run)
     elif a.parts:
@@ -150,8 +161,12 @@ def main():
             grab_frame(parts[i], last_a, last=True)
             grab_frame(parts[i + 1], first_b, last=False)
             m = compare(last_a, first_b)
-            rows.append({"seam": "%d->%d" % (i + 1, i + 2), "from": os.path.basename(parts[i]),
-                         "to": os.path.basename(parts[i + 1]), **m})
+            # 转场语义：引擎看「上一镜」的 transition 决定本镜是否续接
+            tr = transitions[i] if i < len(transitions) else "cut"
+            if tr != "continue" and m["verdict"] != "PASS":
+                m["verdict"] = "CUT"   # 换场：接缝本来就该变，只报数值不判死
+            rows.append({"seam": "%d->%d" % (i + 1, i + 2), "transition": tr,
+                         "from": os.path.basename(parts[i]), "to": os.path.basename(parts[i + 1]), **m})
 
     fails = [r for r in rows if r["verdict"] == "FAIL"]
     if a.json:
@@ -160,12 +175,16 @@ def main():
     else:
         print("=== %s · %d 段 · %d 条接缝 ===" % (video or (("run %d" % a.run) if a.run else "parts"), len(parts), len(rows)))
         for r in rows:
-            print("  %-6s 配色 %5.3f %-4s  布局 %5.3f %-4s  亮度 %5.3f %-4s  → %s" % (
-                r["seam"], r["palette"], "ok" if r["palette"] >= TH["palette"] else "低",
+            print("  %-6s %-8s 配色 %5.3f %-4s  布局 %5.3f %-4s  亮度 %5.3f %-4s  → %s" % (
+                r["seam"], r.get("transition", "cut"),
+                r["palette"], "ok" if r["palette"] >= TH["palette"] else "低",
                 r["layout"], "ok" if r["layout"] >= TH["layout"] else "低",
                 r["luma"], "ok" if r["luma"] <= TH["luma"] else "大", r["verdict"]))
-        print("阈值：配色 ≥%.2f · 布局 ≥%.2f · 亮度差 ≤%.2f" % (TH["palette"], TH["layout"], TH["luma"]))
-        print("结论：%s" % ("全部接缝通过" if not fails else "%d 条接缝 FAIL（换场地/换光/换调色）" % len(fails)))
+        print("阈值：配色 ≥%.2f · 布局 ≥%.2f · 亮度差 ≤%.2f（低 0.03 内记 WARN：i2v 续接重编码的正常抖动）" % (TH["palette"], TH["layout"], TH["luma"]))
+        warns = [r for r in rows if r["verdict"] == "WARN"]
+        print("结论：%s" % ("全部接缝通过" if not fails and not warns else
+                           ("%d 条 FAIL（换场地/换光/换调色）" % len(fails)) if fails else
+                           ("%d 条 WARN —— 人工看一眼接缝两帧再决定" % len(warns))))
     return 0 if not fails else 1
 
 

@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -180,14 +181,24 @@ func (e *EngineV2) generateMediaWithDegrade(req MediaRequest) (string, string, i
 	for attempt := 0; attempt <= maxOOMDegrade; attempt++ {
 		path, kind, err := e.t2i.GenerateMedia(cur)
 		if err == nil {
+			if level > 0 {
+				// 降档跑出来的片子必须留痕：用户看的是画面，日志看的是原因。
+				log.Printf("[oom] %s 已按降档版跑出（共降 %d 档：%s）—— 这一版画质是打折的", req.Kind, level, note)
+			}
 			return path, kind, level, note, nil
 		}
 		lastErr = err
 		if !IsOOMError(err) || e.t2i == nil {
 			return "", "", level, note, err
 		}
+		// 显存降级必须落日志。由来（2026-10-25）：此前这里一行日志都没有，
+		// 于是「某支片子是降档跑出来的」在 engine.log 里完全看不见——
+		// 表现成「今天出的片怎么糊了」，而日志说一切正常（§0.12 ②）。
+		// 同一类证据也解释了「H3 跑完显存归零」：OOM 之后 releaseDiffusionAndWait
+		// 会主动放掉权重，只在日志里留一行，否则没人能反推出是谁卸的。
+		log.Printf("[oom] %s 生成 OOM（%.160s），等显存归还后降档重试", req.Kind, err.Error())
 		// CUDA 显存释放是异步的：不等就「卸载了但没释放」，紧接着重试必然再 OOM
-		e.releaseDiffusionAndWait()
+		e.releaseDiffusionAndWait("OOM 降级重试")
 		// 已经用掉全部重试次数：再降一档也没机会执行，不能把这一档算进 level
 		// （否则返回的「降了几档」比实际生效的多一档，用户按它判断画质会判断错）
 		if attempt >= maxOOMDegrade {
@@ -200,6 +211,16 @@ func (e *EngineV2) generateMediaWithDegrade(req MediaRequest) (string, string, i
 		note = degradeNote(cur, next)
 		cur = next
 		level++
+		log.Printf("[oom] 降到第 %d 档：%s", level, note)
 	}
+	log.Printf("[oom] %s 降到底仍失败（共降 %d 档）：%.200s", req.Kind, level, errText(lastErr))
 	return "", "", level, note, lastErr
+}
+
+// errText 把可能为 nil 的错误转成可打印字符串（lastErr 为 nil 时不能直接 .Error()）。
+func errText(err error) string {
+	if err == nil {
+		return "（无错误信息）"
+	}
+	return err.Error()
 }

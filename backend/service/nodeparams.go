@@ -85,6 +85,13 @@ func ValidateNodeParams(nodes []model.NodeInstance, hasInbound map[string]bool) 
 				issues = append(issues, NodeParamIssue{n.ID, n.Type, "audio_path",
 					"转写缺少音频：填 audio_path，或连一条上游音频线"})
 			}
+		case "comfy":
+			// 图的两个来源（模板名 / 内联 JSON）都必须非空才跑得起来；
+			// 这一项与端口无关（comfy 没有必填端口），只能在这里拦。
+			if !nonEmpty(n.Data["template"]) && !nonEmpty(n.Data["workflow_json"]) {
+				issues = append(issues, NodeParamIssue{n.ID, n.Type, "template",
+					"comfy 节点缺图：填模板名（template，JSON 放 data/comfy_workflows/）或内联 JSON（workflow_json）"})
+			}
 		}
 	}
 	return issues

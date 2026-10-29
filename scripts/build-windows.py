@@ -132,7 +132,9 @@ def embed_services():
         shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
 
     # 白名单：只带用户需要的服务脚本与依赖清单（不含测试脚本）
-    include = {"asr_server.py", "tts_server.py", "requirements.txt"}
+    # tts_breeze_server.py 也带上：它虽然需要独立 venv + 7GB 权重（不像 tts_server.py
+    # 那样自包含），但缺了它，换目录重装后 deps.json 会指向一个不存在的脚本。
+    include = {"asr_server.py", "tts_server.py", "tts_breeze_server.py", "requirements.txt"}
     copied = 0
     for name in sorted(os.listdir(LOCAL_SERVICES)):
         if name not in include:

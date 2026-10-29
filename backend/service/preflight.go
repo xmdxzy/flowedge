@@ -46,6 +46,8 @@ func depFix(dep string) (fixDep string, fixable bool, fix string) {
 		return "comfyui", true, "点「一键修复」启动 ComfyUI（冷启动约 20–40 秒，启动中不要重复点）"
 	case "comfy_h3":
 		return "comfy_h3", true, "点「一键修复」启动 ComfyUI-H3；注意它与默认实例互斥，会自动切实例"
+	case "comfy_moss":
+		return "comfy_moss", true, "点「一键修复」启动 ComfyUI-MOSS（图内文字渲染实例）；注意它与默认实例互斥，会自动切实例"
 	case "ollama":
 		// 语言模型现在也是可托管依赖（video 的提示词优化、拆镜、分镜规划都要它）。
 		// 以前只能让用户"另开终端跑 ollama serve"——在双击 exe 的交付形态里等于
@@ -86,14 +88,20 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 			return true
 		}
 		name := "comfyui"
-		if profile == "h3" {
+		switch profile {
+		case "h3":
 			name = "comfy_h3"
+		case "moss":
+			name = "comfy_moss"
 		}
 		return sup.Startable(name)
 	}
 	profileSuffix := func(profile string) string {
-		if profile == "h3" {
+		switch profile {
+		case "h3":
 			return "_h3"
+		case "moss":
+			return "_moss"
 		}
 		return "ui"
 	}
@@ -155,6 +163,38 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 		case "tts":
 			if c, ok := capabilityOf("tts", caps); ok {
 				add(n, "tts", "语音合成（TTS）", c)
+			}
+		case "comfy":
+			// 逃生舱节点：instance 选哪个实例，就查哪个实例。
+			// comfyui / h3 走能力探针（在跑 = OK，没在跑但引擎托管可拉起 = 放行）；
+			// moss 没有独立探针（Capabilities 里没有这项），只查「引擎能不能拉起它」
+			// ——它是 Autostart=false 的按需实例，在跑与否不影响判定。
+			profile := comfyInstanceProfile(n)
+			label := "自定义 ComfyUI 图"
+			switch profile {
+			case "h3":
+				label = "自定义 ComfyUI 图（H3 实例）"
+			case "moss":
+				label = "自定义 ComfyUI 图（MOSS 实例）"
+			}
+			if profile == "moss" {
+				if !comfyStartable("moss") {
+					dep := "comfy_moss"
+					fd, fx, ftext := depFix(dep)
+					missing = append(missing, DepRequirement{
+						NodeID: n.ID, NodeType: n.Type, Dep: dep,
+						Label: label, Hint: "MOSS 工作树缺失（D:/AI/ComfyUI-MOSS）或未配置启动参数",
+						Fix: ftext, Fixable: fx, FixDep: fd,
+					})
+				}
+				break
+			}
+			dep := "comfyui"
+			if profile == "h3" {
+				dep = "comfy_h3"
+			}
+			if c, ok := capabilityOf(dep, caps); ok {
+				addComfy(n, profile, label, c)
 			}
 		}
 	}

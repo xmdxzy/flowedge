@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -77,6 +78,32 @@ func (h *DepHandler) Stop(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "stopped"})
+}
+
+// Unload 卸载模型、保留进程（省显存又不付重启代价）。
+//
+// 为什么需要它：平台原来只有 start / stop 两个动作，而「把 H3 占着的 20GB 要回来」
+// 只有 stop 一条路——下次冷启动 30–60 秒 + 权重重载 3 分钟。
+// ComfyUI 的 /free 只卸权重、进程还在，是个缺了很久的中间档。
+func (h *DepHandler) Unload(c *gin.Context) {
+	if h.sup == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "依赖管理器未初始化"})
+		return
+	}
+	name := c.Param("name")
+	res, err := h.sup.Unload(name)
+	if err != nil {
+		code := http.StatusBadGateway
+		switch {
+		case strings.Contains(err.Error(), "未知依赖"):
+			code = http.StatusNotFound
+		case strings.Contains(err.Error(), "未运行"):
+			code = http.StatusConflict
+		}
+		c.JSON(code, gin.H{"error": err.Error(), "result": res})
+		return
+	}
+	c.JSON(http.StatusOK, res)
 }
 
 // Wait 等待就绪（供脚本/自动化使用，最多等 120 秒）

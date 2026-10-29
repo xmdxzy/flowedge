@@ -432,7 +432,7 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 			// 那时如实报错，让用户降参数重跑，比交一条半截变画质的片强。
 			// 降的是共享的 req，所以后续所有段都用同一档参数。
 			if perr != nil && IsOOMError(perr) && len(parts) == 0 && segDegrade < maxOOMDegrade {
-				e.releaseDiffusionAndWait() // CUDA 异步释放，不等就白降
+				e.releaseDiffusionAndWait("分段 OOM 降级") // CUDA 异步释放，不等就白降
 				segLadder := e.t2i.Bundles.Ladder(roleForKind(req.Kind))
 				if next, changed := degradeMediaRequest(req, segLadder); changed {
 					segNote = degradeNote(req, next)
