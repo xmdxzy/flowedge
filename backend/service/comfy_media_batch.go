@@ -14,7 +14,17 @@ package service
 //  - 不解释失败。批量图一镜构图错误整批失败，由调用方（shotlist）决定回退逐镜；
 //    这里只把"哪一镜缺产物"说清楚。
 //  - 不混 kind。fl2va 与 ref2va 是两个 checkpoint，一组内必须同 kind；
-//    台词镜（要先合成音轨才能喂 ref_audio）与续接镜（要上一镜末帧）不收。
+//    续接镜（要上一镜末帧）不收。
+//
+// 台词镜（2026-10-30 起可同批，但默认关，由 `batch_dialogue` 字段打开）：
+// 每镜自带一条念稿音轨，各自一个 LoadAudio(150+i) → 自己的
+// ReferenceToVideo.ref_audios，模型侧仍是「一镜一音轨」，只是换权重次数
+// 仍是 3 次而不是 3N 次。音轨必须在提交前**全部**合成好（调用方做 TTS 前置），
+// 图本身不产音频。每镜只放 1 段参考音频：多镜片每镜只有一条念稿轨，
+// 多段只增图复杂度不增收益（单镜路径仍支持 ≤3 段）。
+// 为什么默认关：同分镜实测批量 221/229/292s vs 逐镜热态 187s、逐镜冷态 244s+（第 2 镜
+// 换页卡死）。批量只在「权重必须反复重载」的冷路径占优，热态略慢，且换页方差远大于
+// 两者差 —— 默认按逐镜走，冷启动/长片再显式打开。
 
 import (
 	"context"
@@ -29,6 +39,10 @@ const BatchSaveNodeBase = 140
 
 // h3BatchMax 最大一批 8 镜：屏障节点只开了 8 个槽，且单批失败重试的代价随批长线性涨。
 const h3BatchMax = 8
+
+// BatchAudioNodeBase 台词镜念稿音轨的 LoadAudio 节点 id 基数（150+i）。
+// 必须避开 SaveVideo 段（140+i，产物→镜头的映射靠它）与单镜段（50–137）。
+const BatchAudioNodeBase = 150
 
 // BuildH3BatchGraph 把 N 个同构 H3 请求合并为一张两阶段图。
 // 返回图与按镜序排列的 SaveVideo 节点 id。
@@ -53,8 +67,12 @@ func (s *Text2ImageService) BuildH3BatchGraph(reqs []MediaRequest) (map[string]i
 		if r.Image != "" {
 			return nil, nil, fmt.Errorf("第 %d 镜是续接镜（需要首帧图），不能批量", i+1)
 		}
-		if len(r.RefAudios) > 0 {
-			return nil, nil, fmt.Errorf("第 %d 镜带参考音频（台词镜），不能批量", i+1)
+		// 台词镜可同批，但每镜只放 1 段参考音频（多镜片每镜只有一条念稿轨）。
+		if len(r.RefAudios) > 1 {
+			return nil, nil, fmt.Errorf("第 %d 镜带 %d 段参考音频，批量只支持每镜 1 段", i+1, len(r.RefAudios))
+		}
+		if len(r.RefAudios) == 1 && kind != "h3_r2v" {
+			return nil, nil, fmt.Errorf("第 %d 镜带参考音频但 kind=%s（只有 ref2va 吃音频）", i+1, kind)
 		}
 		if r.Steps != steps || r.Turbo != turbo || r.LowVRAM != lowVRAM || r.PDD != pdd {
 			return nil, nil, fmt.Errorf("第 %d 镜采样参数与第 1 镜不一致，不能同批", i+1)
@@ -175,9 +193,24 @@ func (s *Text2ImageService) BuildH3BatchGraph(reqs []MediaRequest) (map[string]i
 		condIn[fmt.Sprintf("cond_%d", i+1)] = link(strconv.Itoa(e), 0)
 		latIn[fmt.Sprintf("lat_%d", i+1)] = link(strconv.Itoa(samp), 0)
 
+		// 台词镜的念稿音轨：每镜一个 LoadAudio（150+i），只接自己的 ref_audios。
+		// 上传走 /upload/image（与单镜路径同一条：LoadAudio 也从 input 目录读）。
+		audRefs := map[string]interface{}{}
+		if len(r.RefAudios) > 0 {
+			name, aerr := s.UploadImageAt(s.baseForKind(kind), r.RefAudios[0])
+			if aerr != nil {
+				return nil, nil, fmt.Errorf("第 %d 镜参考音频上传失败：%w", i+1, aerr)
+			}
+			aid := strconv.Itoa(BatchAudioNodeBase + i)
+			graph[aid] = map[string]interface{}{"class_type": "LoadAudio",
+				"inputs": map[string]interface{}{"audio": name}}
+			audRefs["ref_audio_1"] = link(aid, 0)
+		}
 		prompt := r.Prompt
 		if kind == "h3_r2v" {
-			prompt = ensureRef2VAPrompt(prompt, len(r.RefImages), 0)
+			// 提示词里的 <Picture k>/<Audio k> 引用必须与实际接线条数一致，
+			// 否则模型会去找不存在的参考（六段式改写依赖这个数）
+			prompt = ensureRef2VAPrompt(prompt, len(r.RefImages), len(audRefs))
 		}
 		if kind == "h3_r2v" {
 			graph[strconv.Itoa(e)] = map[string]interface{}{"class_type": "MiniMaxH3ReferenceToVideo",
@@ -186,7 +219,7 @@ func (s *Text2ImageService) BuildH3BatchGraph(reqs []MediaRequest) (map[string]i
 					"prompt": prompt, "width": width, "height": height, "length": r.Frames,
 					"ref_image_size": "match",
 					"ref_images":     batchRefLinks(),
-					"ref_audios":     map[string]interface{}{},
+					"ref_audios":     audRefs,
 				}}
 		} else {
 			graph[strconv.Itoa(e)] = map[string]interface{}{"class_type": "MiniMaxH3ImageToVideo", "inputs": map[string]interface{}{

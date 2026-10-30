@@ -141,28 +141,42 @@ type shotResult struct {
 }
 
 // batchRunLen 从 start 数连续可同批的镜数（含 start；<2 表示不能批量）。
-// 可批量 = 全组非台词（台词镜要先出音轨才能喂 ref_audio）；组内上一镜不声明
-// continue（下一镜要等它的末帧）；start 自己不是续接镜；每镜缓存未命中
-// （命中了就该直接复用，进组只会白等）；lowVRAM 判档一致（批量图只有一份模型链）。
-// 纯函数，便于单测；调用方提供 lowVRAM/cacheMiss 两个判据。
-func batchRunLen(shots []Shot, start, maxN int, prevContinued bool, lowVRAM func(int) bool, cacheMiss func(int) bool) int {
-	if start >= len(shots) || shots[start].HasDialogue() || prevContinued {
-		return 0
-	}
-	if !cacheMiss(start) {
+// 判据全部由调用方注入（纯函数，便于单测）：
+//   - canBatch(j)：这一镜本身可以进批。台词镜能否进批由 shotlist 的
+//     batch_dialogue 决定（默认关：热态实测略慢，见 execShotListNode 里的数字），
+//     非台词镜还要求缓存未命中；
+//   - same(j)：这一镜与第 start 镜同签名（kind / steps / 低显存档一致）——
+//     批量图共用一份模型链，签名不同的镜混进来只会整批重载。
+//
+// start 自己不能是续接镜（prevContinued），组内上一镜声明 continue 就断组
+// （下一镜要等它的末帧，末帧只有生成完才有）。
+func batchRunLen(shots []Shot, start, maxN int, prevContinued bool, canBatch, same func(int) bool) int {
+	if start >= len(shots) || prevContinued || !canBatch(start) {
 		return 0
 	}
 	n := 1
 	for j := start + 1; j < len(shots) && n < maxN; j++ {
-		if shots[j].HasDialogue() || shots[j-1].Transition == "continue" {
+		if shots[j-1].Transition == "continue" {
 			break
 		}
-		if !cacheMiss(j) || lowVRAM(j) != lowVRAM(start) {
+		if !canBatch(j) || !same(j) {
 			break
 		}
 		n++
 	}
 	return n
+}
+
+// shotDubLines 取一镜要念的台词行：结构化 lines 优先，退到 dialogue 字段
+// （「身份：原话」）。单镜路径与批量路径（TTS 前置）共用，两份逻辑迟早漂移。
+func shotDubLines(sh Shot) []PlanLine {
+	if len(sh.Lines) > 0 {
+		return sh.Lines
+	}
+	if t := sh.DialogueText(); t != "" {
+		return []PlanLine{{Speaker: "S1", Text: t}}
+	}
+	return nil
 }
 
 // execShotListNode 分镜执行器：五层门预检 → 逐镜生成 → 音频治理 → 按 transition 装配
@@ -283,6 +297,16 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	batchSize := int(fieldFloat(node, "batch_size", 0))
 	if batchSize > 8 {
 		batchSize = 8 // 屏障节点只开了 8 个槽（comfy_media_batch.go）
+	}
+	// 台词镜是否进批：默认关。实测（2026-10-30，同分镜 2 台词镜 608×352×124）：
+	//   批量一张图 221s / 229s / 292s（三次，方差来自 VAE decode 换页）；
+	//   逐镜热态 117s+70s=187s（run 358）；逐镜冷态第 1 镜就 244s 且第 2 镜卡在
+	//   decode 换页 15 分钟以上（run 363，已取消）。
+	// 即：批量只在「权重必须反复重载」的冷路径上占优，热态反而略慢，
+	// 而换页方差远大于两者差 ⇒ 默认关，按需开（长时间/冷启动多镜台词片）。
+	batchDialogue := false
+	if v, ok := node.Data["batch_dialogue"].(bool); ok {
+		batchDialogue = v
 	}
 
 	// 片长上限保护：8 镜 × 15s 已经很极端，再多应该拆成多集
@@ -474,53 +498,97 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 						used, wallCap, len(results), len(plan.Shots))
 				}
 			}
-			// ---- 批量分支（仅首轮）：连续可批量镜合成一张图提交，失败回退单镜 ----
+			// ---- 批量分支（仅首轮）：连续可同批的镜合成一张图提交，失败回退单镜 ----
 			// 收益与边界见 comfy_media_batch.go 头注。任何条件不满足就地放弃，
 			// 落回下面的单镜路径——批量是加速器，不是新门槛。
+			// 2026-10-30：台词镜也进批（TTS 前置），但段级门照旧逐镜过。
 			if batchSize >= 2 && pass == 0 {
 				continuity0 := i > 0 && plan.Shots[i-1].Transition == "continue" && prevLastFrame != ""
-				// 组级参数：全组非台词 ⇒ pdd/steps/kind 天然一致；r2v 的 PDD 限制与单镜路径对齐
-				groupPDD := true
+				// 同批签名三件套：kind / steps / 低显存档。批量图共用一份模型链，
+				// 签名不一致混进来只会整批重载（等于白批）。r2v 的 PDD 关（实测更慢），
+				// 台词镜保 12 步、非台词 fl2va 才走 PDD 8 步。
+				pddGlobal := true
 				if v, ok := node.Data["pdd"].(bool); ok {
-					groupPDD = v
+					pddGlobal = v
 				}
-				groupKind := "h3"
-				if len(refImgs) > 0 {
-					groupKind = "h3_r2v"
-				}
-				if groupKind == "h3_r2v" {
-					groupPDD = false
-				}
-				groupSteps := steps
-				if groupPDD {
-					groupSteps = 8
-				}
-				keyAt := func(j int) string {
-					shj := plan.Shots[j]
-					pj := shj.Prompt
-					if strings.TrimSpace(pj) == "" {
-						pj = CompileShotPrompt(plan, shj, false)
+				kindAt := func(j int) string {
+					// 台词必须 r2v（只有它吃 ref_audio）；有定妆图也走 r2v
+					if plan.Shots[j].HasDialogue() || len(refImgs) > 0 {
+						return "h3_r2v"
 					}
-					return shotCacheKey(pj, width, height, shj.Frames, groupSteps, backend, turbo, groupPDD)
+					return "h3"
+				}
+				pddAt := func(j int) bool { return pddGlobal && kindAt(j) != "h3_r2v" }
+				stepsAt := func(j int) int {
+					if pddAt(j) {
+						return 8
+					}
+					return steps
 				}
 				lowAt := func(j int) bool { return shotNeedsLowVRAM(node, width, height, plan.Shots[j].Frames) }
-				missAt := func(j int) bool { return shotCacheHit(cacheDir, keyAt(j)) == "" }
-				if n := batchRunLen(plan.Shots, i, batchSize, continuity0, lowAt, missAt); n >= 2 {
+				promptAt := func(j int) string {
+					pj := plan.Shots[j].Prompt
+					if strings.TrimSpace(pj) == "" {
+						pj = CompileShotPrompt(plan, plan.Shots[j], false)
+					}
+					return pj
+				}
+				keyAt := func(j int) string {
+					if plan.Shots[j].HasDialogue() {
+						return "" // 台词镜不缓存：画面取决于当次 TTS 音轨
+					}
+					return shotCacheKey(promptAt(j), width, height, plan.Shots[j].Frames,
+						stepsAt(j), backend, turbo, pddAt(j))
+				}
+				// canBatch：这一镜本身可进批。台词镜不吃缓存（画面取决于当次 TTS
+				// 音轨），要不要进批由 batch_dialogue 决定（默认关，见上面的实测）。
+				canBatch := func(j int) bool {
+					if plan.Shots[j].HasDialogue() {
+						return batchDialogue
+					}
+					return shotCacheHit(cacheDir, keyAt(j)) == ""
+				}
+				same := func(j int) bool {
+					return kindAt(j) == kindAt(i) && stepsAt(j) == stepsAt(i) && lowAt(j) == lowAt(i)
+				}
+				if n := batchRunLen(plan.Shots, i, batchSize, continuity0, canBatch, same); n >= 2 {
+					// TTS 前置（2026-10-30）：批量图必须在提交前拿到全部 ref_audio，
+					// 所以先按序把这 n 镜的念稿音轨全部合成完，再一次提交。
+					// TTS 在 CPU 上是零 GPU 成本；失败按该镜失败处理——不能拿假音频糊弄，
+					// fully_copy 会把任何垃圾原样带进成片。
+					runDubs := make([]*DubTrackReport, n)
+					runDubPaths := make([]string, n)
+					for k := i; k < i+n; k++ {
+						shk := plan.Shots[k]
+						if !shk.HasDialogue() || backend != "h3" {
+							continue
+						}
+						p := dubTrackTempPath(outDir, shk.ID)
+						gain := shk.AmbienceGain
+						if gain <= 0 {
+							gain = ambienceGain // 节点级兜底（默认 0.85）
+						}
+						e.emitShotProgress(runID, node.ID, k, len(plan.Shots), shk.ID, "voicing", 0)
+						rep, derr := SynthesizeDubTrack(e.tts, shotDubLines(shk), p,
+							float64(shk.Frames)/24.0, shk.Lead, gain, plan.AmbienceFile(shk))
+						if derr != nil {
+							return nil, fmt.Errorf("第 %d 镜念稿音轨合成失败：%w", shk.ID, derr)
+						}
+						runDubs[k-i], runDubPaths[k-i] = rep, p
+					}
 					reqs := make([]MediaRequest, 0, n)
 					keys := make([]string, 0, n)
 					for k := i; k < i+n; k++ {
-						shk := plan.Shots[k]
-						pk := shk.Prompt
-						if strings.TrimSpace(pk) == "" {
-							pk = CompileShotPrompt(plan, shk, false)
-						}
 						r := MediaRequest{
-							Kind: groupKind, Prompt: pk, Width: width, Height: height,
-							Frames: shk.Frames, FPS: 24, Steps: groupSteps,
-							Turbo: turbo, LowVRAM: lowAt(k), PDD: groupPDD, Ctx: ctx,
+							Kind: kindAt(k), Prompt: promptAt(k), Width: width, Height: height,
+							Frames: plan.Shots[k].Frames, FPS: 24, Steps: stepsAt(k),
+							Turbo: turbo, LowVRAM: lowAt(k), PDD: pddAt(k), Ctx: ctx,
 						}
-						if groupKind == "h3_r2v" {
+						if r.Kind == "h3_r2v" {
 							r.RefImages = refImgs
+						}
+						if runDubPaths[k-i] != "" {
+							r.RefAudios = []string{runDubPaths[k-i]}
 						}
 						reqs = append(reqs, r)
 						keys = append(keys, keyAt(k))
@@ -551,18 +619,52 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 					})
 					batchElapsed := time.Since(batchStart)
 					wd.Stop()
+					// 段级门：批量是加速器，不是免检证。带音轨的镜必须在收下产物前验词，
+					// 任何一镜没过就整批作废、回退逐镜（逐镜路径自带重试与明确报错）。
+					// ASR 不可达按「没验」处理（与单镜路径同口径），不能冒充通过。
+					gateFail := ""
+					gateUnverified := false
 					if berr == nil {
+						for k := range outs {
+							if runDubs[k] == nil {
+								continue
+							}
+							expect := plan.Shots[i+k].DialogueText()
+							passed, checked := verifyDialogueLine(e.asr, outs[k].Path, expect)
+							if !checked {
+								gateUnverified = true
+								break
+							}
+							if !passed {
+								gateFail = fmt.Sprintf("第 %d 镜批量产出验词未过：台词「%s」",
+									plan.Shots[i+k].ID, expect)
+								break
+							}
+						}
+					}
+					if berr == nil && gateFail == "" {
 						log.Printf("[shotlist] 批量 %d 镜一张图完成，用时 %s（逐镜基线合计约 %s）",
 							len(reqs), batchElapsed.Round(time.Second),
-							(time.Duration(shotCostSeconds(sumFrames(reqs), width, height, reqs[0].Steps)*float64(time.Second))).Round(time.Second))
+							(time.Duration(shotCostSeconds(sumFrames(reqs), width, height, reqs[0].Steps) * float64(time.Second))).Round(time.Second))
 						for k, out := range outs {
-							finishShot(i+k, pass, plan.Shots[i+k], out.Path, batchElapsed, 1,
-								fmt.Sprintf("批量图 %d 镜合提交", len(reqs)), nil, false, keys[k])
+							note := fmt.Sprintf("批量图 %d 镜合提交", len(reqs))
+							if runDubs[k] != nil {
+								if gateUnverified {
+									note = appendNote(note, "台词校验未执行（ASR 不可达），不等于念对")
+								} else {
+									note = appendNote(note, "ASR 验词通过")
+								}
+							}
+							finishShot(i+k, pass, plan.Shots[i+k], out.Path, batchElapsed, 1, note, runDubs[k], false, keys[k])
 						}
 						i += len(reqs) - 1
 						continue
 					}
-					log.Printf("[shotlist] 批量 %d 镜失败（%.200s），回退逐镜生成", len(reqs), berr.Error())
+					if berr != nil {
+						log.Printf("[shotlist] 批量 %d 镜失败（%.200s），回退逐镜生成", len(reqs), berr.Error())
+					} else {
+						log.Printf("[shotlist] %s，整批作废回退逐镜生成", gateFail)
+					}
 					// 不 return：批量只是加速，回退后从第 i 镜开始照常逐镜
 				}
 			}
@@ -591,13 +693,8 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			var dubPath string
 			var dub *DubTrackReport
 			if dialogue && backend == "h3" {
-				lines := sh.Lines
-				if len(lines) == 0 {
-					// 结构化模式的台词在 dialogue 字段（「身份：原话」）
-					if t := sh.DialogueText(); t != "" {
-						lines = []PlanLine{{Speaker: "S1", Text: t}}
-					}
-				}
+				// 台词行解析与批量路径共用 shotDubLines（结构化 lines 或 dialogue 字段）
+				lines := shotDubLines(sh)
 				dubPath = dubTrackTempPath(outDir, sh.ID)
 				gain := sh.AmbienceGain
 				if gain <= 0 {
@@ -1016,6 +1113,9 @@ func buildGatePlanMap(plan *ShotPlan, refImgs []string, width, height int) map[s
 }
 
 // verifyDialogueLine ASR 验词：转写片段，核对期望原话是否出现（忽略空白差异）。
+// 除了「念没念对」，还要拦「念了两遍」：实测 run 367 第 2 镜 H3 把同一句连说两次
+// （「明天见，做个好梦。明天见，做个好梦。」），而纯 Contains 判据照样通过——
+// 用户听到的是重复台词，门却说通过（§0.12②「工具没报错=没问题」的镜像）。
 // checked=false 表示「没验到」（ASR 不可达/无期望词），调用方必须与「没念对」分开。
 func verifyDialogueLine(asr *ASRService, path, expect string) (passed, checked bool) {
 	if asr == nil || strings.TrimSpace(expect) == "" {
@@ -1025,7 +1125,21 @@ func verifyDialogueLine(asr *ASRService, path, expect string) (passed, checked b
 	if err != nil {
 		return false, false
 	}
-	return strings.Contains(stripASRPunct(text), stripASRPunct(expect)), true
+	ok, _ := dialogueLineMatch(text, expect)
+	return ok, true
+}
+
+// dialogueLineMatch 判「念对了，且只念了一遍」。第二个返回值是整句出现次数。
+// 重复判定用剥标点后的整句计数：H3 会把同一句连说两遍（run 367 实测），
+// 那不是「念错」而是「多念」，观众听得出 ⇒ ≥2 次一律判不过，交给段级重试
+// （采样有随机性，重跑比放过一镜重复台词便宜）。
+func dialogueLineMatch(asrText, expect string) (bool, int) {
+	got, want := stripASRPunct(asrText), stripASRPunct(expect)
+	if want == "" {
+		return false, 0
+	}
+	n := strings.Count(got, want)
+	return n == 1, n
 }
 
 // stripASRPunct 验词只比字、不比标点：faster-whisper 对同一句台词可能回全角

@@ -1007,6 +1007,19 @@
           ]
         },
         {
+          "key": "batch_dialogue",
+          "label": "台词镜也合批",
+          "type": "bool",
+          "default": false,
+          "hint": "把台词镜也拉进合批：每镜自带念稿音轨，TTS 先全部合成再一次提交（每镜仍只接自己的音轨）。实测同分镜 2 台词镜：批量 221/229/292s vs 逐镜热态 187s、逐镜冷态 244s+（第 2 镜换页卡死）——只在权重需反复重载的冷路径占优，热态略慢，故默认关。开之前先确认 batch_size≥2",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "batch_dialogue"
+            }
+          ]
+        },
+        {
           "key": "audio_check",
           "label": "音频抽检",
           "type": "bool",
@@ -1562,6 +1575,19 @@
             {
               "node": "sl-1",
               "path": "batch_size"
+            }
+          ]
+        },
+        {
+          "key": "batch_dialogue",
+          "label": "台词镜也合批",
+          "type": "bool",
+          "default": false,
+          "hint": "把台词镜也拉进合批：每镜自带念稿音轨，TTS 先全部合成再一次提交（每镜仍只接自己的音轨）。实测同分镜 2 台词镜：批量 221/229/292s vs 逐镜热态 187s、逐镜冷态 244s+（第 2 镜换页卡死）——只在权重需反复重载的冷路径占优，热态略慢，故默认关。开之前先确认 batch_size≥2",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "batch_dialogue"
             }
           ]
         },
