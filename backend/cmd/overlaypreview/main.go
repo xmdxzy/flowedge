@@ -20,6 +20,7 @@ import (
 func main() {
 	src := flag.String("src", "", "输入视频")
 	text := flag.String("text", "山海茶肆", "要贴的文字，换行用 | 分隔")
+	srt := flag.String("srt", "", "字幕文件（.srt/.ass）；给了按时间轴烧，忽略 -text")
 	outDir := flag.String("out", ".tmp/overlay-preview", "输出目录")
 	scale := flag.Int("scale", 0, "上采样目标高度（0=保持）")
 	from := flag.Float64("from", 0.5, "出现时间")
@@ -34,6 +35,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "输入不存在：%v\n", err)
 		os.Exit(2)
 	}
+	if *srt != "" {
+		if _, err := os.Stat(*srt); err != nil {
+			fmt.Fprintf(os.Stderr, "字幕文件不存在：%v\n", err)
+			os.Exit(2)
+		}
+	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "建目录失败：%v\n", err)
 		os.Exit(2)
@@ -45,6 +52,7 @@ func main() {
 		for _, sc := range scaleList(*scale) {
 			opt := service.OverlayOptions{
 				Text:  body,
+				SRT:   *srt,
 				Style: style,
 				Scale: sc,
 				From:  *from,

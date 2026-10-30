@@ -257,6 +257,17 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	if v, ok := node.Data["bgm_duck"].(bool); ok {
 		bgmDuck = v
 	}
+	// 整片声床（room tone）：默认开。2026-10-29 多镜实测：TTS 前导静音已裁、
+	// 接缝已有 acrossfade，接缝处仍有 0.85s 可听静音——裁剪修不了「没有声音的
+	// 时间段」，只能铺一层低于节目声的连续底噪。room_tone_gain = 期望底噪 dBFS。
+	roomTone := true
+	if v, ok := node.Data["room_tone"].(bool); ok {
+		roomTone = v
+	}
+	roomToneFloor := fieldFloat(node, "room_tone_gain", -36)
+	if roomToneFloor >= 0 {
+		roomToneFloor = -36 // dBFS 天然为负：传正数视为没配
+	}
 	audioCheck := true
 	if v, ok := node.Data["audio_check"].(bool); ok {
 		audioCheck = v
@@ -332,6 +343,9 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	clips := make([]string, 0, len(plan.Shots))
 	transitions := make([]string, 0, len(plan.Shots))
 	results := make([]shotResult, 0, len(plan.Shots))
+	// dubs[i] = 第 i 镜的念稿音轨报告（nil = 无台词）。与 clips 同索引同生命周期：
+	// 首拍 append、重拍就地替换，装配后按它排字幕时间轴（subtitles.go）。
+	dubs := make([]*DubTrackReport, 0, len(plan.Shots))
 	var prevLastFrame string
 	nodeStart := time.Now()
 
@@ -413,11 +427,13 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			clips = append(clips, part)
 			transitions = append(transitions, sh.Transition)
 			results = append(results, res)
+			dubs = append(dubs, dub)
 		} else {
 			// 重拍：就地替换该镜，保留原轮次信息（Attempts 累加，便于回溯总成本）
 			res.Attempts += results[i].Attempts
 			res.Note = appendNote(res.Note, fmt.Sprintf("定点重拍（第 %d 轮）", pass))
 			clips[i], transitions[i], results[i] = part, sh.Transition, res
+			dubs[i] = dub
 			reshootCount++
 		}
 
@@ -798,6 +814,18 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			postNotes = append(postNotes, fmt.Sprintf("响度归一 %.0f LUFS", lufs))
 		}
 	}
+	// 整片声床：放在响度归一之后（电平相对最终节目声是确定的）、BGM 之前
+	// （有配乐时 duck 的是主轨，声床跟着沉下去正好）。失败降级为 WARN 不阻断。
+	if roomTone {
+		m4 := strings.TrimSuffix(final, filepath.Ext(final)) + "-roomtone" + filepath.Ext(final)
+		if terr := mixRoomTone(final, m4, roomToneFloor); terr != nil {
+			verdict.Add("WARN", "post.room_tone", "声床未铺："+terr.Error())
+			postNotes = append(postNotes, "声床失败")
+		} else {
+			final = m4
+			postNotes = append(postNotes, fmt.Sprintf("声床 %.0f dBFS", roomToneFloor))
+		}
+	}
 	if strings.TrimSpace(bgmPath) != "" {
 		if !filepath.IsAbs(bgmPath) {
 			if abs, aerr := filepath.Abs(bgmPath); aerr == nil {
@@ -820,6 +848,33 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	}
 	if abs, aerr := filepath.Abs(final); aerr == nil {
 		final = abs
+	}
+
+	// 字幕产物：把配音逐行实测时间戳排到全片时间轴，写成 SRT（与成片同名 .srt）。
+	// 烧不烧由 produce 层 subtitles/overlay_srt 参数决定；文件本身总是落盘，
+	// 剪映/PR 导入直接用。接缝重叠值与装配器同源（transitionOverlapD），
+	// 镜时长用探测值（装配器吃的就是这个）。
+	var srtPath string
+	if len(dubs) == len(clips) && len(clips) > 0 {
+		durs := make([]float64, len(clips))
+		probed := true
+		for i, c := range clips {
+			if info, perr := probeMedia(c); perr == nil && info.dur > 0 {
+				durs[i] = info.dur
+			} else {
+				probed = false
+				break
+			}
+		}
+		if probed {
+			if lines := filmSubtitleLines(dubs, durs, transitions); len(lines) > 0 {
+				srtPath = strings.TrimSuffix(final, filepath.Ext(final)) + ".srt"
+				if werr := writeShotSRT(srtPath, lines); werr != nil {
+					log.Printf("[shotlist] 字幕文件写入失败：%v", werr)
+					srtPath = ""
+				}
+			}
+		}
 	}
 
 	// 成片自检：数帧 + 音画时长比对。肉眼看时长看不出「中间整段画面丢失」，
@@ -881,7 +936,7 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		},
 		"enforced": true,
 	}
-	return map[string]interface{}{
+	out := map[string]interface{}{
 		"video":        final,
 		"kind":         "video",
 		"parts":        clips,   // 逐镜产物（有序）——一致性门按这个顺序比段间漂移
@@ -900,7 +955,11 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 		"consistency":  toJSON(consistencyIssues),
 		"gate_ok":      !verdict.HasFail(),
 		"gate_verdict": verdict.Worst(),
-	}, nil
+	}
+	if srtPath != "" {
+		out["subtitles"] = srtPath // produce 层 subtitles=true 时按它烧录
+	}
+	return out, nil
 }
 
 // buildGatePlanMap 把解析后的 ShotPlan 归一成门检用的 plan map。

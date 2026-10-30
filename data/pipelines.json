@@ -1020,6 +1020,27 @@
           ]
         },
         {
+          "key": "room_tone",
+          "label": "整片声床",
+          "type": "bool",
+          "default": true,
+          "hint": "在整片底下铺一层 -36dBFS 的连续底噪，填住接缝/句间的可听静音（实测裁剪修不了，必须铺底）。混了 BGM 时可关",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "room_tone"
+            }
+          ]
+        },
+        {
+          "key": "subtitles",
+          "label": "烧录台词字幕",
+          "type": "bool",
+          "default": false,
+          "hint": "有台词的片子按配音实测时间戳自动生成 SRT 并烧录（样式走 overlay_style，默认 caption 底部白字）。不勾也照样产出 .srt 文件（剪映/PR 可导入）；overlay_srt 手填路径可覆盖自动字幕",
+          "bind": []
+        },
+        {
           "key": "consistency_check",
           "label": "一致性门",
           "type": "bool",
@@ -1556,6 +1577,27 @@
               "path": "audio_check"
             }
           ]
+        },
+        {
+          "key": "room_tone",
+          "label": "整片声床",
+          "type": "bool",
+          "default": true,
+          "hint": "在整片底下铺一层 -36dBFS 的连续底噪，填住接缝/句间的可听静音（实测裁剪修不了，必须铺底）。混了 BGM 时可关",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "room_tone"
+            }
+          ]
+        },
+        {
+          "key": "subtitles",
+          "label": "烧录台词字幕",
+          "type": "bool",
+          "default": false,
+          "hint": "有台词的片子按配音实测时间戳自动生成 SRT 并烧录（样式走 overlay_style，默认 caption 底部白字）。不勾也照样产出 .srt 文件（剪映/PR 可导入）；overlay_srt 手填路径可覆盖自动字幕",
+          "bind": []
         },
         {
           "key": "consistency_check",

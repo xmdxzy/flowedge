@@ -108,3 +108,53 @@ func mixBGM(in, bgm, out string, gainDB float64, duck bool) error {
 	}
 	return nil
 }
+
+// roomToneGeneratorMeanDB brown 噪声（anoisesrc amplitude=1）的实测平均电平。
+// 2026-10-30 本机 ffmpeg 实测 mean -13.7dB / max -1.6dB（3s 采样）。
+// 「静音输入 + 声床 ≈ floorDB」的换算由 TestMixRoomTone_Level 钉住：
+// ffmpeg 换版本导致生成器电平漂了，测试会红，而不是成片静音缺口悄悄回来。
+const roomToneGeneratorMeanDB = -13.7
+
+// mixRoomTone 在成片底下铺一层连续低电平噪声床（room tone）。
+//
+// 为什么必须铺底（2026-10-29 多镜实测）：TTS 每句前导静音已裁（dub_track 留
+// 0.03–0.05s），接缝已有 acrossfade 0.2s，但镜内环境声时强时弱，窗口一叠加
+// 仍出现 0.85s 可听静音（verify-media silence_gap，判据 -38dB / ≥0.45s）。
+// 裁剪修不了「没有声音的时间段」，只能铺底。
+//
+// floorDB 是期望的底噪电平（dBFS，默认 -36：刚好盖过 -38dB 静音判据，又比
+// -16 LUFS 的节目声低 20dB，听感是「房间里有底噪」而不是「多了噪音」）。
+// 视频流原样 copy；输出与 mixBGM 同为 48k，避免后续链路再采样。
+func mixRoomTone(in, out string, floorDB float64) error {
+	if floorDB >= 0 {
+		return fmt.Errorf("声床电平必须是负 dBFS（0 表示关闭，不该调到这里）：%v", floorDB)
+	}
+	info, err := inspectMedia(in)
+	if err != nil {
+		return err
+	}
+	if !info.HasAudio {
+		return fmt.Errorf("声床铺底失败：%s 没有音轨", filepath.Base(in))
+	}
+	// 底噪电平 = 生成器电平 + volume 补偿；fixed seed 让同参数重跑结果可复现
+	fc := fmt.Sprintf(
+		"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[main];"+
+			"[1:a]volume=%.1fdB,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[bed];"+
+			"[main][bed]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.8:level=false[a]",
+		floorDB-roomToneGeneratorMeanDB)
+	args := []string{"-hide_banner", "-loglevel", "error", "-y",
+		"-i", in,
+		"-f", "lavfi", "-i", "anoisesrc=color=brown:seed=2026:sample_rate=48000:amplitude=1",
+		"-filter_complex", fc,
+		"-map", "0:v:0?", "-map", "[a]",
+		"-c:v", "copy",
+		"-c:a", "aac", "-b:a", "192k",
+		"-ar", "48000",
+		out,
+	}
+	if b, cerr := exec.Command(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
+		_ = os.Remove(out)
+		return fmt.Errorf("声床铺底失败：%w（%s）", cerr, strings.TrimSpace(string(b)))
+	}
+	return nil
+}

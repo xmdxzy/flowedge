@@ -88,6 +88,15 @@ func (e *EngineV2) ApplyTextOverlay(states []model.NodeInstance, params map[stri
 	if err != nil {
 		return "", err
 	}
+	// 自动字幕（2026-10-30）：subtitles=true 且没手填 overlay_srt 时，用节点
+	// 产出的 SRT（配音实测时间戳排轴，shotlist 写到成片同名 .srt）。
+	// 显式给的 overlay_text/overlay_srt 永远优先——参数化不覆盖显式指定。
+	if !want && paramBool(params, "subtitles") {
+		if srt := pickSubtitlePathFromStates(states); srt != "" {
+			opt.SRT = srt
+			want = true
+		}
+	}
 	if !want {
 		return "", nil
 	}
@@ -108,6 +117,38 @@ func (e *EngineV2) ApplyTextOverlay(states []model.NodeInstance, params map[stri
 	// 原文件保留（便于对比「贴字前/后」），不删。
 	rewriteArtifactPath(states, src, dst)
 	return dst, nil
+}
+
+// paramBool 读 produce 参数里的布尔值（JSON bool；字符串 "true" 也认——
+// 前端某些路径会把 bool 序列化成字符串）。
+func paramBool(params map[string]interface{}, key string) bool {
+	switch v := params[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	return false
+}
+
+// pickSubtitlePathFromStates 找节点产出的字幕文件：shotlist 在有台词时把
+// 成片同名 .srt 的路径写进 Output["subtitles"]。只认磁盘上真实存在的文件。
+func pickSubtitlePathFromStates(states []model.NodeInstance) string {
+	for i := len(states) - 1; i >= 0; i-- {
+		if states[i].Status != "success" {
+			continue
+		}
+		m, ok := states[i].Output.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if p, ok := m["subtitles"].(string); ok && p != "" {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
 }
 
 // ApplyTextOverlay 对单个视频文件贴字，写到同目录 <名字>-text.mp4。

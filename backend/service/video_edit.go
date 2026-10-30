@@ -433,13 +433,9 @@ func assembleShots(clips []string, transitions []string, outPath string) error {
 	// 否则第二段一帧都不会输出——实测「画面只有第一镜、音频却是全长」就是这个原因。
 	const frameInterval = 0.05
 	for i := 1; i < len(clips); i++ {
-		d := 0.08 // cut：2 帧融合，视觉上仍是硬切
-		switch transitions[i-1] {
-		case "dissolve":
-			d = 0.30
-		case "continue":
-			d = 0.12
-		}
+		// 接缝重叠值集中在 transitionOverlapD（subtitles.go）：SRT 字幕排轴
+		// 共用同一套，两处各写一份迟早漂移（AGENTS §0.12④）
+		d := transitionOverlapD(transitions[i-1])
 		if d >= infos[i].dur-2*frameInterval {
 			d = 0.08
 		}

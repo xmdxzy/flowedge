@@ -293,6 +293,24 @@ FlowEdge 只剩两件事：**本地多模态出片** + **质量门控循环**。
   run 349 用缓存 39.3s 重跑，`verify-media` **全绿**（245 帧、mean −23.7、max −1.9、无静音）。
   **`alimiter` 必须 `level=false`**，否则自动抬回 0dB；中文路径走 PowerShell 请求会变 `??`，
   要用 UTF-8 文件体或 ASCII 路径。
+- **整片声床已上线（2026-10-30）**：film/film_from_plan 默认在响度归一之后铺一层
+  −36dBFS 的 brown-noise 底噪（`mixRoomTone`，audio_master.go；`room_tone` 字段可关，
+  `room_tone_gain` 调电平）。为什么必须铺：TTS 每句前导静音已逐行裁（dub_track 留
+  0.03–0.05s）、接缝已有 acrossfade 0.2s，**真片实测仍有 1.36s/1.18s 中段静音**——
+  裁剪修不了「没有声音的时间段」，只能铺底。真片 A/B：`film-1793316912006304400`
+  铺床前 2×WARN silence_gap → 铺后 0（响度 mean −21.1、245 帧均不变）。
+  电平换算常数 `roomToneGeneratorMeanDB=-13.7` 被 `TestMixRoomTone_Level` 钉住
+  （ffmpeg 换版本漂了会红）；端到端判据 `TestAssembleThenRoomTone_FillsSilenceGaps`。
+  铺床位置在 masterLoudness 之后、mixBGM 之前（电平相对最终节目声确定，BGM duck 时声床跟着沉）。
+- **台词字幕自动生成+烧录（2026-10-30）**：shotlist 有台词时把 dub 逐行**实测**时间戳
+  （`DubLineInfo.Start/End`，合成后 ffprobe 的真值——计划前导 vs 实际语音起点实测差过
+  0.44s，按计划值排轴必漂）排到全片时间轴写 `<成片>.srt`（`service/subtitles.go`）。
+  接缝重叠值 `transitionOverlapD` 与装配器**同源共用**——改装配融合窗口只改那一处，
+  两处各写一份字幕每过一条接缝就漂一截。produce 层 `subtitles=true` 且未手填
+  `overlay_srt` 时自动走 text_overlay 的 libass SRT 模式烧录（显式参数永远优先）；
+  不勾选也产出 .srt（剪映/PR 直接导入）。真片验证：烧录后 245 帧/响度不变，抽帧目视清晰。
+  film/film_from_plan 的 `subtitles` 字段**故意不 bind**：它在 produce 层消费
+  （同 overlay_* 系），不是节点 data。
 - **PDD 8 步实测（2026-10-29 21:20）**：FL2VA/Ref2VA 两份 LoRA 各 1.28GB 已放
   `D:/AI/Models/comfyui/loras/`，ComfyUI 可枚举。同提示词/seed、608×352×124：
   CK+base 12 步 **88.7s**（峰值 23,820MB） vs CK+PDD 8 步 **42.5s**（23,858MB），**2.09×**。
