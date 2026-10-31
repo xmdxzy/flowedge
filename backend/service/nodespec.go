@@ -77,6 +77,11 @@ var NodeSpecs = map[string]NodeSpec{
 	"comfy": {Type: "comfy", Side: sideDiffusion, Heavy: true, Media: true,
 		Timeout: comfyNodeTimeout, MaxTimeout: comfyMaxTimeout},
 
+	// ---- 代码渲染：headless 浏览器逐帧截图，纯 CPU、零显存 ----
+	// 不吃显存 ⇒ Side 为空、Heavy=false，队列按 CPU 道并行（见 queue.go 白名单）。
+	// Media=true：它真的产出视频文件，血缘与产物清单要认。
+	"code_video": {Type: "code_video", Media: true, Timeout: codeVideoTimeout, MaxTimeout: 30 * time.Minute},
+
 	// ---- 语音侧：CPU，但与扩散权重抢内存带宽 ----
 	"tts": {Type: "tts", Side: sideAudio, Media: true, Timeout: ttsTimeout},
 }

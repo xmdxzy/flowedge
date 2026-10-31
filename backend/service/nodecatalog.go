@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"sort"
@@ -262,6 +262,30 @@ var nodeContracts = map[string]NodeContract{
 		},
 		// 成本取决于被循环的图，静态不可知 —— 估算时计入 Uncertain，不编数字。
 		Cost: Cost{GPUClass: "cpu", Unit: "round"},
+	},
+
+	// ---- 代码渲染：headless 浏览器逐帧渲染，零显存 ----
+	"code_video": {
+		Label: "代码视频",
+		In:    []Port{{Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "video", Kind: PortVideo}},
+		Fields: []FieldSpec{
+			{Key: "style", Label: "风格", Kind: FieldEnum, Default: "blueprint", Options: []string{"blueprint"}},
+			{Key: "title", Label: "标题", Kind: FieldText},
+			{Key: "points", Label: "要点（每行一条）", Kind: FieldTextarea},
+			{Key: "kicker", Label: "栏目/眉题", Kind: FieldText},
+			{Key: "figure", Label: "图示", Kind: FieldEnum, Default: "none", Options: []string{"none", "bars", "flow"}},
+			{Key: "labels", Label: "图示标签（逗号分隔）", Kind: FieldText},
+			{Key: "values", Label: "图示数值（逗号分隔）", Kind: FieldText},
+			{Key: "duration", Label: "时长（秒）", Kind: FieldFloat, Default: 6.0, Min: f64(1), Max: f64(180)},
+			{Key: "width", Label: "宽", Kind: FieldInt, Default: 1920, Min: f64(640), Max: f64(3840)},
+			{Key: "height", Label: "高", Kind: FieldInt, Default: 1080, Min: f64(360), Max: f64(2160)},
+			{Key: "fps", Label: "帧率", Kind: FieldInt, Default: 24, Min: f64(12), Max: f64(60)},
+			{Key: "workers", Label: "渲染并发", Kind: FieldInt, Default: 2, Min: f64(1), Max: f64(6)},
+			{Key: "tts_text", Label: "旁白（可空）", Kind: FieldTextarea, Hint: "填了就用 FE 的 TTS 合成并合流"},
+			{Key: "spec", Label: "完整 spec（JSON，可选）", Kind: FieldTextarea, Hint: "多卡片的完整规格；填了优先于上面的单卡字段"},
+		},
+		Cost: Cost{GPUClass: "cpu", BaseSec: 20, SecPerUnit: 0.12, Unit: "frame"},
 	},
 
 	// ---- 逃生舱：跑用户自备的 ComfyUI 图 ----

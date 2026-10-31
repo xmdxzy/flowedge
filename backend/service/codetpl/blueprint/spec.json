@@ -1,0 +1,47 @@
+{
+  "title": "混合出片的三个层次",
+  "title_en": "FLOWEDGE · MIXED PRODUCTION",
+  "kicker": "FLOWEDGE · BLUEPRINT NOTE",
+  "number": "07",
+  "rev": "A",
+  "scale": "1:1",
+  "date": "2026.10.30",
+  "duration": 18,
+  "fps": 24,
+  "card_seconds": 6,
+  "cards": [
+    {
+      "kicker": "PART 01 · PRECISION",
+      "heading": "讲准：代码渲染",
+      "points": [
+        "代码视频：图表、数据与可读文字",
+        "确定性渲染，改一版文案只要几秒"
+      ],
+      "note": "ZERO VARIANCE",
+      "figure": "none"
+    },
+    {
+      "kicker": "PART 02 · TEXTURE",
+      "heading": "质感：生成模型",
+      "points": [
+        "实拍感、人物与氛围交给 H3",
+        "每镜 2–7 分钟，抽卡但不可替代"
+      ],
+      "figure": "bars",
+      "labels": ["H3 生成", "lemo 渲染", "混合编排"],
+      "values": [82, 12, 46],
+      "note": "COST PER SECOND"
+    },
+    {
+      "kicker": "PART 03 · ORCHESTRATION",
+      "heading": "编排：剪辑层",
+      "points": [
+        "按表达需求给每镜分配来源",
+        "统一母版：一次响度、一轨字幕"
+      ],
+      "figure": "flow",
+      "labels": ["GEN", "CODE", "EDIT"],
+      "note": "SINGLE MASTER"
+    }
+  ]
+}

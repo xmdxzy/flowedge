@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"encoding/json"
@@ -39,11 +39,88 @@ type Producer struct {
 	// 质量循环的默认轮数（qc=true 时生效）
 	qcRounds int
 
+	// 血缘（V3 P0）：SetLineage 注入。nil 时不生成 manifest，出片行为不变。
+	fps           *service.FingerprintCache
+	bundles       *service.BundleStore
+	engineVersion string
+	manifestDir   string
+
+	// 预算门（V3 P0）：runID -> 该次运行的预算与起点。引擎心跳时回查。
+	budgetMu sync.Mutex
+	budgets  map[uint]*budgetState
+
 	mu sync.Mutex
 }
 
+// budgetState 一次运行的预算状态（start 起算，fired 保证只取消一次）。
+type budgetState struct {
+	b      service.Budget
+	est    service.GraphEstimate
+	start  time.Time
+	fired  bool
+	warned bool
+}
+
 func NewProducer(db *gorm.DB, engine *service.EngineV2, queue *service.JobQueue, pipes *service.PipelineStore) *Producer {
-	return &Producer{db: db, engine: engine, queue: queue, pipes: pipes, qcRounds: 3}
+	p := &Producer{db: db, engine: engine, queue: queue, pipes: pipes, qcRounds: 3,
+		budgets: map[uint]*budgetState{}}
+	// 预算门挂在引擎心跳上：引擎不认识预算语义，只在 node_progress 时问一句「该不该停」。
+	if engine != nil {
+		engine.SetBudgetGuard(p.checkBudget)
+	}
+	return p
+}
+
+// setBudget 登记一次运行的预算与预估（start 时调用）。
+func (p *Producer) setBudget(runID uint, b service.Budget, est service.GraphEstimate) {
+	if runID == 0 || !b.Enabled() {
+		return
+	}
+	p.budgetMu.Lock()
+	defer p.budgetMu.Unlock()
+	if p.budgets == nil {
+		p.budgets = map[uint]*budgetState{}
+	}
+	p.budgets[runID] = &budgetState{b: b, est: est, start: time.Now()}
+}
+
+// clearBudget 运行结束时回收（返回对账结论，写进 manifest）。
+func (p *Producer) clearBudget(runID uint) *service.BudgetReconcile {
+	p.budgetMu.Lock()
+	st, ok := p.budgets[runID]
+	delete(p.budgets, runID)
+	p.budgetMu.Unlock()
+	if !ok || runID == 0 {
+		return nil
+	}
+	actual := time.Since(st.start).Seconds()
+	r := st.b.Reconcile(st.est, actual)
+	return &r
+}
+
+// checkBudget 引擎心跳回调：超限时按 OnExceed 决定是否取消。
+//
+// warn 模式只在第一次记日志（否则每 5 秒一条，把 engine.log 刷满）。
+func (p *Producer) checkBudget(runID uint) (bool, string) {
+	p.budgetMu.Lock()
+	defer p.budgetMu.Unlock()
+	st, ok := p.budgets[runID]
+	if !ok || st.fired {
+		return false, ""
+	}
+	exceeded, reason := st.b.Check(time.Since(st.start).Seconds())
+	if !exceeded {
+		return false, ""
+	}
+	if !st.warned {
+		st.warned = true
+		log.Printf("[budget] run=%d %s（on_exceed=%s）", runID, reason, st.b.OnExceed)
+	}
+	if st.b.ShouldStop() {
+		st.fired = true
+		return true, reason
+	}
+	return false, ""
 }
 
 // SetPreflight 注入依赖探测所需端点。
@@ -63,10 +140,119 @@ func (p *Producer) SetQCRounds(n int) {
 	}
 }
 
+// SetLineage 注入血缘所需依赖（V3 P0）。未注入时不出 manifest，出片行为与旧版一致。
+func (p *Producer) SetLineage(fps *service.FingerprintCache, bundles *service.BundleStore, engineVersion, manifestDir string) {
+	p.fps = fps
+	p.bundles = bundles
+	p.engineVersion = engineVersion
+	p.manifestDir = manifestDir
+}
+
 // SweepTransient 清掉上次残留的质量循环临时图（进程崩溃会留下）。
 func (p *Producer) SweepTransient() int {
 	res := p.db.Where("name LIKE ?", "qc:%").Delete(&model.Workflow{})
 	return int(res.RowsAffected)
+}
+
+// writeRunManifest 落血缘清单（V3 P0）。
+//
+// 三条纪律：
+//  1. 只登记**真实存在**的产物，不编造路径（缺失就留空，让人一眼看出没产出）；
+//  2. 模型指纹按节点类型展开（宁可多记，不可漏记）；
+//  3. 写失败只记日志，绝不影响出片结论——血缘是附加价值，不是交付前置条件。
+func (p *Producer) writeRunManifest(run *model.WorkflowRun, states []model.NodeInstance, reconcile *service.BudgetReconcile) {
+	if p == nil || p.fps == nil || run == nil {
+		return
+	}
+	var params map[string]interface{}
+	if len(run.Params) > 0 {
+		_ = json.Unmarshal(run.Params, &params)
+	}
+
+	types := make([]string, 0, len(states))
+	for _, n := range states {
+		types = append(types, n.Type)
+	}
+	names := service.ModelNamesForRoles(p.bundles, service.ModelRolesForNodes(types))
+
+	lite := make([]service.NodeInstanceLite, 0, len(states))
+	for _, n := range states {
+		item := service.NodeInstanceLite{
+			ID:         n.ID,
+			Type:       n.Type,
+			Status:     n.Status,
+			ErrorCode:  n.ErrorCode,
+			ModelNames: names,
+		}
+		if n.Data != nil {
+			item.Params = n.Data
+			if v, ok := n.Data["seed"].(float64); ok {
+				item.Seed = int64(v)
+			}
+		}
+		if path := service.ArtifactPathOf(n.Output); path != "" {
+			item.ArtifactPaths = []string{path}
+		}
+		if n.StartedAt != nil && n.EndedAt != nil {
+			item.DurationMS = n.EndedAt.Sub(*n.StartedAt).Milliseconds()
+		}
+		lite = append(lite, item)
+	}
+
+	m := service.BuildManifest(service.RunMeta{
+		ID:         run.ID,
+		PipelineID: run.PipelineID,
+		InvokedBy:  run.InvokedBy,
+		Params:     params,
+		StartedAt:  run.StartedAt,
+		EndedAt:    run.EndedAt,
+	}, lite, p.fps, p.engineVersion)
+	m.Budget = reconcile
+
+	path, err := service.WriteManifest(p.manifestDir, m)
+	if err != nil {
+		log.Printf("[manifest] run=%d 清单写入失败：%v", run.ID, err)
+		return
+	}
+	run.ManifestPath = path
+	if err := p.db.Model(&model.WorkflowRun{}).Where("id = ?", run.ID).
+		Update("manifest_path", path).Error; err != nil {
+		log.Printf("[manifest] run=%d 路径回写失败：%v", run.ID, err)
+	}
+	if err := p.fps.Save(); err != nil {
+		log.Printf("[manifest] 指纹缓存落盘失败：%v", err)
+	}
+	log.Printf("[manifest] run=%d 血缘已落盘：%s（%d 个节点）", run.ID, path, len(m.Nodes))
+}
+
+// GetManifest 返回一次运行的血缘清单。
+//
+// 没有清单时返回 404 并说明原因，而不是返回空对象——
+// 「没有血缘」和「血缘是空的」是两件事，前者要人去查，后者说明这次没产物。
+func (p *Producer) GetManifest(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("runId"), 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "run id 不合法"})
+		return
+	}
+	var run model.WorkflowRun
+	if err := p.db.First(&run, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "运行记录不存在", "run_id": id})
+		return
+	}
+	if run.ManifestPath == "" {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":  "这次运行没有血缘清单（V3 之前的运行，或血缘未启用）",
+			"run_id": id,
+		})
+		return
+	}
+	m, err := service.ReadManifest(run.ManifestPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "清单读取失败：" + err.Error(), "path": run.ManifestPath})
+		return
+	}
+	c.JSON(http.StatusOK, m)
 }
 
 // ListPipelines 返回向导要用的流水线目录。
@@ -283,6 +469,16 @@ func (p *Producer) start(req produceRequest) (*model.WorkflowRun, int, string) {
 		return nil, http.StatusInternalServerError, "运行记录写入失败：" + err.Error()
 	}
 
+	// 预算门（V3 P0）：解析声明 + 登记预估。未声明预算时是空操作。
+	// 估算用同一张图（质量循环包壳前已经算过的话以包壳前为准：壳只有一个节点，估不出东西）。
+	budget := service.ParseBudget(built.Values)
+	if budget.Enabled() {
+		est := service.EstimateGraph(built.Nodes, built.Edges)
+		p.setBudget(run.ID, budget, est)
+		log.Printf("[budget] run=%d 已声明预算：%s；预估 P50=%.0fs P90=%.0fs worst=%.0fs",
+			run.ID, budget.Describe(), est.P50Sec, est.P90Sec, est.WorstSec)
+	}
+
 	job := model.Job{
 		RunID:      run.ID,
 		WorkflowID: transientID,
@@ -353,6 +549,9 @@ func (p *Producer) start(req produceRequest) (*model.WorkflowRun, int, string) {
 		statesJSON, _ := json.Marshal(nodeStates)
 		run.NodeStates = json.RawMessage(statesJSON)
 		p.db.Save(run)
+		// V3 P0：预算对账 + 血缘清单。失败的血缘同样是证据，所以不区分成败都写。
+		reconcile := p.clearBudget(run.ID)
+		p.writeRunManifest(run, nodeStates, reconcile)
 		// 只更新状态三列：整行 Save 会把 StartedAt 从 NULL 写回去
 		// （内存里那份 job 的 StartedAt 是空的，真正的时间由队列落库）。
 		p.db.Model(&model.Job{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
@@ -487,11 +686,15 @@ func (p *Producer) PreflightPipelines(c *gin.Context) {
 		}
 	}
 	warnings := p.preflightWarnings(built)
+	// 区间估算（V3 预算门）：把 EstimateGraph 接到流水线入口。
+	// 以前它只在画布的 /graph/dry-run 用，于是「这条片子要多久」在出片路径上没人答得出来。
+	est := service.EstimateGraph(built.Nodes, built.Edges)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":       len(missing) == 0,
 		"missing":  missing,
 		"fixable":  fixable,
 		"warnings": warnings,
+		"estimate": est,
 	})
 }
 

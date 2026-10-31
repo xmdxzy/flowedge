@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FlowEdge · Dark Card World</title>
+<style>
+  :root{
+    --ink:#F2F5F7; --dim:rgba(242,245,247,.60); --faint:rgba(242,245,247,.34);
+    --mint:#5BE9B9; --purple:#A78BFA;
+  }
+  html,body{margin:0;width:100%;height:100%;background:#07080A;overflow:hidden}
+  #bg{position:absolute;inset:0;display:block}
+  #stage{position:absolute;inset:0;perspective:1400px;perspective-origin:50% 48%;overflow:hidden}
+  #world{position:absolute;inset:0;transform-style:preserve-3d;will-change:transform}
+  .card{
+    position:absolute;left:50%;top:50%;width:1320px;height:700px;margin:-350px 0 0 -660px;
+    transform-style:preserve-3d;backface-visibility:hidden;
+    border-radius:28px;padding:62px 72px;box-sizing:border-box;
+    background:linear-gradient(160deg,rgba(20,23,28,.90),rgba(11,13,17,.94));
+    border:1px solid rgba(255,255,255,.13);
+    box-shadow:0 40px 120px rgba(0,0,0,.72), inset 0 1px 0 rgba(255,255,255,.07);
+    font-family:"Microsoft YaHei","PingFang SC",sans-serif;color:var(--ink);
+    opacity:0;
+  }
+  .card::after{
+    content:"";position:absolute;left:72px;right:72px;bottom:0;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(91,233,185,.55),transparent);
+  }
+  .idx{position:absolute;right:58px;top:48px;font:600 18px/1 "Cascadia Mono",Consolas,monospace;
+       color:var(--faint);letter-spacing:.14em}
+  .kick{display:inline-flex;align-items:center;gap:10px;height:38px;padding:0 20px;border-radius:19px;
+        border:1px solid rgba(91,233,185,.55);color:var(--mint);
+        font:600 17px/1 "Cascadia Mono",Consolas,monospace;letter-spacing:.16em;text-transform:uppercase}
+  .kick i{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 12px var(--mint)}
+  h1{margin:32px 0 0;font-size:var(--h1,64px);line-height:1.2;font-weight:700;letter-spacing:-.01em;
+     text-wrap:balance;clip-path:inset(0 100% 0 0)}
+  .rule{height:2px;width:0;margin:30px 0 0;border-radius:2px;
+        background:linear-gradient(90deg,var(--mint),rgba(167,139,250,.75))}
+  ul{margin:26px 0 0;padding:0;list-style:none}
+  li{position:relative;padding-left:30px;margin:16px 0 0;font-size:29px;line-height:1.5;color:var(--dim);
+     opacity:0;transform:translateY(14px)}
+  li::before{content:"";position:absolute;left:0;top:14px;width:12px;height:12px;border-radius:3px;
+             background:var(--mint);opacity:.85;transform:rotate(45deg)}
+  li:nth-child(even)::before{background:var(--purple)}
+  .bars{position:absolute;right:72px;bottom:96px;width:560px;display:flex;gap:34px;align-items:flex-end;
+        height:138px;opacity:0}
+  .bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:10px}
+  .bar em{font:600 15px/1 "Cascadia Mono",Consolas,monospace;color:var(--mint);font-style:normal;opacity:.9}
+  .bar b{display:block;width:72px;border-radius:8px 8px 3px 3px;height:0;
+         background:linear-gradient(180deg,rgba(91,233,185,.95),rgba(91,233,185,.18))}
+  .bar:nth-child(even) b{background:linear-gradient(180deg,rgba(167,139,250,.95),rgba(167,139,250,.16))}
+  .bar span{font:500 16px/1.2 "Cascadia Mono",Consolas,monospace;color:var(--faint);letter-spacing:.06em}
+  .note{position:absolute;right:62px;bottom:44px;font:500 15px/1 "Cascadia Mono",Consolas,monospace;
+        color:var(--faint);letter-spacing:.18em;text-transform:uppercase}
+  .prop{position:absolute;left:50%;top:50%;border-radius:6px;background:rgba(255,255,255,.045);
+        border:1px solid rgba(255,255,255,.055);transform-style:preserve-3d}
+  .glow{position:absolute;left:50%;top:50%;border-radius:50%;filter:blur(90px);opacity:.5}
+  #floor{position:absolute;left:50%;top:50%;width:5200px;height:5200px;margin:-2600px 0 0 -2600px;
+    background:
+      repeating-linear-gradient(90deg,rgba(255,255,255,.055) 0 1px,transparent 1px 140px),
+      repeating-linear-gradient(0deg,rgba(255,255,255,.045) 0 1px,transparent 1px 140px);
+    transform:translateY(430px) rotateX(72deg);transform-origin:50% 50%;opacity:.5}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div id="stage"><div id="world"></div></div>
+<script type="module" src="render.js"></script>
+</body>
+</html>

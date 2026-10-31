@@ -102,6 +102,7 @@ type EngineV2 struct {
 	eventLog        *EventLogger
 	llmProfiles     *LLMProfileStore // 自定义模型端点（节点 llm_profile 引用）
 	visionModel     string           // 自动探测到的本地视觉模型（vision 节点留空时使用）
+	budgetGuard     BudgetGuard      // 预算门（V3 P0）：每次进度心跳问一次「该不该停」
 	vram            *vramArbiter     // 显存仲裁：同一时刻只跑一个重任务
 	vramMu          sync.Mutex       // 保护 vram 的懒初始化（见 arbiter 注释）
 	deps            *Supervisor      // 依赖进程托管（H3 需要按需切换实例）
@@ -366,6 +367,15 @@ func (e *EngineV2) SetLLMProfiles(s *LLMProfileStore) { e.llmProfiles = s }
 // SetVisionModel 注入自动探测到的视觉模型名（vision 节点未显式指定模型时使用）
 func (e *EngineV2) SetVisionModel(name string) { e.visionModel = name }
 
+// BudgetGuard 预算门回调：返回 (是否超限, 原因)。
+//
+// 由调用方（handler）按 run 注册：引擎不认识预算语义，只负责在心跳时问一句。
+// 这样预算策略（墙钟 / 将来的 GPU 秒）留在 service/budget.go，引擎保持通用。
+type BudgetGuard func(runID uint) (bool, string)
+
+// SetBudgetGuard 注册预算门（nil = 关闭）。
+func (e *EngineV2) SetBudgetGuard(g BudgetGuard) { e.budgetGuard = g }
+
 // SetSupervisor 注入依赖管理器（H3 需要它来切换 ComfyUI 实例）
 func (e *EngineV2) SetSupervisor(s *Supervisor) { e.deps = s }
 
@@ -392,6 +402,23 @@ func runIDFrom(ctx context.Context) uint {
 // 广播保持原有的非阻塞语义（WSHub 缓冲满即丢弃），落库失败只记日志不阻塞引擎。
 func (e *EngineV2) emit(runID uint, ev Event) {
 	ev.RunID = runID
+	// 预算门：借进度心跳做检查点。为什么挂在 emit 而不是 persist：
+	// persist 只在**层完成**时调用，film 只有一个 shotlist 节点 ⇒ 层屏障形同虚设，
+	// 预算要到整片跑完才会被判一次（那时已经晚了）。心跳是 5 秒级的，才拦得住。
+	if e.budgetGuard != nil && ev.Type == "node_progress" {
+		if exceeded, reason := e.budgetGuard(runID); exceeded {
+			log.Printf("[budget] run=%d 超预算，取消运行：%s", runID, reason)
+			// 先把结论广播出去（此时还不能调用 emit，会递归）
+			notice := Event{RunID: runID, Type: "budget_exceeded", Message: reason}
+			if e.wsHub != nil {
+				e.wsHub.Broadcast(notice)
+			}
+			if e.eventLog != nil {
+				e.eventLog.Emit(runID, notice)
+			}
+			e.CancelRun(runID)
+		}
+	}
 	if e.wsHub != nil {
 		e.wsHub.Broadcast(ev)
 	}
@@ -1099,6 +1126,7 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"storyboard":   e.execStoryboardNode,
 		"shotlist":     e.execShotListNode,
 		"comfy":        e.execComfyNode,
+		"code_video":   e.execCodeVideoNode,
 		"tts":          plain(e.execTTSNode),
 		"quality_loop": e.execQualityLoopNode,
 		"end":          plain(e.execEndNode),

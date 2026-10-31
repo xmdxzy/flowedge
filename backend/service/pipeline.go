@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strconv"
@@ -110,6 +111,14 @@ func (s *PipelineStore) Reload() error {
 		return fmt.Errorf("读不到流水线定义 %s: %w", s.path, err)
 	}
 	var f pipelineFile
+	// 容错 UTF-8 BOM（2026-10-31 实测踩到）：Windows 上用记事本 / PowerShell 5.1
+	// 存过的 JSON 会带 BOM，而 encoding/json 不认它 —— 表现为「不是合法 JSON:
+	// invalid character 'ï'」，整条产品线起不来。去 BOM 必须**记日志**，不静默：
+	// 否则用户永远不知道自己的编辑器在污染配置文件。
+	if len(raw) >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF {
+		raw = raw[3:]
+		log.Printf("[pipelines] %s 带 UTF-8 BOM，已忽略（建议存为「UTF-8 无 BOM」）", s.path)
+	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return fmt.Errorf("流水线定义 %s 不是合法 JSON: %w", s.path, err)
 	}

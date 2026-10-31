@@ -99,6 +99,9 @@ type gateRules struct {
 	maxSilenceGap float64
 	forbidSpeech  bool
 	speechMaxSecs float64
+	// VLM 内容判定（V3）：默认关——一次调用 10–30s，不能悄悄改掉所有人的出片耗时。
+	vlmEnabled bool
+	vlmTopic   string
 }
 
 func parseGateRules(node *model.NodeInstance) gateRules {
@@ -133,6 +136,13 @@ func parseGateRules(node *model.NodeInstance) gateRules {
 	}
 	getF("max_silence_gap", &r.maxSilenceGap)
 	getF("speech_max_seconds", &r.speechMaxSecs)
+	// VLM 内容判定（V3）：gates.vlm=true 才开；vlm_topic 可选，留空用默认判据。
+	if v, ok := node.Data["vlm"].(bool); ok {
+		r.vlmEnabled = v
+	}
+	if v, ok := node.Data["vlm_topic"].(string); ok {
+		r.vlmTopic = v
+	}
 	if r.durationTol == 0 {
 		r.durationTol = 0.15 // 默认 150ms（音画时长差容忍）
 	}

@@ -298,6 +298,12 @@ func main() {
 	producer := handler.NewProducer(db, engine, jobQueue, pipes)
 	// 运行前依赖预检：Ollama/ASR/TTS/ComfyUI 没就绪时在入口显式失败并给修复动作
 	producer.SetPreflight(depSupervisor, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
+	// 血缘（V3 P0）：每次出片落一份「用了什么模型/参数/产出什么」的清单。
+	// 指纹缓存落盘，避免重启后重算几十 GB 权重；模型名按 ModelsRoot 索引解析。
+	generatedDir := getEnv("GENERATED_DIR", "data/generated")
+	fpCache := service.LoadFingerprintCache(filepath.Join(generatedDir, "model-fingerprints.json"))
+	fpCache.SetIndex(service.NewModelIndex(service.ModelsRoot(baseDir)))
+	producer.SetLineage(fpCache, bundleStore, version, filepath.Join(generatedDir, "manifests"))
 	if n := producer.SweepTransient(); n > 0 {
 		log.Printf("清理上次残留的质量循环临时图 %d 条", n)
 	}
@@ -359,6 +365,8 @@ func main() {
 		api.POST("/runs/:runId/rerun", producer.Rerun)
 		api.GET("/runs/:runId/events", runHandler.Events)
 		api.GET("/runs/:runId/trace", runHandler.Trace)
+		// 血缘清单（V3 P0）：这次运行用了哪些权重/参数/产出，可离线复现
+		api.GET("/runs/:runId/manifest", producer.GetManifest)
 
 		// 产物管理（生成的图片 / 视频 / 音频）
 		artifactHandler := handler.NewArtifactHandler(getEnv("GENERATED_DIR", "data/generated"))

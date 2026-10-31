@@ -18,10 +18,10 @@ const (
 
 // Workflow 工作流定义
 type Workflow struct {
-	ID        uint            `gorm:"primaryKey" json:"id"`
-	Name      string          `gorm:"size:255;not null" json:"name"`
-	Nodes     json.RawMessage `gorm:"type:text" json:"nodes"`
-	Edges     json.RawMessage `gorm:"type:text" json:"edges"`
+	ID    uint            `gorm:"primaryKey" json:"id"`
+	Name  string          `gorm:"size:255;not null" json:"name"`
+	Nodes json.RawMessage `gorm:"type:text" json:"nodes"`
+	Edges json.RawMessage `gorm:"type:text" json:"edges"`
 
 	// Origin 这张图从哪来：user（画布保存）/ agent（MCP 生成）。
 	// qc 临时图不带 origin —— 由 name 前缀 `qc:` 标识并由 SweepTransient 清理，
@@ -54,6 +54,10 @@ type WorkflowRun struct {
 	// InvokedBy 谁发起的这次出片：manual / workbuddy / dsh / mcp。
 	// 如实记录，不猜；未知一律记 manual。
 	InvokedBy string `gorm:"size:32" json:"invoked_by,omitempty"`
+
+	// ManifestPath 这次运行的血缘清单落盘路径（V3 P0）。
+	// 空 = 未生成（旧运行或血缘未启用）。清单结构见 service/artifact_store.go。
+	ManifestPath string `gorm:"size:512" json:"manifest_path,omitempty"`
 
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"`

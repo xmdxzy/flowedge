@@ -769,10 +769,20 @@ func (e *EngineV2) OptimizePromptForH3WithGrid(ctx context.Context, raw string, 
 	if seconds <= 0 {
 		seconds = 5
 	}
-	user := fmt.Sprintf("目标时长：%d 秒\n原始想法：%s", seconds, raw)
+	// 诊断优先（V3）：先把「缺什么」判出来，只把这几处交给 LLM 修。
+	// 诊断 ok 时 guide 为空 ⇒ 不注入 ⇒ 旧行为逐字不变（重要：prompt_opt 默认开启，
+	// 不能让一条本来没问题的提示词因为这次改动而换一种写法）。
+	guide := DiagnoseGuide(DiagnosePrompt(raw, true))
+	var user string
 	if l := strings.TrimSpace(sceneLock); l != "" {
 		user = fmt.Sprintf("目标时长：%d 秒\n场景锁定（逐字保留在 [Shot 1] 风格句之后）：%s\n原始想法：%s",
 			seconds, l, raw)
+	} else {
+		user = fmt.Sprintf("目标时长：%d 秒\n原始想法：%s", seconds, raw)
+	}
+	if guide != "" {
+		// 必须放在 sceneLock 赋值**之后**：先拼后覆盖会把诊断指导静默丢掉。
+		user += "\n\n" + guide
 	}
 	modelName := e.llm.Model
 	out, err := e.deterministicChat(modelName, fmt.Sprintf("%s\n\n%s", h3PromptInstruction, user))

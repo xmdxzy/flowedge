@@ -38,6 +38,17 @@ func filmFinalRules(gates map[string]interface{}, node *model.NodeInstance, expe
 			r.loudnessMaxDB = hi
 		}
 	}
+	// VLM 内容判定（V3）：gateMapGet 支持 gates.vlm（true 才开）。
+	// 为什么放在 film gates 而不是节点默认值：它改变的是这部片子的交付标准（多花 10–30 秒），
+	// 应该由片子自己声明，而不是靠节点上次留下的开关。
+	if v := gateMapGet(gates, "vlm", "enabled"); v != nil {
+		r.vlmEnabled = gateBool(v)
+	}
+	if v := gateMapGet(gates, "vlm", "topic"); v != nil {
+		if s, ok := v.(string); ok {
+			r.vlmTopic = s
+		}
+	}
 	if r.durationTol <= 0 {
 		r.durationTol = 0.15
 	}

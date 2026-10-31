@@ -59,6 +59,10 @@ func (c JobClass) String() string {
 var cpuOnlyNodeTypes = map[string]bool{
 	"start": true,
 	"end":   true,
+	// code_video 是 headless 浏览器 + ffmpeg，纯 CPU、一个字节显存都不占；
+	// 放 GPU 道会白等 H3 排完才渲染，与「并行省时间」的设计目的相反。
+	// 渲染自身的并发由节点参数 workers + lemo 的 RENDER_SLOTS 控制。
+	"code_video": true,
 }
 
 // ttsOnCPU 判断当前 TTS 后端是否真的跑在 CPU 上（可被测试替换）。

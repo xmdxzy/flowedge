@@ -1294,6 +1294,223 @@
       ]
     },
     {
+      "id": "knowledge_film",
+      "name": "代码知识片",
+      "summary": "四种视觉体系的知识卡：暗色 3D 卡片世界 / 黑画布信息图 / DK 图鉴 / 工程蓝图，逐帧代码渲染，零抽卡、改文案秒级重渲",
+      "output": "video",
+      "est_seconds": 60,
+      "fields": [
+        {
+          "key": "style",
+          "label": "视觉风格",
+          "type": "enum",
+          "default": "darkcard",
+          "options": [
+            "darkcard",
+            "studio",
+            "atlas",
+            "blueprint"
+          ],
+          "hint": "darkcard=暗色 3D 卡片世界+相机飞行（最像头部科普号）· studio=黑画布大字信息图+章节进度条 · atlas=DK 图鉴/剖面图解（小红书图文风）· blueprint=工程蓝图（首版）",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "style"
+            }
+          ]
+        },
+        {
+          "key": "title",
+          "label": "标题",
+          "type": "text",
+          "required": true,
+          "hint": "一张卡的主标题；要整卷多卡请用 spec 字段",
+          "bind": [
+            {
+              "node": "start-1",
+              "path": "prompt"
+            },
+            {
+              "node": "code-1",
+              "path": "title"
+            }
+          ]
+        },
+        {
+          "key": "points",
+          "label": "要点（每行一条）",
+          "type": "textarea",
+          "hint": "3–5 条最舒服；每条不超过 28 字",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "points"
+            }
+          ]
+        },
+        {
+          "key": "kicker",
+          "label": "栏目/眉题",
+          "type": "text",
+          "default": "FLOWEDGE · BLUEPRINT NOTE",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "kicker"
+            }
+          ]
+        },
+        {
+          "key": "figure",
+          "label": "图示",
+          "type": "enum",
+          "default": "none",
+          "options": [
+            "none",
+            "bars",
+            "flow"
+          ],
+          "hint": "bars=横向条形对比；flow=流程箭头",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "figure"
+            }
+          ]
+        },
+        {
+          "key": "labels",
+          "label": "图示标签（逗号分隔）",
+          "type": "text",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "labels"
+            }
+          ]
+        },
+        {
+          "key": "values",
+          "label": "图示数值（逗号分隔）",
+          "type": "text",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "values"
+            }
+          ]
+        },
+        {
+          "key": "duration",
+          "label": "时长（秒）",
+          "type": "float",
+          "default": 6,
+          "min": 1,
+          "max": 180,
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "duration"
+            }
+          ]
+        },
+        {
+          "key": "width",
+          "label": "宽",
+          "type": "int",
+          "default": 1920,
+          "min": 640,
+          "max": 3840,
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "width"
+            }
+          ]
+        },
+        {
+          "key": "height",
+          "label": "高",
+          "type": "int",
+          "default": 1080,
+          "min": 360,
+          "max": 2160,
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "height"
+            }
+          ]
+        },
+        {
+          "key": "tts_text",
+          "label": "旁白（可空）",
+          "type": "textarea",
+          "hint": "填了就合成并合流；不填出无声片，交给剪辑层统一配音",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "tts_text"
+            }
+          ]
+        },
+        {
+          "key": "spec",
+          "label": "完整 spec（JSON，可选）",
+          "type": "textarea",
+          "hint": "多卡片整卷规格；填了优先于上面的单卡字段",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "spec"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start-1",
+          "type": "start",
+          "data": {
+            "prompt": ""
+          }
+        },
+        {
+          "id": "code-1",
+          "type": "code_video",
+          "data": {
+            "style": "darkcard",
+            "title": "",
+            "points": "",
+            "kicker": "FLOWEDGE · BLUEPRINT NOTE",
+            "figure": "none",
+            "duration": 6,
+            "width": 1920,
+            "height": 1080,
+            "fps": 24,
+            "workers": 2
+          }
+        },
+        {
+          "id": "end-1",
+          "type": "end",
+          "data": {}
+        }
+      ],
+      "edges": [
+        {
+          "id": "e1",
+          "source": "start-1",
+          "target": "code-1"
+        },
+        {
+          "id": "e2",
+          "source": "code-1",
+          "target": "end-1"
+        }
+      ]
+    },
+    {
       "id": "voice",
       "name": "文案转配音",
       "summary": "文本 → 语音（本地 TTS；填参考音频即克隆音色）",

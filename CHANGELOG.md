@@ -1,3 +1,131 @@
+## [v2026.10.31-v3.0-p4] VLM 判词接真机 + 提示词诊断注入 + 参考帧模块
+
+把 p1/p3 的「协议层」接到真实链路，并补上参考帧的自动收集。
+
+**VLM 判词接真机**（`service/vlm_gate.go`，4 个测试）
+- `ExtractFramesUniform`：一次 ffmpeg 均匀抽 3 帧（512 宽），避开首尾黑帧；失败报 ffmpeg 真实 stderr 首行。
+- `judgeMedia`：图片直接送，视频抽帧后送；`VisionChat` → `ParseVLMVerdict`。
+- 接进 film 终检：`gates.vlm.enabled=true` 才开（默认关，一次调用 10–30s 不能悄悄拖慢所有人）。
+- **三种失败分开报**：内容问题（fair/poor/bad）、协议问题（判词不可解析）、环境问题（VLM 不可达）——修复动作完全不同，混成一句"质量不佳"等于没报。
+- `TestAppendVLMCheck_EndToEndWithFakeOllama` 用假 Ollama 跑通「送图 → 判词 → 门结论」整链。
+
+**提示词诊断注入**（`prompt_opt.go` + `DiagnoseGuide`，3 个测试）
+- 改写前先诊断，把「本次只允许修这几处」拼进 user prompt。
+- **诊断 ok 时返回空串 ⇒ 不注入 ⇒ 旧行为逐字不变**（prompt_opt 默认开启，不能让本来没问题的提示词换一种写法）。
+- 踩到一个坑并修掉：诊断指导原先拼在 `sceneLock` 分支**之前**，会被 `user = fmt.Sprintf(...)` 覆盖掉——现在拼在之后，并有注释钉住。
+
+**参考帧自动收集**（`service/auto_refs.go`，4 个测试）
+- `rankAutoRefShots`：无台词 > 有台词、非 continue > continue、时长长者优先（短镜常是运动模糊的过渡态）。
+- `CollectAutoRefs`：从已完成镜抽帧凑够 Max（默认 3，上限 6），每镜一个子目录（同目录连抽会互相覆盖）。
+- **未接 shotlist**：动多镜生成主循环前必须真机 A/B（Ref2VA 六段式是多镜一致性的命脉，接错代价高）。
+
+---
+
+## [v2026.10.31-v3.0-p3] 提示词诊断：分型 + 定点算子（TARA 的工程化）
+
+`prompt_opt` 一直是「扩写式重写」：把提示词交给 LLM 重写一遍。两个后果——改好改坏分不清
+（没有"改之前缺什么"的结论），且一次改动同时动了主体/场景/镜头/音频四件事，违反
+「一轮只动一个变量」。本版补的是**诊断层**：先判缺什么，再只动一处。
+
+**新增**（`service/prompt_diagnose.go`，9 个测试）
+- `DiagnosePrompt(text, isVideo)`：判 7 类缺陷——缺动作 / 缺场景 / 缺镜头语言 / 缺音频段 /
+  模糊修饰 / 过长 / 空。每条带**原文证据 + 一句可执行修复 + 算子名**。
+  - 图片不要求镜头与音频（图片没有运镜、没有音轨）
+  - 模糊修饰只报 1 条（同类问题报 5 条会淹没真正的缺口）
+  - 严重度：缺动作/场景 = fail，缺镜头/音频/模糊/过长 = warn，全齐 = ok
+- `ApplyOperator(text, op, arg)`：只做纯规则算子（trim 按句子边界、replace_ambiguous、
+  normalize_space）；**创作性算子（add_scene/add_action/add_camera/add_audio）一律拒绝**，
+  因为那要 LLM 生成内容，纯规则硬拼等于编造。
+- 词表刻意短而明确：**宁可漏判，不要误判**——误判会让人去改一个本来没问题的提示词。
+
+**未接线**：`prompt_opt` 主流程仍走原来的重写路径。接线方式已定：先 `DiagnosePrompt` 出结论，
+按 `NeedsLLM` 分派（false 走纯规则算子，true 才调 LLM 且一次只补一类），最后用
+`ApplyOperator` 应用并记录算子名——这样"这一轮动了什么"永远可追溯。
+
+---
+
+## [v2026.10.31-v3.0-p2] 预算门：跑之前给区间、跑之中能停、跑完对账
+
+补上 M4 护城河（成本/时间承诺）的最小闭环。现状是「能估但没人管」：
+`EstimateGraph` 早就产出 P50/P90/worst，却只挂在画布的 `/graph/dry-run` 上，
+流水线入口的 preflight 只有 missing/warnings——于是"30 秒片要多久"在产品里没有答案。
+
+**新增**
+- `service/budget.go`：`Budget{MaxWallSeconds, OnExceed}`，`ParseBudget` 支持
+  `params.budget={...}` 与简写 `params.max_wall_seconds`；`OnExceed` 默认 **warn**
+  （误杀一条跑了 20 分钟的长片，代价远大于多烧几分钟）。
+- **引擎心跳式预算检查**（`EngineV2.SetBudgetGuard` + `emit` 的 `node_progress` 分支）：
+  不挂在 `persist` 上，因为 persist 只在**层完成**时调用，而 film 只有一个 shotlist 节点
+  ⇒ 层屏障形同虚设，预算要等整片跑完才判一次（那时已经晚了）。心跳是 5 秒级的。
+- 超限动作：`stop` → 广播 `budget_exceeded` 事件 + `CancelRun`（会同时打 ComfyUI `/interrupt`
+  并清 pending）；`warn` → 只记一条日志（只记一次，否则每 5 秒刷一条）。
+- `POST /api/preflight` 响应新增 `estimate`（p50/p90/worst/cold_load/vram_peak + 逐节点 lines + caveat）。
+- `manifest` 新增 `budget` 段：`{predicted_p50/p90/worst, actual_sec, verdict, within_budget}`，
+  `verdict` 分 under_p50 / in_p50_p90 / over_p90 / over_worst / unknown。
+
+**刻意不做**：GPU 秒预算。引擎目前没有实时采集 GPU 秒（只有节点耗时与峰值显存），
+没有数据就不做字段——否则又是"配了却不生效"那一类。
+
+**未验证**：`stop` 的真机行为（要跑一条真片并设一个很短的预算）；单测覆盖了
+解析、边界（等于上限不算超）、对账四档、preflight 返回区间。
+
+---
+
+## [v2026.10.31-v3.0-p1] VLM 判词协议：先证据、后等级（质量层的第一步）
+
+接上一版血缘层。这次落**质量层的协议**，不接真机门——理由是先把"判词长什么样、怎么解析、
+解析失败算什么"定死，再谈调用，否则又是"看起来加了质检、其实静默通过"。
+
+**为什么做这个**（论文深读的结论，见 `docs/调研-前沿论文深读-20261031.md`）：
+> FE 的真瓶颈不是模型不够强，是缺一层把「画面内容对不对」变成可执行诊断的东西。
+
+现有门只量**存在性**（帧数/响度/静音/色温/ASR 验词），量不到"人物换了脸"。
+Q-Align（2312.17090）用离散等级代替分数以降抖动；FIRM-Video（2608.21839）要求先给可核验证据。
+
+**新增**（`backend/service/vlm_judge.go`，5 个测试）
+- `BuildJudgePrompt`：模板写死三条约束——先列证据再给等级、证据必须带帧号、禁止「可能/似乎」。
+  模板是契约，`TestBuildJudgePrompt_Contract` 逐条断言（改模板会红）。
+- `ParseVLMVerdict`：宽容解析（加粗/英文键/全角冒号/`3)` 编号行都能认）；
+  **认不出等级就 `ParseOK=false`**，绝不猜默认值——猜成 good 等于把门关掉。
+- `VLMVerdict.GateCheck`：good/excellent 通过，fair 记 warn，poor/bad 记 fail，
+  **解析失败记 warn 且明确说"判词不可解析"**（不按通过处理）。
+- `VLMGradeRank`：等级可比较序号，未识别返回 -1（聚合时排除，不当"最差"）。
+
+**没做（明确边界）**：抽帧与 Ollama 调用、`gates.vlm.enabled` 接线、真机稳定性标定。
+缺这三件不能说"质量门已升级"。
+
+---
+
+## [v2026.10.31-v3.0-p0] 架构升级 V3 立项 + 血缘层落地（内容寻址 + Manifest）
+
+第一次把 FE 的**底层定位**写清楚（`docs/架构升级-FlowEdge-V3-总纲-20261031.md`），
+并落地 P0 第一项：**内容寻址与产物血缘**。这是"从抽卡到生产线"的地基——
+没有它，换权重/换参考图/换 seed 都不会让缓存失效，三个月后也无法复现任何一版。
+
+**定位（写进文档，成为后续所有取舍的判据）**
+> FE = 本地、单卡、**可验收、成本可承诺**的 AI 制片流水线。
+> 不是节点工具（没验收），不是云平台（管线不可改），不是通用编排（不懂媒体）。
+
+**新增能力**
+- **`ArtifactKey` 内容寻址键**（`service/artifact_store.go`）：参数 + 模型指纹 + seed +
+  上游产物摘要 + 代码版本 → 32 位 hash。8 个维度各自改变 key（`TestArtifactKey_Completeness`）。
+- **模型指纹**：首尾各 1MB 的快速摘要（20GB 权重 <1s），纳秒 mtime 参与缓存判定，
+  同尺寸替换也能检出；指纹落盘 `data/generated/model-fingerprints.json`，重启不重算。
+- **`Manifest` 血缘清单**：每次出片落 `data/generated/manifests/run-<id>.json`，
+  记模型/参数/产物 sha256/耗时/资源；失败运行也写（失败的血缘同样是证据）。
+- **`GET /api/runs/:runId/manifest`**：有清单 200，旧运行 404 并**说明原因**（不返回空对象冒充成功）。
+
+**修掉的坑**
+- `data/pipelines.json` 带 UTF-8 BOM → handler 测试全红，报错误导性极强
+  （`invalid character 'ï'`）。`LoadPipelines` 现在容错去 BOM **并记日志**，
+  `TestLoadPipelines_ToleratesBOM` 钉住"容错但不吞错"。
+
+**未验证（诚实清单）**
+- `writeRunManifest` 的真机路径未跑（需 GPU + 几分钟出片）；单测覆盖了构造与 API。
+- `shotCacheKey` 仍缺 seed/权重/参考图（已移到 P1：改键会让现有缓存全失效，须与真机 A/B 一起做）。
+
+---
+
 ## [v2026.10.25-v2.5] 真机首跑：七条流水线全跑通，修掉四个静默失败
 
 第一次把 v2 真跑起来（ComfyUI / H3 / Ollama / TTS / ASR 全在真机上），跑通 7 条流水线，

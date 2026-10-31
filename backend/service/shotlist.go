@@ -994,7 +994,11 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	if finfo, perr := probeGateMedia(final); perr != nil {
 		verdict.Add("WARN", "final.probe", "终检未执行（读不到媒体信息）："+perr.Error())
 	} else {
-		finalChecks = runGateChecks(ctx, final, finfo, filmFinalRules(gates, node, expectedFrames))
+		finRules := filmFinalRules(gates, node, expectedFrames)
+		finalChecks = runGateChecks(ctx, final, finfo, finRules)
+		// VLM 内容判定（V3）：技术门全过但"人物换脸 / 畸形 / 穿模"只有看画面才能发现。
+		// 默认关（gates.vlm=true 才开）；判词不可解析或 VLM 不可达都记 warn，绝不当通过。
+		finalChecks = e.appendVLMCheck(ctx, final, finRules, finalChecks)
 		for _, c := range finalChecks {
 			if c.OK {
 				verdict.Add("OK", "final."+c.Name, c.Detail)
