@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -52,7 +51,7 @@ func masterLoudness(in, out string, targetLUFS, truePeak, lra float64) error {
 		args = append(args, "-t", fmt.Sprintf("%.3f", dur))
 	}
 	args = append(args, out)
-	if b, cerr := exec.Command(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
+	if b, cerr := hiddenExec(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
 		_ = os.Remove(out)
 		return fmt.Errorf("响度归一失败：%w（%s）", cerr, strings.TrimSpace(string(b)))
 	}
@@ -102,7 +101,7 @@ func mixBGM(in, bgm, out string, gainDB float64, duck bool) error {
 		"-t", fmt.Sprintf("%.3f", dur),
 		out,
 	}
-	if b, cerr := exec.Command(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
+	if b, cerr := hiddenExec(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
 		_ = os.Remove(out)
 		return fmt.Errorf("BGM 混音失败：%w（%s）", cerr, strings.TrimSpace(string(b)))
 	}
@@ -152,9 +151,43 @@ func mixRoomTone(in, out string, floorDB float64) error {
 		"-ar", "48000",
 		out,
 	}
-	if b, cerr := exec.Command(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
+	if b, cerr := hiddenExec(ffmpegBin(), args...).CombinedOutput(); cerr != nil {
 		_ = os.Remove(out)
 		return fmt.Errorf("声床铺底失败：%w（%s）", cerr, strings.TrimSpace(string(b)))
 	}
 	return nil
+}
+
+// videoAudioFinish 给「文生视频」这类没有完整装配链路的片子补齐响度归一 +
+// 可选声床，与 film 复用同一套 ffmpeg 参数，避免两套音频验收不一致。
+// 视频流全部 -c:v copy，只重编码音轨；失败降级为 WARN（调用方自己在 out 里记
+// 下来，不阻断出片）。返回最终可交付的视频路径。
+func videoAudioFinish(video string, enableMaster bool, lufs float64,
+	enableRoomTone bool, roomToneFloor float64,
+	out map[string]interface{}) string {
+	final := video
+	if enableMaster {
+		m2 := strings.TrimSuffix(final, filepath.Ext(final)) + "-master" + filepath.Ext(final)
+		if err := masterLoudness(final, m2, lufs, -1.5, 11); err != nil {
+			out["audio_master_warn"] = err.Error()
+		} else {
+			final = m2
+			out["audio_master_ok"] = true
+			out["audio_master_lufs"] = lufs
+		}
+	}
+	if enableRoomTone {
+		m4 := strings.TrimSuffix(final, filepath.Ext(final)) + "-roomtone" + filepath.Ext(final)
+		if err := mixRoomTone(final, m4, roomToneFloor); err != nil {
+			out["audio_roomtone_warn"] = err.Error()
+		} else {
+			final = m4
+			out["audio_roomtone_ok"] = true
+			out["audio_roomtone_floor_db"] = roomToneFloor
+		}
+	}
+	if abs, aerr := filepath.Abs(final); aerr == nil {
+		final = abs
+	}
+	return final
 }

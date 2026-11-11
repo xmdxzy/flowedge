@@ -33,9 +33,9 @@ import (
 
 // 稳定错误码（前端、文档、测试共用；改名等于破坏协议）。
 const (
-	IssueTypeMismatch    = "type_mismatch"
-	IssueUnknownPortKey  = "unknown_port"
-	IssueUnknownNodeType = "unknown_node_type"
+	IssueTypeMismatch     = "type_mismatch"
+	IssueUnknownPortKey   = "unknown_port"
+	IssueUnknownNodeType  = "unknown_node_type"
 	IssueInputUnreachable = "input_unreachable"
 )
 

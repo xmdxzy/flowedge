@@ -1,173 +1,151 @@
 # FlowEdge
 
-> **2026-10-24 · FlowEdge Lite** —— this build keeps exactly two capabilities:
-> ① local multimodal generation workflows (image / video / audio), ② a quality-gate loop
-> (generate → score → diagnose → repair → rerun → keep best).
-> Everything else — self-evolution, toolchain / MCP client / plugins, capability cards &
-> skill packs, KB / RAG, triggers, credentials, workflow versions, the OpenAI-compatible
-> `/v1` surface — has been **removed**. 44 API routes, 27 node types, one exe.
-> Details & cut list: `docs/轻装化-FlowEdge-Lite-v1.md`.
+Local video and image production on one GPU. You pick a pipeline, fill in a form, and the engine
+figures out what to load, what to free, and whether the result is any good. There is a canvas view
+too if you'd rather wire the graph yourself. Everything runs on your machine; nothing is uploaded.
 
-**A private, single-binary multimodal workflow engine for one consumer GPU.**
+It builds into one Windows exe. No Docker, no Python, no Node on the target machine.
 
-Chain local LLM, text-to-image, video, ASR, TTS and RAG nodes on one canvas — then run the whole pipeline with one click. Everything stays on your machine. No Docker, no Node, no Python, no cloud account.
+![an example film produced locally](docs/demo/flowedge-film-demo.gif)
 
-```bash
-# Download FlowEdge.exe, double-click, open http://127.0.0.1:8080
+That clip (dialogue, ambience, lip movement) came out of a single RTX 3090 through a FlowEdge
+pipeline. MiniMax-H3 did the video and the stereo audio in one pass.
+
+## What it looks like
+
+![produce station, dark theme](docs/demo/ui-produce-dark.png)
+
+Left: the pipelines you can run. Right: the fields that pipeline needs. Nothing else to learn.
+
+![canvas view](docs/demo/ui-canvas-dark.png)
+
+The canvas is the same engine with the lid off. Start from a template, drag nodes, run a dry-run
+before you commit.
+
+![light theme](docs/demo/ui-produce-light.png)
+
+Light theme is its own palette, not a filter over the dark one.
+
+## Why I built it
+
+I had ComfyUI, Ollama, ffmpeg and a few TTS servers on one 24 GB card. Each worked alone. Together
+they fought over VRAM, and the failures looked like "the node is broken" instead of "we ran out of
+graphics memory twenty minutes ago".
+
+Three things came out of that, all measured on this machine:
+
+**VRAM arbitration.** A diffusion model (17 GB), an LLM (9 GB) and Whisper (3 GB) don't fit at
+once. The engine evicts before it loads, waits for the device to actually free memory, and keeps the
+queues separate so a CPU-only job doesn't wait behind a video render. A text-to-image plus vision
+pipeline peaks at 15.0 GB with a 3D editor open, down from 24.0 GB.
+
+**Consistency you can check.** Multi-shot clips drift. Shot three quietly becomes a different room
+while the duration and the audio stay perfect. FlowEdge compiles the scene facts into one lock
+sentence, injects it byte-for-byte into every shot, and fails the run if any shot's copy differs.
+
+**Gates that run before delivery.** A 0.04 s crossfade once dropped an entire shot while every
+timestamp looked fine. So the checks live inside the run: frame-exact counting, A/V drift, silence
+gaps, loudness, speech verification. A take where the actor says the line twice gets rejected and
+retried, not shipped.
+
+## Interop
+
+Two ways in, no connector catalogue:
+
+- **MCP server.** `FlowEdge.exe --mcp` speaks stdio JSON-RPC. Agents get `flowedge_pipelines`,
+  `flowedge_produce`, `flowedge_run_status`, `flowedge_runs`, `flowedge_artifacts`.
+- **ComfyUI escape hatch.** The `comfy` node runs an Export (API) graph as-is. Anything ComfyUI can
+  do is reachable without waiting for me to add a node. UI-format graphs are rejected with an
+  explanation; converting them silently would produce a graph that looks runnable and is wired wrong.
+
+## Before you commit to a run
+
+`POST /api/preflight` and `POST /api/graph/dry-run` answer with a range instead of a guess:
+
+```
+peak 21.8 GB (range 18.5–25.1), wall 26–41 min, confidence medium (5 samples)
 ```
 
-![FlowEdge in action — 30-second generated film with stereo audio, produced entirely on one RTX 3090](docs/demo/flowedge-film-demo.gif)
+VRAM peaks are sampled per heavy node and accumulated in `data/vram_profiles.json`. No
+extrapolation across parameter ranges, confidence drops below three samples, and estimates that came
+from model size rather than a real run are marked as such. `fits` is judged on the upper bound.
 
-*The clip above (dialogue, ambience, lip movement) was generated locally with MiniMax-H3 on a single 24 GB GPU — orchestrated as a FlowEdge workflow.*
+## Configuration
 
----
-
-## Why another workflow tool
-
-| Tool | What it does | What FlowEdge adds |
-|---|---|---|
-| **ComfyUI** (137k★) | Node graph for diffusion models | Multimodal orchestration *around* it: LLM / ASR / TTS / RAG / video assembly in the same DAG, plus **VRAM arbitration** so ComfyUI and your LLM can share one 24 GB card |
-| **n8n / Dify / Langflow** | LLM workflow platforms | Runs **local models** end-to-end (not just API calls), ships as **one exe**, and treats *generated media quality* as a first-class, machine-checkable concern |
-| **Ollama / LocalAI** | Local model servers | Not a chat box: a production engine with debugger, breakpoints, lineage, versions and quality gates |
-
-FlowEdge does not replace ComfyUI — it **orchestrates** it (and Ollama, ffmpeg, Whisper, Kokoro) the way a build system orchestrates compilers.
-
-## Three things that are hard to copy
-
-These are not design decisions. They grew out of real production failures on this machine, and the numbers below are measured, not estimated.
-
-### 1. VRAM arbitration on a single card
-
-24 GB cannot hold a diffusion model (17 GB), an LLM (9 GB) and Whisper (3 GB) at once. FlowEdge arbitrates:
-
-- Enter one side → others are **really unloaded** (`keep_alive:0` / ComfyUI `POST /free`), not just marked free
-- Poll `vram_free` until it actually returns above 16 GB before continuing (CUDA release is async)
-- Keep ComfyUI weights **resident** within a batch: 5 images at 768² take **199 s** when reloading per image vs **29 s** resident — a measured 6.9×
-- Speech services default to CPU, leaving the whole card for image and LLM work
-
-Result: a text-to-image + vision pipeline peaks at **15.0 GB** on a 3090 *while UE5 is open* (was 24.0 GB before arbitration).
-
-### 2. Scene consistency that is enforced, not described
-
-Multi-segment video drifts — shot 3 quietly becomes a different room while duration and audio stay perfect. FlowEdge compiles a 3×3 physical-facts grid into a single `SCENE LOCK` sentence, injects it **byte-identical** into every segment, and **fails the run** if any segment's lock drifts (`scene_lock_missing` / `scene_lock_drift`). Consistency by verification, not by adjectives.
-
-### 3. Quality gates as nodes
-
-`verify-media.py` catches what duration checks cannot: a 0.04 s crossfade once silently dropped an entire segment while every timestamp looked fine. FlowEdge ships this as a **`quality_gate` node** — frame-exact counting (`-count_frames`), A/V drift, silence gaps, loudness, speech detection — wired into the graph, failing the run *before* assembly instead of after delivery.
-
-Plus: H3 dual-worktree isolation (torch 2.14 vs 2.6 coexisting on one machine via exclusive port arbitration) — the kind of knowledge that only comes from debugging, never from reading source.
-
-## Interop: four ways in, none of them a connector catalogue
-
-FlowEdge does not chase n8n's 400 connectors. It borrows other ecosystems through protocols instead:
-
-| Direction | What it gives you |
+| File | What it controls |
 |---|---|
-| **OpenAI-compatible endpoints** | `POST /v1/images/generations`, `/v1/audio/transcriptions`, `/v1/audio/speech`, `/v1/chat/completions` (SSE streaming), `GET /v1/models`. Point Open WebUI / SillyTavern / Chatbox / LangChain at `http://127.0.0.1:8080/v1` and your local GPU becomes their backend — zero client changes. |
-| **MCP server** | `FlowEdge.exe --mcp` speaks stdio JSON-RPC. Claude Desktop / Cursor get `flowedge_run_workflow`, `run_status`, `estimate`, `generate_image` as tools. One integration point instead of a hundred connectors — MCP clients are the side that is growing. |
-| **ComfyUI workflow import** | The `comfy_workflow` node runs a ComfyUI **Export (API)** graph as-is — bind inputs by `nodeId.inputName=value`, and numeric fields are coerced to numbers. Honest limitation: the UI format is rejected, not converted. All 89 official blueprints ship as UI format with `definitions.subgraphs` (node `type` is a UUID), so they need expanding + Export (API) first. Guessing a conversion would produce a graph that looks runnable and is wired wrong; the error message distinguishes plain UI format from subgraph format because the fixes differ. |
-| **Runtime plugins** | `data/plugins/<name>/plugin.json` — an `http` plugin (written in any language) or a `script` plugin (interpreted in-process by yaegi, sandboxed to a stdlib allowlist). Adding a node no longer means recompiling a 32 MB exe. |
+| `data/pipelines.json` | The 11 fixed pipelines: fields, where each field binds, which node gets skipped. Shipped in the repo, because it is the product. |
+| `data/models.json` | Role → weight file, default steps/cfg/size, precision ladder. Generated on first run. |
+| `data/deps.json` | How ComfyUI, Ollama, ffmpeg and the speech services are started, on which port, with how much VRAM held back. |
 
-## Prediction before execution
+Weight names used to be hardcoded in eight places. Swapping a checkpoint meant editing Go and
+rebuilding, and on any other machine the first run died with a ComfyUI validation error.
 
-Every heavy node is sampled for VRAM peak (`nvidia-smi`, 1 s interval, only during the node's own execution window — no idle polling). Those measurements accumulate into `data/vram_profiles.json`, keyed by model × resolution × frames × steps.
+## What's in the box
 
-`POST /api/estimate` then answers, *before* you commit:
+11 pipelines: text to image, storyboard batch, image edit, text to video with audio, image to video
+with a hand-off between segments, multi-shot films, code-rendered knowledge films, storyboard first
+then shoot, voice-over, and plain text.
 
-> peak 21.8 GB (range 18.5–25.1), wall 26–41 min, confidence: medium (5 samples)
+15 node types: `start`, `end`, `quality_loop`, `llm`, `storyboard`, `shotlist`, `text2image`,
+`image2image`, `inpaint`, `upscale`, `text2video`, `tts`, `music`, `code_video`, `comfy`.
 
-Three rules keep it honest: no extrapolation across parameter ranges (it says "extrapolated" and only gives an upper bound), confidence drops when samples < 3, and peaks that came from a model-size estimate rather than a sample are marked `peak_underestimated`. `fits` is judged on the upper bound, not the expected value.
+Films get subtitles (SRT written always, burned in on request), room tone under the seams, loudness
+normalisation and a limiter. Code films render through headless Chromium and cost seconds instead of
+minutes, so they queue on the CPU track while a video samples on the GPU.
 
-## Configuration, not code
+## Running it
 
-| File | Controls |
-|---|---|
-| `data/models.json` | Logical role → weight files + default params (steps/cfg/size/frames) + precision ladder |
-| `data/instances.json` | Model → ComfyUI instance routing; `exclusive_group` serialises instances that cannot coexist on one card |
-| `data/plugins/` | Runtime nodes |
+**Windows, no toolchain.** Grab `FlowEdge.exe` and `data/pipelines.json` from Releases, put them in a
+folder, double-click. It opens `http://127.0.0.1:8080`. The engine starts without any backend
+installed; the Environment panel tells you what's missing and how to start it.
 
-Before this, those weight names were hardcoded in 8 places — swapping a checkpoint meant editing Go and rebuilding. It also meant that on any machine without those exact filenames, the first run failed with ComfyUI's `400 prompt_outputs_failed_validation`.
-
-## Features
-
-**Orchestration**
-- Visual DAG canvas (React Flow v12): drag, snap, connect with validation
-- Layered parallel execution with diamond joins, `join: any`, `continue_on_error`
-- 30 node types: LLM / T2I / img2img / inpaint / upscale / T2V / H3 audio-video / shot list / ASR / TTS / vision / select / RAG / code / HTTP / transform / aggregate / loop / sub-workflow / **quality_gate** / **comfy_workflow** (imported ComfyUI graph) / runtime plugins
-- Single-step debugger + breakpoints; resume from any node; branch-aware resume reuses successful outputs
-- Variable system `{{nodeId.path}}` with array indexing
-- Webhook + cron triggers; versioning with rollback; AES-256-GCM credential store
-- Artifact lineage: every image / audio / video traces back to workflow → run → node → inputs
-
-**Multimodal (all local)**
-- Ollama LLM (streaming + tool calling), ComfyUI T2I with custom workflow templates, Wan 2.1 / MiniMax-H3 video (H3 generates **joint video + stereo audio**), Whisper ASR, Kokoro TTS (Windows SAPI zero-dependency fallback), BM25+vector hybrid RAG with MMR
-
-**Engineering discipline**
-- Explicit failure over silent success: unconfigured services fail loudly, never fabricate results
-- Save-time validation: cycles, missing prompts and missing inputs are rejected before they enter the database
-- Run-time preflight: missing dependencies fail at the entry point with *what is missing and how to start it*
-- 300+ tests, structured error codes, persistent job queue with crash recovery, preflight against `/object_info` so wrong weight names fail before submit instead of after
-
-## Quick start
-
-**Windows (recommended — nothing to install)**
-
-1. Download `FlowEdge.exe` (~32 MB) from [Releases](../../releases) — frontend, database and voice-service scripts are embedded
-2. Double-click. Browser opens at `http://127.0.0.1:8080`
-3. Install optional backends as needed (Ollama / ComfyUI / ffmpeg / Python) — the **Environment** panel tells you exactly what is missing and how to fix it. The engine runs without any of them; only the corresponding nodes will report.
-
-**From source**
+**From source.**
 
 ```bash
-# backend (Go 1.25+)
-cd backend && go run main.go
-
-# frontend (Node 18+)
+cd backend && go run main.go          # Go 1.25+
 cd frontend && npm install && npm run dev
 ```
 
-**Build the single exe**
+**Build the exe.**
 
 ```bash
-python scripts/build-windows.py   # → dist/FlowEdge.exe
+python scripts/build-windows.py --version 2026.11.11
 ```
 
-**Linux / macOS (one-command local run)**
+**Linux/macOS.** `./scripts/run-local.sh` builds if needed, starts the engine and waits for health.
 
-`scripts/run-local.sh` builds the binary if needed (cross-compile-free, `CGO_ENABLED=0`),
-starts it in the background, polls `/api/health`, and prints the client URL.
+## Tests
 
 ```bash
-./scripts/run-local.sh            # build-if-needed + start + health-check → http://127.0.0.1:8080
-./scripts/run-local.sh --build    # force a rebuild
-./scripts/run-local.sh --stop     # stop the background engine
-./scripts/run-local.sh --logs     # follow the engine log
+python scripts/check-all.py --full     # build, go test, tsc, frontend tests
+python scripts/release-check.py        # boots dist/FlowEdge.exe and asserts 20 things
+python scripts/privacy-scan.py         # no usernames, emails, logs or internal notes in the tree
 ```
 
-Build a Linux/amd64 binary directly (for container or remote deploy):
+500+ backend tests, 60+ frontend tests. The pipeline format has contract tests, so a field that is
+accepted by the API but never reaches a node fails the build instead of failing silently in
+production.
 
-```bash
-python scripts/build-windows.py --goos linux --goarch amd64 --output flowedge   # → dist/flowedge
-```
+## Security
 
-## Documentation
+Loopback only by default. Exposing it to the LAN requires `FLOWEDGE_HOST` plus
+`FLOWEDGE_API_TOKEN`, otherwise it refuses to start. No telemetry, no account, no cloud. It is a
+single-user tool: no roles, no encryption at rest, no sandbox for the workflows you load. See
+[SECURITY.md](SECURITY.md) for what counts as a vulnerability here.
 
-| Document | Contents |
-|---|---|
-| [Multimodal film playbook](docs/多模态出片手册.md) (zh) | Route selection / control gates / prompt templates / measured parameters / acceptance / troubleshooting — one page each |
-| [中文 README](docs/zh/README.md) | Full Chinese documentation |
-| `AGENTS.md` | Operational discipline: every environment pitfall this project has hit, with evidence |
+## Docs
 
-## Tech stack
+- [Producing films](docs/多模态出片手册.md): choosing a pipeline, parameters, acceptance checks
+- [Pipelines and canvas](docs/画布与流水线统一-20261029.md): how the two views share one engine
+- [Prompt rules for product shots](docs/3D爆炸图提示词规范.md) and [video prompt structure](docs/视频提示词编排规范.md)
+- [Release checklist](RELEASE.md) if you are cutting a build
 
-Go 1.25 + Gin + GORM + Gorilla WebSocket · React 18 + TypeScript + @xyflow/react + Tailwind · SQLite (zero-dependency; Postgres switchable) · Ollama / ComfyUI / ffmpeg / Whisper / Kokoro
+## Stack
 
-## Security posture
-
-- Listens on `127.0.0.1` by default; external exposure requires explicit `FLOWEDGE_HOST=0.0.0.0` **plus** `FLOWEDGE_API_TOKEN` (refuses to start otherwise)
-- Credentials encrypted with AES-256-GCM; workflow exports never leak secrets
-- Code-execution node runs a yaegi Go subset with a stdlib allowlist and static import rejection
+Go 1.25, Gin, GORM, gorilla/websocket. React 18, TypeScript, @xyflow/react, Tailwind. SQLite by
+default, Postgres if you point it at one. Talks to Ollama, ComfyUI, ffmpeg, Whisper and Kokoro.
 
 ## License
 
-Apache-2.0
+Apache-2.0.

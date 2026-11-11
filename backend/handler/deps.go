@@ -106,6 +106,29 @@ func (h *DepHandler) Unload(c *gin.Context) {
 	c.JSON(http.StatusOK, res)
 }
 
+// Reclaim 回收显存：清队列 → /free（或 /unload）→ **测量**是否真的释放了。
+//
+// 与 Unload 的分工：Unload 只发卸载请求；Reclaim 会先清掉 ComfyUI 队列里
+// 卡住的 running/pending 项——实测任务超时后 ComfyUI 侧还在 VAE decode 里跑，
+// 这时 /free 完全无效（还在跑就不会卸载），必须先把队列清掉。
+func (h *DepHandler) Reclaim(c *gin.Context) {
+	if h.sup == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "依赖管理器未初始化"})
+		return
+	}
+	name := c.Param("name")
+	res, err := h.sup.ReclaimVRAM(name)
+	if err != nil {
+		code := http.StatusBadGateway
+		if strings.Contains(err.Error(), "未知依赖") {
+			code = http.StatusNotFound
+		}
+		c.JSON(code, gin.H{"error": err.Error(), "result": res})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
 // Wait 等待就绪（供脚本/自动化使用，最多等 120 秒）
 func (h *DepHandler) Wait(c *gin.Context) {
 	if h.sup == nil {

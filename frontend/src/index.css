@@ -220,3 +220,10 @@ body{font-family:system-ui,'Microsoft YaHei UI','PingFang SC',sans-serif;font-si
 .react-flow__edge-path{stroke:var(--muted-2);stroke-width:1.6}
 .react-flow__edge.selected .react-flow__edge-path{stroke:var(--brand)}
 .react-flow__node{font-family:inherit}.cv-qc{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer}
+/* 顶层错误边界：渲染崩掉时的兜底页（样式用主题令牌，深浅色都跟着走） */
+.crash{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--bg)}
+.crash__card{width:100%;max-width:560px;border:1px solid var(--danger);border-radius:14px;background:var(--panel);padding:22px 24px}
+.crash__title{margin:0 0 8px;font-size:16px;font-weight:600;color:var(--danger)}
+.crash__hint{margin:0 0 14px;font-size:13px;line-height:1.7;color:var(--muted)}
+.crash__raw{margin:0 0 16px;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel-2);color:var(--text);font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto}
+.crash__actions{display:flex;gap:8px}

@@ -105,10 +105,10 @@ type IdleReclaimer struct {
 	queue  *JobQueue
 	policy IdleReclaimPolicy
 
-	mu        sync.Mutex
-	idleSince time.Time
-	done      bool // 本轮空闲已经回收过（避免每 30s 重复发 /free）
-	last      *ReclaimResult
+	mu          sync.Mutex
+	idleSince   time.Time
+	lastAttempt time.Time // 上次真正动手的时刻（重试间隔按它算）；本轮空闲还没动过时为零值
+	last        *ReclaimResult
 }
 
 // NewIdleReclaimer 构造回收器。queue 可以为 nil（只按 activeRuns 判定）。
@@ -175,7 +175,7 @@ func (r *IdleReclaimer) Tick(now time.Time) {
 	if r.busy() {
 		r.mu.Lock()
 		r.idleSince = time.Time{}
-		r.done = false
+		r.lastAttempt = time.Time{}
 		r.mu.Unlock()
 		return
 	}
@@ -187,17 +187,34 @@ func (r *IdleReclaimer) Tick(now time.Time) {
 		return
 	}
 	waiting := now.Sub(r.idleSince)
-	already := r.done
+	prevAttempt := r.lastAttempt
 	r.mu.Unlock()
 
-	if already || waiting < r.policy.After {
+	if waiting < r.policy.After {
+		return
+	}
+
+	// 重试间隔 = 空闲阈值（下限 1 分钟），避免每 30s poll 一次就发一轮请求。
+	//
+	// 为什么不是「一轮空闲只试一次」（旧实现，2026-11-06 修）：托管依赖完全可能
+	// 在回收之后才被加载——面板上点启动、直接 curl /load、外部脚本起服务，这些
+	// 都不经过引擎队列，busy() 看不见。旧的一次性闩锁只在 busy() 里复位，于是
+	// 权重重新常驻之后再没人管。
+	// 实测现场：10:57 回收一次（回收 0MB）→ 13:48 手动起 ACE-Step 7.3GB →
+	// 15:30 手动起 Breeze TTS 11.6GB → 到 16:13 回收器一次都没再判定，卡上
+	// 20.6GB 常驻，日志最后一笔还停在 10:57。
+	retryGap := r.policy.After
+	if retryGap < time.Minute {
+		retryGap = time.Minute
+	}
+	if !prevAttempt.IsZero() && now.Sub(prevAttempt) < retryGap {
 		return
 	}
 
 	// 先占位再动手：回收本身要几秒到十几秒（/unload 6s、/free 最多等 12s），
 	// 不占位的话下一轮 tick 会重复发一遍请求。
 	r.mu.Lock()
-	r.done = true
+	r.lastAttempt = now
 	r.mu.Unlock()
 
 	res := r.reclaim()

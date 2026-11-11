@@ -1,8 +1,11 @@
-// FlowEdge · blueprint knowledge card renderer
+﻿// FlowEdge · blueprint knowledge card renderer
 // Page contract (lemo): window.READY, window.DUR, window.render(t), window.TEXTS(t)
 // Deterministic: every frame depends only on t (no Math.random / Date.now).
 
-const W = 1920, H = 1080;
+// 设计尺寸随画幅变：横屏 1920×1080，竖屏 1080×DH（9:16→1920，3:4→1440）
+let W = 1920, H = 1080, PORTRAIT = false, VW = 1920, VH = 1080, SC = 1;
+import { wrapByPunct } from './shared/kit.js';
+
 const INK = 'rgba(226,238,252,0.92)';
 const INK_DIM = 'rgba(178,200,228,0.62)';
 const INK_FAINT = 'rgba(150,178,212,0.34)';
@@ -101,6 +104,22 @@ function typed(s, p) {
 }
 
 // ---------- blueprint base (rendered once) ----------
+// setupLayout 由视口决定设计尺寸与缩放：竖屏不是把横屏挤扁，图版会重排
+function setupLayout() {
+  const cv = document.getElementById('c');
+  VW = cv.width = Math.max(2, window.innerWidth | 0);
+  VH = cv.height = Math.max(2, window.innerHeight | 0);
+  PORTRAIT = VH >= VW * 0.99;
+  if (PORTRAIT) {
+    W = 1080;
+    H = Math.round((1080 * VH) / VW);
+  } else {
+    W = 1920;
+    H = 1080;
+  }
+  SC = PORTRAIT ? VW / W : Math.min(VW / W, VH / H);
+}
+
 function buildBackground() {
   const off = document.createElement('canvas');
   off.width = W; off.height = H;
@@ -272,67 +291,88 @@ function drawCard(c, card, lt, cardDur, idx, total) {
   c.save();
   c.globalAlpha = fin;
 
-  // index number (top-right watermark, clear of the heading)
-  setText(c, 132, 700, true);
+  // 版心与节奏随画幅变：竖屏图版更窄更高，字号按 1080 宽重排
+  const CX = PORTRAIT ? 64 : 150;
+  const CW = W - CX * 2;
+  const kickY = PORTRAIT ? H * 0.135 : 150;
+  const hy = PORTRAIT ? H * 0.175 : 206;
+  const hSize = PORTRAIT ? 74 : 54;
+  const pStep = PORTRAIT ? 104 : 60;
+  const pSize = PORTRAIT ? 42 : 30;
+  const figY = PORTRAIT ? H * 0.54 : 618;
+  const dimY = PORTRAIT ? H * 0.815 : 972;
+
+  // index number (顶部水印序号)
+  setText(c, PORTRAIT ? 150 : 132, 700, true);
   c.fillStyle = 'rgba(150,196,250,0.085)';
   c.textAlign = 'right'; c.textBaseline = 'top';
-  c.fillText(String(idx + 1).padStart(2, '0'), W - 96, 130);
+  c.fillText(String(idx + 1).padStart(2, '0'), W - (PORTRAIT ? 64 : 96), kickY - 46);
 
   // kicker
-  setText(c, 20, 500, true);
+  setText(c, PORTRAIT ? 22 : 20, 500, true);
   c.fillStyle = INK_FAINT; c.letterSpacing = '4px';
   c.textAlign = 'left'; c.textBaseline = 'top';
-  c.fillText((card.kicker || SPEC.kicker || 'FLOWEDGE · BLUEPRINT NOTE').toUpperCase(), CARD_X, 150);
+  c.fillText((card.kicker || SPEC.kicker || 'FLOWEDGE · BLUEPRINT NOTE').toUpperCase(), CX, kickY);
   c.letterSpacing = '0px';
 
-  // heading
-  const hy = 206;
-  setText(c, 54, 700);
-  c.fillStyle = INK; c.textAlign = 'left'; c.textBaseline = 'top';
+  // heading：竖屏按标点断行，最多 3 行（横屏维持单行打字机）
   const hp = prog(lt, 0.15, 0.75);
-  c.fillText(typed(card.heading || '', hp), CARD_X, hy);
-  const hw = textW(c, card.heading || '');
+  setText(c, hSize, 700);
+  const lines = PORTRAIT ? wrapByPunct(c, card.heading || '', CW, 3) : [card.heading || ''];
+  let hBottom = hy, hWidth = 0;
+  lines.forEach((ln, k) => {
+    setText(c, hSize, 700);
+    c.fillStyle = INK; c.textAlign = 'left'; c.textBaseline = 'top';
+    c.fillText(typed(ln, hp), CX, hy + k * hSize * 1.28);
+    hBottom = hy + k * hSize * 1.28;
+    hWidth = Math.max(hWidth, textW(c, ln));
+  });
+
+  // 双线（手绘抖动）在标题下方
   if (hp >= 1) {
-    c.strokeStyle = ACCENT; c.lineWidth = 2.6;
     const up = prog(lt, 0.75, 1.25);
-    handLine(c, CARD_X, hy + 78, CARD_X + hw * up, hy + 78, 900 + idx, 1.4, Math.max(4, Math.round(20 * up)));
+    c.strokeStyle = ACCENT; c.lineWidth = 2.6;
+    handLine(c, CX, hBottom + hSize * 1.34, CX + hWidth * up, hBottom + hSize * 1.34, 900 + idx, 1.4, Math.max(4, Math.round(20 * up)));
     c.strokeStyle = 'rgba(120,214,255,0.35)'; c.lineWidth = 1.2;
-    handLine(c, CARD_X, hy + 86, CARD_X + hw * up, hy + 86, 940 + idx, 1.0, Math.max(4, Math.round(16 * up)));
+    handLine(c, CX, hBottom + hSize * 1.34 + 8, CX + hWidth * up, hBottom + hSize * 1.34 + 8, 940 + idx, 1.0, Math.max(4, Math.round(16 * up)));
   }
 
   // points
-  let py = hy + 136;
-  const points = (card.points || []).slice(0, 6);
-  points.forEach((pt, i) => {
+  let py = hBottom + hSize * 1.34 + (PORTRAIT ? 64 : 62);
+  const maxPts = PORTRAIT ? 4 : 6;
+  (card.points || []).slice(0, maxPts).forEach((pt, i) => {
     const t0 = 1.15 + i * 0.62;
     const rp = prog(lt, t0, t0 + 0.55);
     if (rp <= 0) return;
-    setText(c, 30, 400);
+    setText(c, pSize, 400);
     c.fillStyle = INK_DIM;
-    c.fillText('▸', CARD_X, py);
+    c.textAlign = 'left'; c.textBaseline = 'top';
+    c.fillText('▸', CX, py);
     c.fillStyle = INK;
-    c.fillText(typed(pt, rp), CARD_X + 34, py);
-    py += 60;
+    const pl = PORTRAIT ? wrapText(c, pt, CW - 44)[0] : pt;
+    c.fillText(typed(pl, rp), CX + (PORTRAIT ? 40 : 34), py);
+    py += pStep;
   });
 
   // figure
-  const figY = 618;
-  if (card.figure === 'bars') drawBars(c, card, prog(lt, 1.6, 3.6), CARD_X, figY, CARD_W - 40);
-  else if (card.figure === 'flow') drawFlow(c, card, prog(lt, 1.6, 3.4), CARD_X, figY, CARD_W - 80);
+  if (card.figure === 'bars') drawBars(c, card, prog(lt, 1.6, 3.6), CX, figY, CW - 40);
+  else if (card.figure === 'flow') drawFlow(c, card, prog(lt, 1.6, 3.4), CX, figY, CW - 80);
 
   // dimension decoration under content
   c.strokeStyle = INK_FAINT;
-  dimensionLine(c, CARD_X, 972, CARD_X + CARD_W * 0.42, 972, card.note || '', 1200 + idx);
+  dimensionLine(c, CX, dimY, CX + CW * 0.42, dimY, card.note || '', 1200 + idx);
 
   c.restore();
 }
-
 // ---------- page assembly ----------
 function drawFrame(t) {
   const c = ctx;
   c.setTransform(1, 0, 0, 1, 0, 0);
   c.globalAlpha = 1;
-  c.drawImage(bg, 0, 0);
+  c.fillStyle = PAPER_2;
+  c.fillRect(0, 0, VW, VH);
+  c.setTransform(SC, 0, 0, SC, (VW - W * SC) / 2, (VH - H * SC) / 2);
+  if (bg) c.drawImage(bg, 0, 0);
 
   // top strip
   setText(c, 19, 500, true);
@@ -407,6 +447,7 @@ async function boot() {
   if (!(DUR > 0)) DUR = 6;
   SPEC.fps = Number(spec.fps) > 0 ? Number(spec.fps) : 24;
 
+  setupLayout();
   bg = buildBackground();
 
   // 设计稿固定 1920×1080；--size 只决定截图视口，构图按视口等比缩放后居中，

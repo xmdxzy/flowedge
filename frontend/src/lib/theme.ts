@@ -39,6 +39,13 @@ export function getInitialTheme(): Theme {
 export function applyTheme(pref: ThemePref): Theme {
   const resolved = resolveTheme(pref)
   const root = document.documentElement
+  // 偏好每次都落盘：解析后主题没变时（深色系统下点「深色」）也要记住这次选择，
+  // 否则下次启动会退回旧偏好，用户会以为「点了没用」。
+  try {
+    localStorage.setItem(STORAGE_KEY, pref)
+  } catch {
+    /* 忽略 */
+  }
   if (root.getAttribute('data-theme') === resolved) {
     root.setAttribute('data-pref', pref)
     return resolved
@@ -47,11 +54,6 @@ export function applyTheme(pref: ThemePref): Theme {
   root.classList.add(NO_TRANSITION)
   root.setAttribute('data-theme', resolved)
   root.setAttribute('data-pref', pref)
-  try {
-    localStorage.setItem(STORAGE_KEY, pref)
-  } catch {
-    /* 忽略 */
-  }
   // 两帧之后再恢复过渡，确保新主题已经绘制完
   requestAnimationFrame(() => {
     requestAnimationFrame(() => root.classList.remove(NO_TRANSITION))

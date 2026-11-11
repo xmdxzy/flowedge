@@ -233,3 +233,69 @@ export interface WsEvent {
   data?: Record<string, unknown>
   message?: string
 }
+
+// ---- OpenMontage 代理（转发到独立部署的 OpenMontage Drama Studio，默认 :8787）----
+
+export interface OmProject {
+  id: number
+  name: string
+  description: string | null
+  status: string
+  aspect_ratio: string | null
+  genre: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface OmProjectListResponse {
+  projects: OmProject[] | null
+  total: number
+}
+
+export interface OmProjectDetail extends OmProject {
+  shots: unknown[] | null
+  entities: unknown[] | null
+  script: unknown | null
+  storyboard: unknown | null
+}
+
+export interface OmCreateProjectBody {
+  name: string
+  description?: string
+  aspect_ratio?: string
+  genre?: string
+  source_material?: string
+}
+
+export interface OmScriptBody {
+  idea: string
+  genre?: string
+  aspect_ratio?: string
+}
+
+export interface OmStoryboardBody {
+  script_id?: number | string
+}
+
+export interface OmGenerateBody {
+  shot_ids?: number[] | string[]
+  model?: string
+}
+
+export interface OmAudioBody {
+  shot_ids?: number[] | string[]
+  voice?: string
+}
+
+export interface OmEditBody {
+  timeline: unknown
+  export_format?: string
+}
+
+export interface OmAutoProduceBody {
+  idea: string
+  genre?: string
+  aspect_ratio?: string
+  model?: string
+  voice?: string
+}

@@ -1,4 +1,4 @@
-﻿import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
 
 import { errorText, fetchPipelines } from './api/client'
 import type { Pipeline } from './api/types'
@@ -6,6 +6,7 @@ import DepsDrawer from './components/DepsDrawer'
 import ToastHost from './components/Toast'
 import { applyTheme, getInitialPref, THEME_OPTIONS, watchSystemTheme, type ThemePref } from './lib/theme'
 import ArtifactsPage from './pages/ArtifactsPage'
+import OpenMontagePage from './pages/OpenMontagePage'
 // 画布按需加载：@xyflow/react 约 110KB gzip，不该让只用出片台的人付这份启动成本
 const CanvasPage = lazy(() => import('./pages/CanvasPage'))
 import ProducePage from './pages/ProducePage'
@@ -17,10 +18,11 @@ import RunsPage from './pages/RunsPage'
 //   出片台 = 7 条预置流水线，填字段即出片（新手路径）；
 //   画布   = 从模板出发改任意图（专家路径），与出片台共用引擎、校验、门与队列。
 
-type Tab = 'produce' | 'canvas' | 'runs' | 'artifacts'
+type Tab = 'produce' | 'openmontage' | 'canvas' | 'runs' | 'artifacts'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'produce', label: '出片' },
+  { id: 'openmontage', label: 'OpenMontage' },
   { id: 'canvas', label: '画布' },
   { id: 'runs', label: '运行' },
   { id: 'artifacts', label: '产物' },
@@ -122,6 +124,7 @@ export default function App() {
             onProduced={handleProduced}
           />
         )}
+        {tab === 'openmontage' && <OpenMontagePage />}
         {tab === 'canvas' && (
           <Suspense fallback={<div className="empty">正在载入画布…</div>}>
             <CanvasPage onRan={handleProduced} />

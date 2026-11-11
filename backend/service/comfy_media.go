@@ -50,6 +50,30 @@ type MediaRequest struct {
 	Turbo     bool // H3 turbo LoRA：20 步 → 8 步（约 2.5 倍速）
 	PDD       bool // H3 PDD 8-step Acc LoRA：非台词镜 8 步（与 Turbo 互斥）
 
+	// 段间引导（motion context）：把上一镜末 N 帧（+同段音轨）钉进本镜前缀，
+	// 生成后再裁掉前缀，让镜与镜在模型内部「一口气接着演」，而不是各拍各的再缝。
+	//
+	// 做法走**官方节点** MiniMaxH3AddGuide（image 口吃 5/22/39/56 帧片段、audio 口
+	// 同起点锚定音轨，见 comfy_extras/nodes_minimax_h3.py），不 monkeypatch ComfyUI。
+	// 思路来自 AIMixer/ComfyUI_MiniMaxH3_Director 的 h3_motion_context（Apache-2.0）：
+	// 它注入上一段 AV latent 省一次 VAE 编码；这里用解码帧，换来不绑版本。
+	GuideClip   string // 上一镜末 N 帧的 mp4（本地路径）
+	GuideFrames int    // 上面那段片段实际帧数（5/22/39/56）
+	GuideAudio  string // 上一镜末 N 帧对应的音轨 wav（本地路径，可空 = 只续画面）
+	TrimHead    int    // 生成后从头部裁掉的帧数 = GuideFrames
+
+	// 二采（同分辨率精修）：0 = 关。取值是第二遍的 denoise（0.25–0.5 是常用区间），
+	// 越大改得越多、越容易把一采的构图改掉。RefineSteps 是第二遍的步数（默认 4）。
+	RefineDenoise float64
+	RefineSteps   int
+
+	// v2v / rv2v：拿一段现成视频当参考（`<Video 1>`），只改要改的部分。
+	//
+	// 官方 ReferenceToVideo 的 ref_videos 吃的是 **IMAGE 批次**（不是 VIDEO 类型），
+	// 所以走 VHS_LoadVideo 取帧片段的路径——和段间引导同一条，不引入新依赖。
+	SourceVideo      string // 源视频路径（整段）
+	SourceStartFrame int    // 从源视频第几帧开始取（每镜按累计帧数切片）
+
 	// h3_r2v（ref2va）：参考图 + 参考音频 → 口型同步的视频。
 	//
 	// 这是 H3 唯一「用自己的音频念稿」的链路：ref_audios 里的声音会被模型
@@ -561,16 +585,21 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 			if req.Image == "" {
 				return nil, fmt.Errorf("H3 图生视频缺少首帧图片")
 			}
-			imgName, err := s.UploadImageAt(s.baseForKind(req.Kind), req.Image)
-			if err != nil {
-				return nil, err
+			// 段间引导自带一段 N 帧锚定，若再叠一个「单帧 frame_idx=0」的 AddGuide，
+			// 同一帧上会挂两个 keyframe（1 帧 + 22 帧片段），采样时互相打架。
+			// 有片段就只走片段；单帧是片段不可用时的退路，两者不同时出现。
+			if strings.TrimSpace(req.GuideClip) == "" {
+				imgName, err := s.UploadImageAt(s.baseForKind(req.Kind), req.Image)
+				if err != nil {
+					return nil, err
+				}
+				extra["20"] = map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": imgName}}
+				extra["21"] = map[string]interface{}{"class_type": "MiniMaxH3AddGuide", "inputs": map[string]interface{}{
+					"positive": link("5", 0), "latent": link("5", 1), "frame_idx": 0,
+					"vae": link("3", 0), "image": link("20", 0),
+				}}
+				guideCond = link("21", 0)
 			}
-			extra["20"] = map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": imgName}}
-			extra["21"] = map[string]interface{}{"class_type": "MiniMaxH3AddGuide", "inputs": map[string]interface{}{
-				"positive": link("5", 0), "latent": link("5", 1), "frame_idx": 0,
-				"vae": link("3", 0), "image": link("20", 0),
-			}}
-			guideCond = link("21", 0)
 		}
 
 		modelRef := link("1", 0)
@@ -589,12 +618,16 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 			if len(req.RefImages) > 9 {
 				return nil, fmt.Errorf("参考图最多 9 张，当前 %d", len(req.RefImages))
 			}
-			if len(req.RefAudios) == 0 && len(req.RefImages) == 0 {
-				return nil, fmt.Errorf("参考生视频至少要给 1 张参考图或 1 段参考音频")
+			if len(req.RefAudios) == 0 && len(req.RefImages) == 0 && strings.TrimSpace(req.SourceVideo) == "" {
+				return nil, fmt.Errorf("参考生视频至少要给 1 张参考图、1 段参考音频或 1 段源视频")
 			}
 			// 六段式补齐：缺 subject_definitions / retention_analysis 时模型会把
 			// 参考音频当成"风格提示"重新生成，念稿就退化成伪中文
 			req.Prompt = ensureRef2VAPrompt(req.Prompt, len(req.RefImages), len(req.RefAudios))
+			// 有源视频时补一条 <Video 1> 的保留说明（否则模型不知道那段素材是"要改的源片"）
+			if strings.TrimSpace(req.SourceVideo) != "" {
+				req.Prompt = ensureSourceVideoPrompt(req.Prompt)
+			}
 			refImgs := map[string]interface{}{}
 			for i, p := range req.RefImages {
 				if strings.TrimSpace(p) == "" {
@@ -624,6 +657,33 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 					"inputs": map[string]interface{}{"audio": name}}
 				refAuds[fmt.Sprintf("ref_audio_%d", i+1)] = link(id, 0)
 			}
+			// ---- v2v / rv2v：源视频当 <Video 1> ----
+			//
+			// 官方 ref_videos 吃 IMAGE 批次（不是 VIDEO 类型），所以用 VHS 按帧切片，
+			// 与段间引导同一条素材通路。每镜切自己那一段：多镜片里
+			// SourceStartFrame 是前面各镜帧数的累计（由 shotlist 算）。
+			refVids := map[string]interface{}{}
+			if strings.TrimSpace(req.SourceVideo) != "" {
+				name, verr := s.UploadImageAt(s.baseForKind(req.Kind), req.SourceVideo)
+				if verr != nil {
+					return nil, fmt.Errorf("源视频上传失败：%w", verr)
+				}
+				skip := req.SourceStartFrame
+				if skip < 0 {
+					skip = 0
+				}
+				graphExtra["76"] = map[string]interface{}{"class_type": "VHS_LoadVideo", "inputs": map[string]interface{}{
+					"video": name, "force_rate": 0, "custom_width": 0, "custom_height": 0,
+					"frame_load_cap": frames, "skip_first_frames": skip, "select_every_nth": 1,
+				}}
+				// 槽位从 **0** 起：官方 Ref2VA 的 ref_videos 是 autogrow（prefix ref_video_，
+				// min=0），序位型的参考按槽位顺序编号，`<Video 1>` 指的就是第一个槽。
+				// 写成 ref_video_1 会把唯一那段视频放进第二个槽，`<Video 1>` 指向空槽 ——
+				// 表面上节点收到参数、也跑了 vae.encode，但模型看不到任何视频。
+				// 实测（2026-11-01）：ref_video_1 + "原样复刻"提示词，SSIM 0.53（= 没用上）；
+				// AIMixer 自己的 v2v 用的就是 ref_video_0。
+				refVids["ref_video_0"] = link("76", 0)
+			}
 			// 用 ReferenceToVideo 顶替默认的 ImageToVideo（同样输出 positive + latent）
 			graphExtra["5"] = map[string]interface{}{"class_type": "MiniMaxH3ReferenceToVideo",
 				"inputs": map[string]interface{}{
@@ -631,9 +691,46 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 					"prompt": req.Prompt, "width": width, "height": height, "length": frames,
 					"ref_image_size": "match",
 					"ref_images":     refImgs, "ref_audios": refAuds,
+					"ref_videos": refVids,
 				}}
 			// 参考模式不接首帧引导：Ref2V 自己管身份，叠 AddGuide 反而打架
 			guideCond = link("5", 0)
+		}
+
+		// ---------- 段间引导（motion context）：上一镜末 N 帧 + 音轨 → 本镜前缀 ----------
+		//
+		// 与「单帧首帧引导」不是一回事：
+		//   单帧 i2v = 只钉 1 帧画面，运动从零开始，且必须放弃 ref2va（身份锁）才接得上；
+		//   本方案   = 钉 N 帧（5/22/39/56）+ 同段音轨，模型先「重演」这段尾巴再往下写，
+		//              并且 AddGuide 是**追加** keyframe（读 positive 里已有的 minimax_keyframes），
+		//              所以能叠在 ReferenceToVideo 之上，身份锁不丢。
+		//
+		// 生成帧数 = align17(正文帧 + N)，解码后裁掉头部 N 帧（trimHead），正文长度不变。
+		// 这条链路只用官方节点 + VHS，不依赖任何 monkeypatch。
+		if strings.TrimSpace(req.GuideClip) != "" {
+			clipName, err := s.UploadImageAt(s.baseForKind(req.Kind), req.GuideClip)
+			if err != nil {
+				return nil, fmt.Errorf("段间引导片段上传失败：%w", err)
+			}
+			graphExtra["70"] = map[string]interface{}{"class_type": "VHS_LoadVideo", "inputs": map[string]interface{}{
+				"video": clipName, "force_rate": 0, "custom_width": 0, "custom_height": 0,
+				"frame_load_cap": 0, "skip_first_frames": 0, "select_every_nth": 1,
+			}}
+			guideInputs := map[string]interface{}{
+				"positive": guideCond, "latent": link("5", 1), "frame_idx": 0,
+				"vae": link("3", 0), "image": link("70", 0),
+			}
+			if strings.TrimSpace(req.GuideAudio) != "" {
+				audName, aerr := s.UploadImageAt(s.baseForKind(req.Kind), req.GuideAudio)
+				if aerr != nil {
+					return nil, fmt.Errorf("段间引导音频上传失败：%w", aerr)
+				}
+				graphExtra["71"] = map[string]interface{}{"class_type": "LoadAudio", "inputs": map[string]interface{}{"audio": audName}}
+				guideInputs["audio"] = link("71", 0)
+				guideInputs["audio_vae"] = link("4", 0)
+			}
+			graphExtra["72"] = map[string]interface{}{"class_type": "MiniMaxH3AddGuide", "inputs": guideInputs}
+			guideCond = link("72", 0)
 		}
 
 		// 低显存模式：把注意力与 FFN 分块。峰值显存下来，代价是稍慢。
@@ -713,6 +810,33 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 		h3Clip := s.bundleFile(h3Role, "clip")
 		h3VideoVAE := s.bundleFile(h3Role, "video_vae")
 		h3AudioVAE := s.bundleFile(h3Role, "audio_vae")
+		// ---------- 二采（Refine）：同分辨率精修 ----------
+		//
+		// 一采定构图与运动，二采只补细节：把一采的 latent 当起点，用一段
+		// **从中间切进去的 sigma 表**（denoise < 1）再采一遍。
+		//
+		// 与「放大二采」的区别：这里分辨率、帧数、时长都不变，所以镜头节奏、
+		// 音画对齐、字幕时间轴全不受影响——这也是它能直接挂在分镜链路上的原因。
+		// 思路对照 AIMixer 的 refine（同尺寸路径必须接 SIGMAS，不是 denoise<1 硬灌）：
+		// 我们用 BasicScheduler 的 denoise 生成那条部分 sigma 表，等价且不用自定义节点。
+		finalLatent := link("10", 0)
+		if req.RefineDenoise > 0 {
+			refineSteps := req.RefineSteps
+			if refineSteps <= 0 {
+				refineSteps = 4
+			}
+			graphExtra["73"] = map[string]interface{}{"class_type": "RandomNoise",
+				"inputs": map[string]interface{}{"noise_seed": seed + 1}}
+			graphExtra["74"] = map[string]interface{}{"class_type": "BasicScheduler", "inputs": map[string]interface{}{
+				"model": modelRef, "scheduler": "simple", "steps": refineSteps, "denoise": req.RefineDenoise,
+			}}
+			graphExtra["75"] = map[string]interface{}{"class_type": "SamplerCustomAdvanced", "inputs": map[string]interface{}{
+				"noise": link("73", 0), "guider": link("7", 0), "sampler": link("8", 0),
+				"sigmas": link("74", 0), "latent_image": link("10", 0),
+			}}
+			finalLatent = link("75", 0)
+		}
+
 		graph := map[string]interface{}{
 			"1": map[string]interface{}{"class_type": "UNETLoader", "inputs": map[string]interface{}{
 				"unet_name": unetName, "weight_dtype": "default",
@@ -742,8 +866,8 @@ func (s *Text2ImageService) BuildMediaGraph(req MediaRequest) (map[string]interf
 				"noise": link("6", 0), "guider": link("7", 0), "sampler": link("8", 0),
 				"sigmas": link("9", 0), "latent_image": link("5", 1),
 			}},
-			"11": map[string]interface{}{"class_type": "VAEDecode", "inputs": map[string]interface{}{"samples": link("10", 0), "vae": link("3", 0)}},
-			"12": map[string]interface{}{"class_type": "VAEDecodeAudio", "inputs": map[string]interface{}{"samples": link("10", 0), "vae": link("4", 0)}},
+			"11": map[string]interface{}{"class_type": "VAEDecode", "inputs": map[string]interface{}{"samples": finalLatent, "vae": link("3", 0)}},
+			"12": map[string]interface{}{"class_type": "VAEDecodeAudio", "inputs": map[string]interface{}{"samples": finalLatent, "vae": link("4", 0)}},
 			"13": map[string]interface{}{"class_type": "CreateVideo", "inputs": map[string]interface{}{
 				"images": link("11", 0), "audio": link("12", 0), "fps": 24.0, "bit_depth": 8,
 			}},

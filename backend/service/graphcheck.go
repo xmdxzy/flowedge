@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"flowedge/backend/model"
@@ -16,11 +16,11 @@ import (
 
 // GraphReport 一次图体检的完整结果。
 type GraphReport struct {
-	OK       bool   `json:"ok"`
-	NodeCnt  int    `json:"node_count"`
-	EdgeCnt  int    `json:"edge_count"`
-	Blocking int    `json:"blocking"`
-	Warnings int    `json:"warnings"`
+	OK       bool `json:"ok"`
+	NodeCnt  int  `json:"node_count"`
+	EdgeCnt  int  `json:"edge_count"`
+	Blocking int  `json:"blocking"`
+	Warnings int  `json:"warnings"`
 
 	DAG    []DAGIssue       `json:"dag"`
 	Ports  []PortIssue      `json:"ports"`

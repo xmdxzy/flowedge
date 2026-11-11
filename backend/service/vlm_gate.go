@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -55,7 +54,7 @@ func ExtractFramesUniform(ctx context.Context, videoPath, outDir string, count i
 		"-frames:v", strconv.Itoa(count),
 		pattern,
 	}
-	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	cmd := hiddenExecContext(ctx, ffmpegBin(), args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		msg := strings.TrimSpace(string(out))
 		if i := strings.IndexByte(msg, '\n'); i > 0 {

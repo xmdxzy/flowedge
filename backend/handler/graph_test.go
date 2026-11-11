@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"encoding/json"
@@ -388,6 +388,7 @@ func TestGraphPipelineIDRoundTrip(t *testing.T) {
 		}
 	}
 }
+
 // 质量循环包壳：外层必须只有 3 个节点，且 quality_loop 指向刚落库的内层图。
 // 提示词要沿用到外层 start，否则每一轮都会重跑一张没有主题的图。
 func TestWrapGraphQCBuildsShell(t *testing.T) {

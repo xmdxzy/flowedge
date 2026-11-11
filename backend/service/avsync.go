@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -41,7 +40,7 @@ func alignAVToVideo(path string, tolerance float64) (driftBefore float64, fixed 
 
 	ext := filepath.Ext(path)
 	out := strings.TrimSuffix(path, ext) + "-avsync" + ext
-	cmd := exec.Command(ffmpegBin(), "-hide_banner", "-loglevel", "error", "-y",
+	cmd := hiddenExec(ffmpegBin(), "-hide_banner", "-loglevel", "error", "-y",
 		"-i", path,
 		"-map", "0:v:0", "-map", "0:a:0",
 		"-c:v", "copy",

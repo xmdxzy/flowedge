@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -94,7 +93,7 @@ func loudnormFilter(st LoudnessStats, targetLUFS, tpDB float64) string {
 
 // measureLoudnessFile 对已有音频文件测一遍响度（第一遍的测量动作）。
 func measureLoudnessFile(ffmpegPath, path string) (LoudnessStats, error) {
-	cmd := exec.Command(ffmpegPath, "-hide_banner", "-nostats",
+	cmd := hiddenExec(ffmpegPath, "-hide_banner", "-nostats",
 		"-i", path, "-af", "loudnorm=print_format=json", "-f", "null", "-")
 	out, _ := cmd.CombinedOutput()
 	st, ok := parseLoudnormJSON(string(out))

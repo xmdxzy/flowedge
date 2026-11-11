@@ -2,6 +2,7 @@ package service
 
 import (
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -363,6 +364,10 @@ func (q *JobQueue) Snapshot() QueueState {
 // 2026-10-27 补：**pending 也要收**。队列只在内存里，进程一退，排在队里的
 // 任务就再也不会被调度；留着 pending 会让面板永远显示「排队中」，
 // 用户等一个不会发生的运行。
+//
+// 2026-10-31 修：run 原来被标成 **failed**，于是「可续跑」只存在于错误文案里——
+// 没有任何入口能真的续跑，一次外部终止就等于整支白跑（实测 10:04/10:11 两次）。
+// 现在标成 **interrupted**（与 job 同语义），并保留 node_states 供 `POST /runs/:id/resume`。
 func (q *JobQueue) RecoverInterrupted() int64 {
 	var total int64
 	res := q.db.Model(&model.Job{}).Where("status = ?", "running").
@@ -375,10 +380,23 @@ func (q *JobQueue) RecoverInterrupted() int64 {
 	if resPending.Error == nil {
 		total += resPending.RowsAffected
 	}
-	res2 := q.db.Model(&model.WorkflowRun{}).Where("status = ?", "running").
-		Updates(map[string]interface{}{"status": "failed", "error": "进程异常退出，运行被中断（启动时回收）；可在执行记录里续跑"})
-	if res2.Error == nil {
-		total += res2.RowsAffected
+	// 先把遗留的 running run 取出来，便于日志点名（「哪几条可以续跑」比「有几条」有用）
+	var stale []model.WorkflowRun
+	if err := q.db.Where("status = ?", "running").Find(&stale).Error; err == nil && len(stale) > 0 {
+		ids := make([]string, 0, len(stale))
+		for _, r := range stale {
+			ids = append(ids, strconv.FormatUint(uint64(r.ID), 10))
+		}
+		res2 := q.db.Model(&model.WorkflowRun{}).Where("status = ?", "running").
+			Updates(map[string]interface{}{
+				"status": "interrupted",
+				"error": "引擎被外部终止（进程异常退出）。已完成的节点产物保留，" +
+					"可 POST /api/runs/{id}/resume 从断点续跑（run ids: " + strings.Join(ids, ",") + "）",
+			})
+		if res2.Error == nil {
+			total += res2.RowsAffected
+		}
+		log.Printf("[lifecycle] 上次异常终止遗留 %d 条 running run（可续跑）：%s", len(stale), strings.Join(ids, ","))
 	}
 	return total
 }

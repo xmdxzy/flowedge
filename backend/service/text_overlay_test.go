@@ -63,12 +63,12 @@ func TestBuildASS_Content(t *testing.T) {
 // 这条是「接口收了字段但代码没读」的钉子（AGENTS §0.4：开关上线必须验生效）。
 func TestOverlayOptionsFromParams_StyleAndScale(t *testing.T) {
 	opt, want, err := overlayOptionsFromParams(map[string]interface{}{
-		"text_overlay":   "山海茶肆",
-		"overlay_style":  "title",
-		"overlay_scale":  float64(720),
-		"overlay_from":   float64(0.6),
-		"overlay_to":     float64(4),
-		"overlay_size":   float64(0),
+		"text_overlay":  "山海茶肆",
+		"overlay_style": "title",
+		"overlay_scale": float64(720),
+		"overlay_from":  float64(0.6),
+		"overlay_to":    float64(4),
+		"overlay_size":  float64(0),
 	})
 	if err != nil || !want {
 		t.Fatalf("应当触发贴字：want=%v err=%v", want, err)

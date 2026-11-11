@@ -204,7 +204,7 @@ func (s *VideoService) ApplyTextOverlay(src string, opt OverlayOptions) (string,
 	}
 	args = append(args, "-movflags", "+faststart", dst)
 
-	if out, err := exec.Command(s.FFmpegPath, args...).CombinedOutput(); err != nil {
+	if out, err := hiddenExec(s.FFmpegPath, args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("贴字失败：ffmpeg 报错：%w（%.400s）", err, string(out))
 	}
 
@@ -714,7 +714,7 @@ type overlayMedia struct {
 
 func overlayProbe(ffprobe, path string) (overlayMedia, error) {
 	var p overlayMedia
-	cmd := exec.Command(ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", path)
+	cmd := hiddenExec(ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return p, fmt.Errorf("ffprobe: %w", err)
@@ -777,7 +777,7 @@ func splitRate(s string) (int, int, bool) {
 // countOverlayFrames 精确数帧：有些封装根本不写 nb_frames（H3 的 mp4 就是），
 // 只信容器头的数字会让"帧数变了"这类事故漏检（AGENTS §0.12 ⑤）。
 func countOverlayFrames(ffprobe, path string) int {
-	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0",
+	out, err := hiddenExec(ffprobe, "-v", "error", "-select_streams", "v:0",
 		"-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "json", path).Output()
 	if err != nil {
 		return 0

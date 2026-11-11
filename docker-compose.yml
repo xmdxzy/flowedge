@@ -1,8 +1,9 @@
-version: '3.8'
-
+# 本文件给「想用容器跑」的人用；单机用户直接跑 FlowEdge.exe 即可。
+# 注意：Compose V2 已废弃 version 字段，这里不再写。
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: flowedge
       POSTGRES_PASSWORD: flowedge
@@ -21,6 +22,7 @@ services:
     build:
       context: .
       dockerfile: docker/backend.Dockerfile
+    restart: unless-stopped
     environment:
       DB_DRIVER: postgres
       DB_HOST: postgres

@@ -479,6 +479,19 @@
           ]
         },
         {
+          "key": "pdd",
+          "label": "PDD 8 步加速（非台词镜）",
+          "type": "bool",
+          "default": false,
+          "hint": "H3 PDD LoRA 8 步蒸馏：实测画面 2 倍速；与 turbo 互斥，缺失时报错不静默退回",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "pdd"
+            }
+          ]
+        },
+        {
           "key": "qc",
           "label": "质量循环",
           "type": "bool",
@@ -580,6 +593,118 @@
           "min": -1,
           "max": 600,
           "hint": "-1 = 到片尾"
+        },
+        {
+          "key": "audio_master",
+          "label": "响度归一",
+          "type": "bool",
+          "default": true,
+          "hint": "装配后把音轨归一到目标响度（只重编码音轨，视频流原样 copy）",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "audio_master"
+            }
+          ]
+        },
+        {
+          "key": "lufs",
+          "label": "目标响度 (LUFS)",
+          "type": "int",
+          "default": -16,
+          "min": -23,
+          "max": -9,
+          "hint": "-16 适合网络播放；-14 更响；超过 -9 会压扁动态",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "lufs"
+            }
+          ]
+        },
+        {
+          "key": "room_tone",
+          "label": "整片声床",
+          "type": "bool",
+          "default": true,
+          "hint": "在整片底下铺一层 -36dBFS 的连续底噪，填住接缝/句间的可听静音；混了 BGM 时可关",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "room_tone"
+            }
+          ]
+        },
+        {
+          "key": "room_tone_gain",
+          "label": "声床电平 (dBFS)",
+          "type": "int",
+          "default": -36,
+          "min": -60,
+          "max": -20,
+          "hint": "底噪电平，越低越轻；-36 刚好盖过可听静音判据",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "room_tone_gain"
+            }
+          ]
+        },
+        {
+          "key": "budget",
+          "label": "墙钟预算（秒，0=不限）",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 86400,
+          "hint": "超过后按 budget_on_exceed 处理。跑完会在 manifest 里做预估/实耗对账",
+          "bind": []
+        },
+        {
+          "key": "budget_on_exceed",
+          "label": "超预算动作",
+          "type": "enum",
+          "default": "warn",
+          "options": [
+            "warn",
+            "stop"
+          ],
+          "hint": "warn=只记日志继续跑；stop=取消运行并保留已完成产物",
+          "bind": []
+        },
+        {
+          "key": "bgm_auto",
+          "label": "自动配乐（ACE-Step）",
+          "type": "bool",
+          "default": false,
+          "hint": "勾了就按成片时长生成并混入；已填 bgm 文件时以文件为准",
+          "bind": []
+        },
+        {
+          "key": "bgm_prompt",
+          "label": "BGM 风格",
+          "type": "text",
+          "default": "",
+          "hint": "留空用默认氛围垫（无人声、无鼓点）",
+          "bind": []
+        },
+        {
+          "key": "bgm_gain",
+          "label": "BGM 电平 (dB)",
+          "type": "int",
+          "default": -18,
+          "min": -40,
+          "max": 0,
+          "hint": "相对原音轨的电平：BGM 是底，不是主角",
+          "bind": []
+        },
+        {
+          "key": "bgm_duck",
+          "label": "人声时压低 BGM",
+          "type": "bool",
+          "default": true,
+          "hint": "用原音轨做旁链压缩：有人声时 BGM 自动压低",
+          "bind": []
         }
       ],
       "nodes": [
@@ -740,6 +865,19 @@
           ]
         },
         {
+          "key": "pdd",
+          "label": "PDD 8 步加速（非台词镜）",
+          "type": "bool",
+          "default": false,
+          "hint": "H3 PDD LoRA 8 步蒸馏：实测画面 2 倍速；与 turbo 互斥，缺失时报错不静默退回",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "pdd"
+            }
+          ]
+        },
+        {
           "key": "qc",
           "label": "质量循环",
           "type": "bool",
@@ -815,6 +953,96 @@
           "min": -1,
           "max": 600,
           "hint": "-1 = 到片尾"
+        },
+        {
+          "key": "audio_master",
+          "label": "响度归一",
+          "type": "bool",
+          "default": true,
+          "hint": "装配后把音轨归一到目标响度（只重编码音轨，视频流原样 copy）",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "audio_master"
+            }
+          ]
+        },
+        {
+          "key": "lufs",
+          "label": "目标响度 (LUFS)",
+          "type": "int",
+          "default": -16,
+          "min": -23,
+          "max": -9,
+          "hint": "-16 适合网络播放；-14 更响；超过 -9 会压扁动态",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "lufs"
+            }
+          ]
+        },
+        {
+          "key": "room_tone",
+          "label": "整片声床",
+          "type": "bool",
+          "default": true,
+          "hint": "在整片底下铺一层 -36dBFS 的连续底噪，填住接缝/句间的可听静音；混了 BGM 时可关",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "room_tone"
+            }
+          ]
+        },
+        {
+          "key": "room_tone_gain",
+          "label": "声床电平 (dBFS)",
+          "type": "int",
+          "default": -36,
+          "min": -60,
+          "max": -20,
+          "hint": "底噪电平，越低越轻；-36 刚好盖过可听静音判据",
+          "bind": [
+            {
+              "node": "t2v-1",
+              "path": "room_tone_gain"
+            }
+          ]
+        },
+        {
+          "key": "bgm_auto",
+          "label": "自动配乐（ACE-Step）",
+          "type": "bool",
+          "default": false,
+          "hint": "勾了就按成片时长生成并混入；已填 bgm 文件时以文件为准",
+          "bind": []
+        },
+        {
+          "key": "bgm_prompt",
+          "label": "BGM 风格",
+          "type": "text",
+          "default": "",
+          "hint": "留空用默认氛围垫（无人声、无鼓点）",
+          "bind": []
+        },
+        {
+          "key": "bgm_gain",
+          "label": "BGM 电平 (dB)",
+          "type": "int",
+          "default": -18,
+          "min": -40,
+          "max": 0,
+          "hint": "相对原音轨的电平：BGM 是底，不是主角",
+          "bind": []
+        },
+        {
+          "key": "bgm_duck",
+          "label": "人声时压低 BGM",
+          "type": "bool",
+          "default": true,
+          "hint": "用原音轨做旁链压缩：有人声时 BGM 自动压低",
+          "bind": []
         }
       ],
       "nodes": [
@@ -1067,6 +1295,84 @@
           ]
         },
         {
+          "key": "continuity_frames",
+          "label": "段间引导帧数",
+          "type": "int",
+          "default": 0,
+          "hint": "上一镜标记 continue 时生效。0=关（只把上一镜末帧当首帧）；22=把上一镜末 22 帧+同段音轨钉成本镜前缀，模型先重演这段尾巴再往下写（推荐，多花约 27% 生成帧）；39/56 更稳更贵。台词镜自动关（念稿音轨优先）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "continuity_frames"
+            }
+          ]
+        },
+        {
+          "key": "refine",
+          "label": "二采精修强度",
+          "type": "float",
+          "default": 0,
+          "hint": "同分辨率再采一遍补细节：0=关；0.25–0.35 轻微修整（推荐）；0.5 改动明显；>0.9 会被压到 0.9（再高等于重画）。分辨率/帧数/时长不变，每镜多花约 30% 时间",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "refine"
+            }
+          ]
+        },
+        {
+          "key": "source_video",
+          "label": "源视频（v2v·实验性）",
+          "type": "path",
+          "default": "",
+          "hint": "【实验性】填一段现成视频：每镜按帧数自动切片段，作为 <Video 1> 喂给模型。2026-11-01 实测：模型对 <Video 1> 的跟随很弱（复刻提示词 SSIM 0.59，而完全不给源片的对照组是 0.51），结果可能接近“按提示词重新生成”。留空=正常生成；要用请自己抽帧核对是否真的保留了源片内容",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "source_video"
+            }
+          ]
+        },
+        {
+          "key": "confirm_first_pass",
+          "label": "一采确认（先看构图再精修）",
+          "type": "bool",
+          "default": false,
+          "hint": "开：本轮只跑一采（把二采压成 0），出片给你看构图，省掉“构图不对也先烧完二采”的浪费。看完满意后，关掉本开关、保持同一个 seed 再跑一次——一采会命中 ComfyUI 节点缓存，实际只补二采。必须同时填 seed",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "confirm_first_pass"
+            }
+          ]
+        },
+        {
+          "key": "seed",
+          "label": "随机种子",
+          "type": "int",
+          "default": 0,
+          "hint": "0=每次随机。填正整数则锁定：同 seed + 同提示词 + 同参数会复现同一版画面（换权重/换 ComfyUI 版本后不保证）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "seed"
+            }
+          ]
+        },
+        {
+          "key": "only_shots",
+          "label": "只跑这几镜",
+          "type": "text",
+          "default": "",
+          "hint": "留空=全跑。填镜号（如 2,3）则只重拍这几镜，其余必须命中镜头缓存，否则直接报错而不是偷偷重烧。台词镜/段间引导镜/二采镜不进缓存，所以它们不能跳过——要用就一起勾上",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "only_shots"
+            }
+          ]
+        },
+        {
           "key": "interp",
           "label": "48fps 插帧",
           "type": "bool",
@@ -1147,6 +1453,22 @@
               "path": "bgm_duck"
             }
           ]
+        },
+        {
+          "key": "bgm_auto",
+          "label": "自动配乐（ACE-Step）",
+          "type": "bool",
+          "default": false,
+          "hint": "勾了就按成片时长生成并混入；已填 bgm 文件时以文件为准",
+          "bind": []
+        },
+        {
+          "key": "bgm_prompt",
+          "label": "BGM 风格",
+          "type": "text",
+          "default": "",
+          "hint": "留空用默认氛围垫（无人声、无鼓点）",
+          "bind": []
         },
         {
           "key": "reshoot_max",
@@ -1233,6 +1555,28 @@
           "min": -1,
           "max": 600,
           "hint": "-1 = 到片尾"
+        },
+        {
+          "key": "budget",
+          "label": "墙钟预算（秒，0=不限）",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 86400,
+          "hint": "超过后按 budget_on_exceed 处理。跑完会在 manifest 里做预估/实耗对账",
+          "bind": []
+        },
+        {
+          "key": "budget_on_exceed",
+          "label": "超预算动作",
+          "type": "enum",
+          "default": "warn",
+          "options": [
+            "warn",
+            "stop"
+          ],
+          "hint": "warn=只记日志继续跑；stop=取消运行并保留已完成产物",
+          "bind": []
         }
       ],
       "nodes": [
@@ -1266,7 +1610,13 @@
             "audio_check": true,
             "interp": false,
             "consistency_check": true,
-            "loudness_min_db": -30
+            "continuity_frames": 0,
+            "refine": 0,
+            "only_shots": "",
+            "loudness_min_db": -30,
+            "source_video": "",
+            "seed": 0,
+            "confirm_first_pass": false
           }
         },
         {
@@ -1316,6 +1666,25 @@
             {
               "node": "code-1",
               "path": "style"
+            }
+          ]
+        },
+        {
+          "key": "aspect",
+          "label": "画幅",
+          "type": "enum",
+          "default": "16:9",
+          "options": [
+            "16:9",
+            "9:16",
+            "3:4",
+            "1:1"
+          ],
+          "hint": "9:16=竖屏（抖音/视频号默认；四套风格都有竖版布局，已留顶部 12% + 底部 18% 安全区，别把字压在平台 UI 底下）· 3:4=小红书图文 · 16:9=横屏 B站/YouTube",
+          "bind": [
+            {
+              "node": "code-1",
+              "path": "aspect"
             }
           ]
         },
@@ -1856,6 +2225,84 @@
           ]
         },
         {
+          "key": "continuity_frames",
+          "label": "段间引导帧数",
+          "type": "int",
+          "default": 0,
+          "hint": "上一镜标记 continue 时生效。0=关（只把上一镜末帧当首帧）；22=把上一镜末 22 帧+同段音轨钉成本镜前缀，模型先重演这段尾巴再往下写（推荐，多花约 27% 生成帧）；39/56 更稳更贵。台词镜自动关（念稿音轨优先）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "continuity_frames"
+            }
+          ]
+        },
+        {
+          "key": "refine",
+          "label": "二采精修强度",
+          "type": "float",
+          "default": 0,
+          "hint": "同分辨率再采一遍补细节：0=关；0.25–0.35 轻微修整（推荐）；0.5 改动明显；>0.9 会被压到 0.9（再高等于重画）。分辨率/帧数/时长不变，每镜多花约 30% 时间",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "refine"
+            }
+          ]
+        },
+        {
+          "key": "source_video",
+          "label": "源视频（v2v·实验性）",
+          "type": "path",
+          "default": "",
+          "hint": "【实验性】填一段现成视频：每镜按帧数自动切片段，作为 <Video 1> 喂给模型。2026-11-01 实测：模型对 <Video 1> 的跟随很弱（复刻提示词 SSIM 0.59，而完全不给源片的对照组是 0.51），结果可能接近“按提示词重新生成”。留空=正常生成；要用请自己抽帧核对是否真的保留了源片内容",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "source_video"
+            }
+          ]
+        },
+        {
+          "key": "confirm_first_pass",
+          "label": "一采确认（先看构图再精修）",
+          "type": "bool",
+          "default": false,
+          "hint": "开：本轮只跑一采（把二采压成 0），出片给你看构图，省掉“构图不对也先烧完二采”的浪费。看完满意后，关掉本开关、保持同一个 seed 再跑一次——一采会命中 ComfyUI 节点缓存，实际只补二采。必须同时填 seed",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "confirm_first_pass"
+            }
+          ]
+        },
+        {
+          "key": "seed",
+          "label": "随机种子",
+          "type": "int",
+          "default": 0,
+          "hint": "0=每次随机。填正整数则锁定：同 seed + 同提示词 + 同参数会复现同一版画面（换权重/换 ComfyUI 版本后不保证）",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "seed"
+            }
+          ]
+        },
+        {
+          "key": "only_shots",
+          "label": "只跑这几镜",
+          "type": "text",
+          "default": "",
+          "hint": "留空=全跑。填镜号（如 2,3）则只重拍这几镜，其余必须命中镜头缓存，否则直接报错而不是偷偷重烧。台词镜/段间引导镜/二采镜不进缓存，所以它们不能跳过——要用就一起勾上",
+          "bind": [
+            {
+              "node": "sl-1",
+              "path": "only_shots"
+            }
+          ]
+        },
+        {
           "key": "interp",
           "label": "48fps 插帧",
           "type": "bool",
@@ -1936,6 +2383,22 @@
               "path": "bgm_duck"
             }
           ]
+        },
+        {
+          "key": "bgm_auto",
+          "label": "自动配乐（ACE-Step）",
+          "type": "bool",
+          "default": false,
+          "hint": "勾了就按成片时长生成并混入；已填 bgm 文件时以文件为准",
+          "bind": []
+        },
+        {
+          "key": "bgm_prompt",
+          "label": "BGM 风格",
+          "type": "text",
+          "default": "",
+          "hint": "留空用默认氛围垫（无人声、无鼓点）",
+          "bind": []
         },
         {
           "key": "reshoot_max",
@@ -2022,6 +2485,28 @@
           "min": -1,
           "max": 600,
           "hint": "-1 = 到片尾"
+        },
+        {
+          "key": "budget",
+          "label": "墙钟预算（秒，0=不限）",
+          "type": "int",
+          "default": 0,
+          "min": 0,
+          "max": 86400,
+          "hint": "超过后按 budget_on_exceed 处理。跑完会在 manifest 里做预估/实耗对账",
+          "bind": []
+        },
+        {
+          "key": "budget_on_exceed",
+          "label": "超预算动作",
+          "type": "enum",
+          "default": "warn",
+          "options": [
+            "warn",
+            "stop"
+          ],
+          "hint": "warn=只记日志继续跑；stop=取消运行并保留已完成产物",
+          "bind": []
         }
       ],
       "nodes": [
@@ -2039,7 +2524,13 @@
             "audio_check": true,
             "interp": false,
             "consistency_check": true,
-            "loudness_min_db": -30
+            "continuity_frames": 0,
+            "refine": 0,
+            "only_shots": "",
+            "loudness_min_db": -30,
+            "source_video": "",
+            "seed": 0,
+            "confirm_first_pass": false
           }
         },
         {

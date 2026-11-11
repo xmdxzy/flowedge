@@ -4,9 +4,11 @@
 // 确定性：每一帧只依赖 t。
 
 import { clamp, lerp, easeInOut, hash, SANS, MONO } from './shared/kit.js';
+import { TOKENS, applyCssTokens } from './shared/tokens.js';
 
-const STAGE_W = 1920, STAGE_H = 1080;
-const SEG = 1500;            // 卡片间距（世界坐标）
+// 舞台尺寸随画幅变：横屏 1920×1080，竖屏 1080×DH（9:16→1920，3:4→1440）
+let STAGE_W = 1920, STAGE_H = 1080, PORTRAIT = false, CW = 1320, CH = 700;
+let SEG = 1500;              // 卡片间距（世界坐标），竖屏按卡高推
 const HOLD = 0.56;           // 每张卡停留比例，剩下的时间飞向下一张
 
 const stage = document.getElementById('stage');
@@ -17,7 +19,38 @@ const bctx = bg.getContext('2d');
 let SPEC = null, CARDS = [], DUR = 0, nodes = [];
 
 function scaleStage() {
-  const s = Math.min(window.innerWidth / STAGE_W, window.innerHeight / STAGE_H);
+  const vw = window.innerWidth | 0, vh = window.innerHeight | 0;
+  PORTRAIT = vh >= vw * 0.99; // 方形也算竖版：1:1 走横版会上下加黑边
+  if (PORTRAIT) {
+    STAGE_W = 1080;
+    STAGE_H = Math.round((1080 * vh) / Math.max(1, vw));
+    // 竖屏卡片：窄而高，占满 2/3 屏高，手机上一屏一张
+    CW = 940;
+    CH = Math.min(Math.round(STAGE_H * 0.66), 1320);
+  } else {
+    STAGE_W = 1920;
+    STAGE_H = 1080;
+    CW = 1320;
+    CH = 700;
+  }
+  SEG = PORTRAIT ? Math.round(CH * 1.62) : 1500;
+
+  // 尺寸走 CSS 变量：index.html 里那套是横屏默认值，这里按画幅覆盖
+  const R = document.documentElement.style;
+  R.setProperty('--cw', CW + 'px');
+  R.setProperty('--ch', CH + 'px');
+  R.setProperty('--pad', PORTRAIT ? '64px 58px' : '62px 72px');
+  R.setProperty('--li', PORTRAIT ? '30px' : '29px');
+  R.setProperty('--liGap', PORTRAIT ? '26px' : '16px');
+  R.setProperty('--kickH', PORTRAIT ? '34px' : '38px');
+  R.setProperty('--kickF', PORTRAIT ? '15px' : '17px');
+  R.setProperty('--idxF', PORTRAIT ? '16px' : '18px');
+  R.setProperty('--barW', PORTRAIT ? '380px' : '560px');
+  R.setProperty('--ruleW', PORTRAIT ? '132px' : '168px');
+  R.setProperty('--bigIdx', PORTRAIT ? '220px' : '150px');
+  R.setProperty('--ulTop', PORTRAIT ? '108px' : '26px');
+
+  const s = PORTRAIT ? vw / STAGE_W : Math.min(vw / STAGE_W, vh / STAGE_H);
   stage.style.width = STAGE_W + 'px';
   stage.style.height = STAGE_H + 'px';
   stage.style.left = '50%';
@@ -52,6 +85,12 @@ function buildCard(card, i) {
   d.style.transform = `translate3d(${xo}px, ${yo}px, ${-i * SEG}px) rotateY(${yaw}deg)`;
   d.style.zIndex = String(1000 - i);
 
+  if (PORTRAIT) {
+    // 竖屏卡片下半部容易空：用超大序号当版面锚点（瑞士海报手法），比硬塞内容好看
+    const big = el('div', d);
+    big.className = 'bigidx';
+    big.textContent = String(i + 1).padStart(2, '0');
+  }
   const idx = el('div', d);
   idx.className = 'idx';
   idx.textContent = String(i + 1).padStart(2, '0') + ' / ' + String(CARDS.length).padStart(2, '0');
@@ -65,8 +104,12 @@ function buildCard(card, i) {
   const h = document.createElement('h1');
   h.textContent = card.heading || '';
   // 中文标题按字数定字号：宁可小一点，也不要断成「…差这么 / 多」
+  // 竖屏卡片窄（900 宽），字号再降一档，保证 3 行内断得齐
   const len = [...(card.heading || '')].length;
-  h.style.setProperty('--h1', (len <= 12 ? 76 : len <= 16 ? 68 : len <= 20 ? 58 : 50) + 'px');
+  const h1 = PORTRAIT
+    ? (len <= 9 ? 66 : len <= 13 ? 58 : len <= 17 ? 50 : 44)
+    : (len <= 12 ? 76 : len <= 16 ? 68 : len <= 20 ? 58 : 50);
+  h.style.setProperty('--h1', h1 + 'px');
   d.appendChild(h);
 
   const rule = el('div', d);
@@ -85,6 +128,7 @@ function buildCard(card, i) {
   let bars = null;
   if (card.figure === 'bars' && (card.labels || []).length && (card.values || []).length) {
     bars = el('div', d);
+    bars.className = 'bars';
     const max = Math.max(...card.values, 1);
     card.labels.forEach((lb, k) => {
       const b = el('div', bars);
@@ -128,7 +172,8 @@ function buildProps() {
     p.style.height = s + 'px';
     p.style.marginLeft = -s / 2 + 'px';
     p.style.marginTop = -s / 2 + 'px';
-    p.style.transform = `translate3d(${x}px, ${y}px, ${z}px) rotate(${(hash(i * 13.7) * 40 - 20).toFixed(1)}deg)`;
+    // 道具坐标按 1920×1080 设计，换画幅时按舞台比例摆，避免竖屏全挤在中间
+    p.style.transform = `translate3d(${((x * STAGE_W) / 1920).toFixed(1)}px, ${((y * STAGE_H) / 1080).toFixed(1)}px, ${z}px) rotate(${(hash(i * 13.7) * 40 - 20).toFixed(1)}deg)`;
   });
   // 两团色雾：薄荷绿 + 紫，跟相机一起走以制造纵深
   [['91,233,185', -540, -180, -1500, 520], ['167,139,250', 620, 220, -2300, 620]].forEach(([rgb, x, y, z, s]) => {
@@ -139,7 +184,7 @@ function buildProps() {
     g.style.marginLeft = -s / 2 + 'px';
     g.style.marginTop = -s / 2 + 'px';
     g.style.background = `radial-gradient(circle, rgba(${rgb},.30), rgba(${rgb},0) 70%)`;
-    g.style.transform = `translate3d(${x}px, ${y}px, ${z}px)`;
+    g.style.transform = `translate3d(${((x * STAGE_W) / 1920).toFixed(1)}px, ${((y * STAGE_H) / 1080).toFixed(1)}px, ${z}px)`;
   });
   const floor = el('div', world);
   floor.id = 'floor';
@@ -222,7 +267,7 @@ function drawFrame(t) {
     // 卡内节奏：接近时标题展开、要点逐条上浮
     const near = clamp((1.05 - Math.abs(d)) / 0.55, 0, 1);
     nd.h1.style.clipPath = `inset(0 ${(100 - near * 100).toFixed(1)}% 0 0)`;
-    nd.rule.style.width = (near * 168).toFixed(1) + 'px';
+    nd.rule.style.width = (near * (PORTRAIT ? 132 : 168)).toFixed(1) + 'px';
     nd.lis.forEach((li, j) => {
       const a = clamp((near - j * 0.14) / 0.42, 0, 1);
       li.style.opacity = a.toFixed(3);
@@ -233,7 +278,7 @@ function drawFrame(t) {
       [...nd.bars.children].forEach((b, j) => {
         const bar = b.querySelector('b');
         const a = clamp((near - 0.3 - j * 0.09) / 0.45, 0, 1);
-        bar.style.height = (Number(bar.dataset.h) * 92 * a).toFixed(1) + 'px';
+        bar.style.height = (Number(bar.dataset.h) * (PORTRAIT ? 78 : 92) * a).toFixed(1) + 'px';
       });
     }
   });
@@ -242,6 +287,8 @@ function drawFrame(t) {
 }
 
 async function init() {
+  // 配色走 design tokens（shared/tokens.js），index.html 里那套 CSS 变量只是兜底
+  applyCssTokens(document.documentElement, TOKENS.darkcard);
   scaleStage();
   const r = await fetch('spec.json', { cache: 'no-store' });
   SPEC = await r.json();

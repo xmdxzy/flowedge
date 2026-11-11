@@ -41,7 +41,7 @@ func TestJudgeShotSpeed_RealIncident(t *testing.T) {
 	}
 	// 倍数按实现同一套算术推，避免把常量变化误当成回归
 	base := baseCost(frames)
-	wantRatio := fmt.Sprintf("%.1f 倍", (2269 * time.Second).Seconds()/base.Seconds())
+	wantRatio := fmt.Sprintf("%.1f 倍", (2269*time.Second).Seconds()/base.Seconds())
 	for _, want := range []string{wantRatio, "752MB", "换页"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("告警里应有 %q，实际：%s", want, msg)

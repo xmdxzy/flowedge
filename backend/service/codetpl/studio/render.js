@@ -5,27 +5,42 @@
 // 页面契约（lemo）：window.READY / window.DUR / window.render(t)
 
 import { clamp, lerp, easeInOut, easeOut, wrapText, wrapBalanced, wrapByPunct, setFont, makeGrain, SANS, MONO } from './shared/kit.js';
+import { TOKENS } from './shared/tokens.js';
 
-const DW = 1920, DH = 1080;
-const BG = '#050506';
-const WHITE = '#F5F7FA';
-const DIM = 'rgba(245,247,250,.55)';
-const FAINT = 'rgba(245,247,250,.22)';
-const ACC = '#4D9FFF';
-const WARM = '#FF7A59';
+// 画布尺寸由视口决定：
+//   横屏 → 1920×1080 设计稿（保持初版观感不变）
+//   竖屏 → 1080×DH 设计稿，DH 由比例推出（9:16→1920，3:4→1440，1:1→1080）
+// 这样竖屏不是把横屏挤扁，而是换一套排版。
+let DW = 1920, DH = 1080, PORTRAIT = false;
+// 配色来自 design tokens（shared/tokens.js）
+const T = TOKENS.studio;
+const BG = T.bg, WHITE = T.ink, DIM = T.dim, FAINT = T.faint;
+const ACC = T.accent, WARM = T.accent2;
 
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d', { alpha: false });
-let SPEC = null, CARDS = [], DUR = 0, GRAIN = null, VW = DW, VH = DH;
+let SPEC = null, CARDS = [], DUR = 0, GRAIN = null, GRAIN_KEY = '', VW = 1920, VH = 1080;
 
 function resize() {
   VW = canvas.width = Math.max(2, window.innerWidth | 0);
   VH = canvas.height = Math.max(2, window.innerHeight | 0);
-  if (!GRAIN) GRAIN = makeGrain(DW, DH, 12, 23);
+  PORTRAIT = VH >= VW * 0.99;
+  if (PORTRAIT) {
+    DW = 1080;
+    DH = Math.round((1080 * VH) / VW); // 9:16→1920，3:4→1440
+  } else {
+    DW = 1920;
+    DH = 1080;
+  }
+  const key = DW + 'x' + DH;
+  if (GRAIN_KEY !== key) {
+    GRAIN = makeGrain(DW, DH, 12, 23);
+    GRAIN_KEY = key;
+  }
 }
 
 function beginFrame() {
-  const s = Math.min(VW / DW, VH / DH);
+  const s = PORTRAIT ? VW / DW : Math.min(VW / DW, VH / DH);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, VW, VH);
@@ -213,6 +228,167 @@ function footer(card, i, total, local) {
   ctx.fillText((card.note || SPEC.title_en || 'FLOWEDGE').toUpperCase(), 1800, 962);
 }
 
+// ============ 竖屏（1080 × DH）============
+// 竖屏规则（不是把横屏挤扁，是另一套排版）：
+//   1. 安全区：顶部 13.5%、底部 18% 不放内容 —— 抖音/视频号会压头像、文案和操作条；
+//   2. 信息量减半：一张卡 = 1 个主张 + 至多 3 条支撑；
+//   3. 字号在 1080 宽下按 1.15 倍放，手机上才看得清。
+
+function hudP(card, i, total, local) {
+  const m = 76, top = DH * 0.135;
+  setFont(ctx, 22, 600, MONO);
+  ctx.fillStyle = ACC;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText((card.kicker || SPEC.kicker || 'FLOWEDGE · EXPLAINER').toUpperCase(), m, top);
+  setFont(ctx, 22, 500, MONO);
+  ctx.fillStyle = DIM;
+  ctx.textAlign = 'right';
+  ctx.fillText(`${String(i + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}`, DW - m, top);
+  line(m, top + 46, DW - m, top + 46, FAINT);
+  ctx.fillStyle = ACC;
+  ctx.fillRect(m, top + 45, (DW - 2 * m) * clamp(local, 0, 1), 2);
+}
+
+function headingP(card, y, local) {
+  const m = 76, w = DW - 2 * m;
+  let size = 92, lines = [];
+  for (const s of [92, 84, 76, 68, 60]) {
+    setFont(ctx, s, 700, SANS);
+    const cand = wrapByPunct(ctx, card.heading || '', w, 3);
+    if (cand.length <= 3) {
+      size = s;
+      lines = cand;
+      break;
+    }
+  }
+  if (!lines.length) {
+    setFont(ctx, 60, 700, SANS);
+    lines = wrapText(ctx, card.heading || '', w).slice(0, 3);
+    size = 60;
+  }
+  const lh = size * 1.22;
+  const p = easeOut(clamp(local / 0.18, 0, 1));
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(m - 2, y - size, w * p + 8, lines.length * lh + size * 0.5);
+  ctx.clip();
+  lines.forEach((ln, k) => {
+    setFont(ctx, size, 700, SANS);
+    ctx.fillStyle = WHITE;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(ln, m, y + k * lh);
+  });
+  ctx.restore();
+  return y + (lines.length - 1) * lh;
+}
+
+function pointsP(card, y, local) {
+  const m = 76;
+  (card.points || []).slice(0, 3).forEach((txt, j) => {
+    const ap = clamp((local - 0.16 - j * 0.075) / 0.2, 0, 1);
+    if (ap <= 0) return;
+    const py = y + 96 + j * 96;
+    ctx.globalAlpha = ap;
+    setFont(ctx, 24, 600, MONO);
+    ctx.fillStyle = j === 0 ? ACC : DIM;
+    ctx.textAlign = 'left';
+    ctx.fillText(String(j + 1).padStart(2, '0'), m, py);
+    ctx.fillStyle = j === 0 ? ACC : FAINT;
+    ctx.fillRect(m + 58, py - 11, 22, 2);
+    setFont(ctx, 40, 500, SANS);
+    ctx.fillStyle = 'rgba(245,247,250,.90)';
+    const wrapped = wrapText(ctx, txt, DW - 2 * m - 100);
+    ctx.fillText(wrapped[0] + (wrapped.length > 1 ? '…' : ''), m + 100, py);
+    ctx.globalAlpha = 1;
+  });
+}
+
+function barsP(card, y, local) {
+  const labels = card.labels || [], vals = card.values || [];
+  if (!labels.length || !vals.length) return;
+  const m = 76, max = Math.max(...vals, 1);
+  const w = DW - 2 * m;
+  labels.forEach((lb, i) => {
+    const bp = clamp((local - 0.22 - i * 0.08) / 0.35, 0, 1);
+    if (bp <= 0) return;
+    const by = y + i * 88;
+    ctx.globalAlpha = bp;
+    setFont(ctx, 26, 500, SANS);
+    ctx.fillStyle = DIM;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(lb, m, by);
+    const trackW = w;
+    const bw = trackW * (vals[i] / max) * easeOut(bp);
+    ctx.fillStyle = 'rgba(255,255,255,.07)';
+    ctx.fillRect(m, by + 18, trackW, 12);
+    ctx.fillStyle = i % 2 ? WARM : ACC;
+    ctx.fillRect(m, by + 18, Math.max(2, bw), 12);
+    setFont(ctx, 24, 600, MONO);
+    ctx.fillStyle = 'rgba(245,247,250,.80)';
+    ctx.fillText(String(vals[i]), m + Math.max(2, bw) + 16, by + 30);
+    ctx.globalAlpha = 1;
+  });
+}
+
+function footerP(card, i, total, local) {
+  // 0.775 = 底部安全区内（抖音底部操作条会压住 18%），别放到 0.82 以下
+  const m = 76, y = DH * 0.775;
+  const gap = 10;
+  const segW = (DW - 2 * m - gap * (total - 1)) / total;
+  for (let k = 0; k < total; k++) {
+    const sx = m + k * (segW + gap);
+    ctx.fillStyle = 'rgba(255,255,255,.10)';
+    ctx.fillRect(sx, y + 44, segW, 6);
+    let fill = k < i ? 1 : k === i ? easeInOut(clamp(local, 0, 1)) : 0;
+    if (fill > 0) {
+      ctx.fillStyle = ACC;
+      ctx.fillRect(sx, y + 44, segW * fill, 6);
+    }
+  }
+  setFont(ctx, 20, 500, MONO);
+  ctx.fillStyle = DIM;
+  ctx.textAlign = 'left';
+  ctx.fillText((card.kicker || 'CHAPTER').toUpperCase(), m, y);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(245,247,250,.34)';
+  ctx.fillText((SPEC.title_en || 'FLOWEDGE').toUpperCase(), DW - m, y);
+}
+
+function drawPortrait(card, i, n, local, t) {
+  bgLayer(t, i);
+  hudP(card, i, n, local);
+  const yEnd = headingP(card, DH * 0.135 + 170, local);
+  const hasBars = card.figure === 'bars' && (card.labels || []).length;
+  if (hasBars) {
+    pointsP(card, yEnd + 30, local);
+    const cp = easeOut(clamp((local - 0.2) / 0.25, 0, 1));
+    ctx.globalAlpha = cp;
+    setFont(ctx, 20, 600, MONO);
+    ctx.fillStyle = DIM;
+    ctx.textAlign = 'left';
+    ctx.fillText('DATA · 示意值', 76, DH * 0.545);
+    ctx.globalAlpha = 1;
+    line(76, DH * 0.545 + 18, 76 + (DW - 152) * cp, DH * 0.545 + 18, FAINT);
+    barsP(card, DH * 0.545 + 74, local);
+  } else {
+    pointsP(card, yEnd + 40, local);
+    // 竖屏没有图表时中部会空一大块：用一条收束线 + 卡尾注记把版面收住
+    const cp = easeOut(clamp((local - 0.24) / 0.3, 0, 1));
+    const ry = DH * 0.60;
+    ctx.globalAlpha = cp;
+    line(76, ry, 76 + (DW - 152) * cp, ry, FAINT);
+    setFont(ctx, 22, 500, MONO);
+    ctx.fillStyle = 'rgba(245,247,250,.42)';
+    ctx.textAlign = 'left';
+    ctx.fillText((card.note || SPEC.title_en || 'FLOWEDGE').toUpperCase(), 76, ry + 52);
+    ctx.globalAlpha = 1;
+  }
+  footerP(card, i, n, local);
+}
+
 function drawFrame(t) {
   resize();
   beginFrame();
@@ -222,6 +398,11 @@ function drawFrame(t) {
   const local = clamp((t - i * per) / per, 0, 1);
   const card = CARDS[i];
 
+  if (PORTRAIT) {
+    drawPortrait(card, i, n, local, t);
+    return;
+  }
+
   bgLayer(t, i);
   hud(card, i, n, local);
 
@@ -229,6 +410,15 @@ function drawFrame(t) {
   const hasBars = card.figure === 'bars' && (card.labels || []).length;
   if (hasBars) {
     points(card, yEnd + 40, local);
+    // 数据区抬头：给上半部分留白一个交代，也把「示意值」讲清楚
+    const cp = easeOut(clamp((local - 0.2) / 0.25, 0, 1));
+    ctx.globalAlpha = cp;
+    setFont(ctx, 16, 600, MONO);
+    ctx.fillStyle = DIM;
+    ctx.textAlign = 'left';
+    ctx.fillText('DATA · 示意值', 120, 660);
+    ctx.globalAlpha = 1;
+    line(120, 676, 120 + 1680 * cp, 676, FAINT);
     barsFigure(card, 706, local);
   } else {
     points(card, yEnd + 56, local);

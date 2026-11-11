@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -51,7 +50,7 @@ type DubTrackReport struct {
 // ffmpegRun 跑一次 ffmpeg，返回合并输出（错误信息里要带 stderr 尾巴，
 // 否则「滤镜语法错」这种只会在 stderr 里说原因的失败没法诊断）。
 func ffmpegRun(args ...string) (string, error) {
-	raw, err := exec.Command(ffmpegBin(), args...).CombinedOutput()
+	raw, err := hiddenExec(ffmpegBin(), args...).CombinedOutput()
 	return string(raw), err
 }
 

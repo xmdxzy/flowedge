@@ -38,13 +38,116 @@ func extractLastFrame(videoPath, outPNG string) error {
 		"-vsync", "0", "-update", "1",
 		"-frames:v", "1", outPNG,
 	}
-	cmd := exec.Command(ffmpegBin(), args...)
+	cmd := hiddenExec(ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("取末帧失败：%v %s", err, strings.TrimSpace(string(out)))
 	}
 	if st, serr := os.Stat(outPNG); serr != nil || st.Size() < 1024 {
 		return fmt.Errorf("末帧文件无效：%s", outPNG)
+	}
+	return nil
+}
+
+// countVideoFrames 用 ffprobe 精确数帧（-count_frames 是真解码，不信 duration×fps）。
+//
+// 段间引导必须精确到帧：少一帧就从 22 掉到 21，而官方 AddGuide 会把不合法长度
+// **自己往下削**（while frames%17 != 5）直到 5 帧——于是「续接」静默变成「几乎没接」，
+// 跑完不报任何错。这类降级只能靠这里拦。
+func countVideoFrames(videoPath string) (int, error) {
+	out, err := hiddenExec(ffprobeBin(), "-v", "error", "-count_frames",
+		"-select_streams", "v:0", "-show_entries", "stream=nb_read_frames",
+		"-of", "csv=p=0", videoPath).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("数帧失败：%v %s", err, strings.TrimSpace(string(out)))
+	}
+	var n int
+	if _, serr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &n); serr != nil || n <= 0 {
+		return 0, fmt.Errorf("数帧输出无法解析：%q", strings.TrimSpace(string(out)))
+	}
+	return n, nil
+}
+
+// extractTailClip 截出视频最后 nFrames 帧另存为静音 mp4（段间引导的前缀素材）。
+//
+// 为什么按绝对帧号选（select=gte(n,start)），而不是 -sseof 按秒定位：
+// 容器时长与视频流时长会差几帧（-shortest / 重编码过的片子很常见），按秒取会
+// 多一帧或少一帧，而少一帧在 AddGuide 里是静默降级（见 countVideoFrames 注释）。
+func extractTailClip(videoPath, outMP4 string, nFrames, fps int) error {
+	if nFrames <= 0 || fps <= 0 {
+		return fmt.Errorf("尾部片段参数非法：frames=%d fps=%d", nFrames, fps)
+	}
+	total, err := countVideoFrames(videoPath)
+	if err != nil {
+		return err
+	}
+	if total < nFrames {
+		return fmt.Errorf("上一镜只有 %d 帧，不够取 %d 帧做段间引导", total, nFrames)
+	}
+	start := total - nFrames
+	args := []string{
+		"-y", "-v", "error", "-i", videoPath,
+		"-vf", fmt.Sprintf("select='gte(n\\,%d)',setpts=N/(%d*TB)", start, fps),
+		"-frames:v", fmt.Sprintf("%d", nFrames),
+		"-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+		"-pix_fmt", "yuv420p", "-r", fmt.Sprintf("%d", fps),
+		outMP4,
+	}
+	if out, rerr := hiddenExec(ffmpegBin(), args...).CombinedOutput(); rerr != nil {
+		return fmt.Errorf("截尾部片段失败：%v %s", rerr, strings.TrimSpace(string(out)))
+	}
+	got, cerr := countVideoFrames(outMP4)
+	if cerr != nil || got != nFrames {
+		return fmt.Errorf("尾部片段帧数不对：期望 %d 实际 %d（%v）", nFrames, got, cerr)
+	}
+	return nil
+}
+
+// extractTailAudio 取与尾部片段同时段的音轨，存 wav 供 AddGuide 的 audio 口锚定。
+//
+// 单独截出来而不是让 VHS 交整条音轨：VHS 的 audio 输出是整片音轨，
+// 与「锚定起点」对不齐就要再切一刀，切片逻辑放自己手里更可控。
+func extractTailAudio(videoPath, outWav string, nFrames, fps int) error {
+	if nFrames <= 0 || fps <= 0 {
+		return fmt.Errorf("尾部音轨参数非法：frames=%d fps=%d", nFrames, fps)
+	}
+	dur := float64(nFrames) / float64(fps)
+	args := []string{
+		"-y", "-v", "error",
+		"-sseof", fmt.Sprintf("-%.4f", dur), "-i", videoPath,
+		"-vn", "-t", fmt.Sprintf("%.4f", dur),
+		"-ac", "2", "-ar", "32000", outWav,
+	}
+	if out, err := hiddenExec(ffmpegBin(), args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("截尾部音轨失败：%v %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// trimHeadFrames 裁掉头部 nFrames 帧、保留 keepFrames 帧作为正文（音画同裁）。
+//
+// 段间引导的生成结果是「上一镜尾巴 + 本镜正文」，前缀必须丢掉，否则成片里
+// 每一镜都会先倒放一遍上一镜的结尾（并且字幕时间轴会整体漂 N 帧）。
+func trimHeadFrames(inPath, outPath string, nFrames, keepFrames, fps int) error {
+	if nFrames <= 0 || keepFrames <= 0 || fps <= 0 {
+		return fmt.Errorf("裁头参数非法：trim=%d keep=%d fps=%d", nFrames, keepFrames, fps)
+	}
+	skip := float64(nFrames) / float64(fps)
+	args := []string{
+		"-y", "-v", "error", "-i", inPath,
+		"-vf", fmt.Sprintf("select='gte(n\\,%d)',setpts=N/(%d*TB)", nFrames, fps),
+		"-frames:v", fmt.Sprintf("%d", keepFrames),
+		"-af", fmt.Sprintf("atrim=start=%.5f,asetpts=PTS-STARTPTS", skip),
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+		"-r", fmt.Sprintf("%d", fps), "-c:a", "aac", "-b:a", "192k", "-ar", "32000",
+		outPath,
+	}
+	if out, err := hiddenExec(ffmpegBin(), args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("裁头部前缀失败：%v %s", err, strings.TrimSpace(string(out)))
+	}
+	got, cerr := countVideoFrames(outPath)
+	if cerr != nil || got != keepFrames {
+		return fmt.Errorf("裁头后帧数不对：期望 %d 实际 %d（%v）", keepFrames, got, cerr)
 	}
 	return nil
 }
@@ -122,7 +225,7 @@ func concatVideos(inputs []string, outPath string) error {
 		"-movflags", "+faststart",
 		outPath,
 	)
-	out, err := exec.Command(ffmpegBin(), args...).CombinedOutput()
+	out, err := hiddenExec(ffmpegBin(), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("拼接失败：%v %s", err, strings.TrimSpace(string(out)))
 	}
@@ -200,7 +303,7 @@ func replaceAudioTrack(video, audio string) (string, error) {
 		return "", fmt.Errorf("替换音轨失败：读不到视频时长（%s）", video)
 	}
 	out := strings.TrimSuffix(video, filepath.Ext(video)) + "-dub.mp4"
-	cmd := exec.Command(ffmpegBin(), "-hide_banner", "-loglevel", "error", "-y",
+	cmd := hiddenExec(ffmpegBin(), "-hide_banner", "-loglevel", "error", "-y",
 		"-i", video, "-i", audio,
 		"-map", "0:v", "-map", "1:a",
 		"-c:v", "copy",
@@ -233,7 +336,7 @@ func inspectMedia(path string) (mediaCheck, error) {
 		"stream=codec_type,width,height,r_frame_rate,duration,nb_read_frames:format=duration",
 		path,
 	}
-	raw, err := exec.Command(bin, args...).Output()
+	raw, err := hiddenExec(bin, args...).Output()
 	if err != nil {
 		chk.Note = "ffprobe 执行失败，跳过自检"
 		return chk, nil
@@ -316,7 +419,7 @@ func inspectMedia(path string) (mediaCheck, error) {
 func probeMedia(path string) (mediaInfo, error) {
 	// 只用 ffmpeg -i 解析：ffprobe 不一定在 PATH（本机就是这种情况），
 	// 而拼接是必须成功的环节，不能依赖一个可选二进制。
-	raw, _ := exec.Command(ffmpegBin(), "-i", path, "-hide_banner").CombinedOutput()
+	raw, _ := hiddenExec(ffmpegBin(), "-i", path, "-hide_banner").CombinedOutput()
 
 	txt := string(raw)
 	var info mediaInfo
@@ -356,7 +459,7 @@ func concatSimple(inputs []string, outPath string) error {
 	args := []string{"-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listPath,
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
 		"-movflags", "+faststart", outPath}
-	out, err := exec.Command(ffmpegBin(), args...).CombinedOutput()
+	out, err := hiddenExec(ffmpegBin(), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("拼接失败：%v %s", err, strings.TrimSpace(string(out)))
 	}
@@ -385,7 +488,7 @@ func interpolateVideo(in, out string, fps int) error {
 		"-c:a", "copy",
 		out,
 	}
-	cmdOut, err := exec.Command(ffmpegBin(), args...).CombinedOutput()
+	cmdOut, err := hiddenExec(ffmpegBin(), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("插帧失败：%v %s", err, strings.TrimSpace(string(cmdOut)))
 	}
@@ -470,7 +573,7 @@ func assembleShots(clips []string, transitions []string, outPath string) error {
 		"-movflags", "+faststart",
 		outPath,
 	)
-	raw, err := exec.Command(ffmpegBin(), args...).CombinedOutput()
+	raw, err := hiddenExec(ffmpegBin(), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("装配失败：%v %s", err, strings.TrimSpace(string(raw)))
 	}
@@ -494,7 +597,7 @@ func duckAudio(path string) error {
 		"-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
 		tmp,
 	}
-	if raw, err := exec.Command(ffmpegBin(), args...).CombinedOutput(); err != nil {
+	if raw, err := hiddenExec(ffmpegBin(), args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("压音失败：%v %s", err, strings.TrimSpace(string(raw)))
 	}
 	if st, err := os.Stat(tmp); err != nil || st.Size() < 4096 {
@@ -523,7 +626,7 @@ func stripSpeechCenter(path string) error {
 		"-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
 		tmp,
 	}
-	if raw, err := exec.Command(ffmpegBin(), args...).CombinedOutput(); err != nil {
+	if raw, err := hiddenExec(ffmpegBin(), args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("中置相消失败：%v %s", err, strings.TrimSpace(string(raw)))
 	}
 	if st, err := os.Stat(tmp); err != nil || st.Size() < 4096 {

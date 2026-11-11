@@ -90,7 +90,7 @@ func detectSAPIInfo() string {
 		return ""
 	}
 	script := `$v = New-Object -ComObject SAPI.SpVoice; $t = $v.GetVoices(); $out = @(); for ($i=0; $i -lt $t.Count; $i++) { $out += $t.Item($i).GetDescription() }; $out -join ' | '`
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	cmd := hiddenExec("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
 	cmd.SysProcAttr = hiddenWindowAttr()
 	done := make(chan struct{})
 	var out []byte
@@ -153,7 +153,7 @@ func synthesizeSAPI(text, outputPath, voiceName string, rate int) error {
 		return err
 	}
 
-	cmd := exec.Command("powershell.exe",
+	cmd := hiddenExec("powershell.exe",
 		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 		"-File", scriptPath,
 		"-TextPath", textPath,

@@ -1,9 +1,19 @@
-﻿import type {
+import type {
   ArtifactItem,
   ArtifactListResponse,
   DepListResponse,
   DepStatus,
   McpConfig,
+  OmAudioBody,
+  OmAutoProduceBody,
+  OmCreateProjectBody,
+  OmEditBody,
+  OmGenerateBody,
+  OmProject,
+  OmProjectDetail,
+  OmProjectListResponse,
+  OmScriptBody,
+  OmStoryboardBody,
   Pipeline,
   PipelineListResponse,
   PreflightResult,
@@ -131,6 +141,22 @@ export async function rerunRun(runId: number): Promise<RerunAccepted> {
   return (await postJSON(`/api/runs/${runId}/rerun`)) as RerunAccepted
 }
 
+/**
+ * 从断点续跑：成功的节点复用产物，只重跑没成功的。
+ *
+ * 引擎被外部杀掉（沙箱回收、关机、任务管理器）时运行会标成 interrupted，
+ * 这时候「重跑」等于从零再烧一遍，续跑才是对的。
+ */
+export async function resumeRun(
+  runId: number,
+): Promise<{ run_id: number; status?: string; reused_nodes?: number }> {
+  return (await postJSON(`/api/runs/${runId}/resume`)) as {
+    run_id: number
+    status?: string
+    reused_nodes?: number
+  }
+}
+
 // ---- 产物 ----
 
 export async function fetchArtifacts(): Promise<ArtifactListResponse & { items: ArtifactItem[] }> {
@@ -229,4 +255,47 @@ export function fetchMcpConfig(): Promise<McpConfig> {
     ...c,
     notes: Array.isArray(c.notes) ? c.notes : [],
   }))
+}
+
+// ---- OpenMontage 代理（转发到独立部署的 OpenMontage Drama Studio，默认 :8787）----
+
+export async function fetchOmHealth(): Promise<unknown> {
+  return request<unknown>('/api/openmontage/health')
+}
+
+export async function fetchOmProjects(): Promise<OmProject[]> {
+  const data = await request<OmProjectListResponse>('/api/openmontage/projects')
+  return Array.isArray(data.projects) ? data.projects : []
+}
+
+export function fetchOmProject(id: number | string): Promise<OmProjectDetail> {
+  return request<OmProjectDetail>(`/api/openmontage/projects/${id}`)
+}
+
+export function createOmProject(body: OmCreateProjectBody): Promise<OmProjectDetail> {
+  return postJSON('/api/openmontage/projects', body) as Promise<OmProjectDetail>
+}
+
+export function generateOmScript(id: number | string, body: OmScriptBody): Promise<unknown> {
+  return postJSON(`/api/openmontage/projects/${id}/script`, body)
+}
+
+export function generateOmStoryboard(id: number | string, body: OmStoryboardBody): Promise<unknown> {
+  return postJSON(`/api/openmontage/projects/${id}/storyboard`, body)
+}
+
+export function generateOmVideo(id: number | string, body: OmGenerateBody): Promise<unknown> {
+  return postJSON(`/api/openmontage/projects/${id}/generate`, body)
+}
+
+export function generateOmAudio(id: number | string, body: OmAudioBody): Promise<unknown> {
+  return postJSON(`/api/openmontage/projects/${id}/audio`, body)
+}
+
+export function saveOmEdit(id: number | string, body: OmEditBody): Promise<unknown> {
+  return postJSON(`/api/openmontage/projects/${id}/edits`, body)
+}
+
+export function autoProduceOm(body: OmAutoProduceBody): Promise<unknown> {
+  return postJSON('/api/openmontage/auto-produce', body)
 }

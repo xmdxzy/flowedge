@@ -1,0 +1,24 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{ts,tsx,js,jsx,json,css,yml,yaml}]
+indent_size = 2
+
+[*.go]
+indent_style = tab
+
+[*.py]
+indent_size = 4
+
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[*.md]
+# 文档里手工对齐的表格不强制清尾随空格
+trim_trailing_whitespace = false

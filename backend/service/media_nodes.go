@@ -398,6 +398,9 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	if v, ok := node.Data["turbo"].(bool); ok && v {
 		req.Turbo = true
 	}
+	if v, ok := node.Data["pdd"].(bool); ok && v {
+		req.PDD = true
+	}
 	if v, ok := node.Data["steps"].(float64); ok && v > 0 {
 		req.Steps = int(v)
 	}
@@ -486,6 +489,24 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 		if len(promptWarnings) > 0 {
 			out["prompt_warnings"] = promptWarnings
 		}
+		// 与 film 同源的装配后音频处理：响度归一 + 声床，失败降级 WARN 不阻断出片。
+		audioMaster := true
+		if v, ok := node.Data["audio_master"].(bool); ok {
+			audioMaster = v
+		}
+		lufs := fieldFloat(node, "lufs", -16)
+		if lufs > 0 {
+			lufs = -16
+		}
+		roomTone := true
+		if v, ok := node.Data["room_tone"].(bool); ok {
+			roomTone = v
+		}
+		roomToneFloor := fieldFloat(node, "room_tone_gain", -36)
+		if roomToneFloor >= 0 {
+			roomToneFloor = -36
+		}
+		final = videoAudioFinish(final, audioMaster, lufs, roomTone, roomToneFloor, out)
 		out["video"] = muxPreparedAudio(node, final, out)
 		return out, nil
 	}
@@ -519,7 +540,25 @@ func (e *EngineV2) execText2VideoNode(ctx context.Context, node *model.NodeInsta
 	if optimize {
 		out["original_prompt"] = original
 	}
-	out["video"] = muxPreparedAudio(node, path, out)
+	// 与 film 同源的装配后音频处理：响度归一 + 声床，失败降级 WARN 不阻断出片。
+	audioMaster := true
+	if v, ok := node.Data["audio_master"].(bool); ok {
+		audioMaster = v
+	}
+	lufs := fieldFloat(node, "lufs", -16)
+	if lufs > 0 {
+		lufs = -16
+	}
+	roomTone := true
+	if v, ok := node.Data["room_tone"].(bool); ok {
+		roomTone = v
+	}
+	roomToneFloor := fieldFloat(node, "room_tone_gain", -36)
+	if roomToneFloor >= 0 {
+		roomToneFloor = -36
+	}
+	out["video"] = videoAudioFinish(path, audioMaster, lufs, roomTone, roomToneFloor, out)
+	out["video"] = muxPreparedAudio(node, out["video"].(string), out)
 	return out, nil
 }
 

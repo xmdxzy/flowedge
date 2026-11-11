@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 // code_video 多风格渲染的 live 冒烟：真调 lemo 渲染链，出片并核对帧数。
 // 默认跳过（渲染要几十秒），用 FLOWEDGE_LIVE_CODEVIDEO=1 打开。
@@ -41,7 +41,7 @@ func liveCodeVideoCards() []CodeCard {
 			Figure: "bars",
 			Labels: []string{"运镜", "硬切", "版式"},
 			Values: []int{82, 12, 46},
-			Note: "DESIGN TOKENS",
+			Note:   "DESIGN TOKENS",
 		},
 		{
 			Kicker:  "PART 03 · PIPELINE",
@@ -179,3 +179,22 @@ func ffmpegBin2Probe() string {
 }
 
 var _ = fmt.Sprintf
+
+// splitPoints 不许把中文句内的「，」当分隔符（2026-10-31 真机 produce 抓到：
+// 「信息密度一样，观感差距…」被拆成两条要点，成片里是被腰斩的句子）。
+func TestSplitPointsKeepsChineseCommas(t *testing.T) {
+	in := "信息密度一样，观感差距来自版式与节奏\r\n观众记住的是「怎么讲」，不是「讲了什么」\n\n  \n"
+	got := splitPoints(in)
+	if len(got) != 2 {
+		t.Fatalf("要点应只按换行切，want 2 got %d: %#v", len(got), got)
+	}
+	if got[0] != "信息密度一样，观感差距来自版式与节奏" {
+		t.Fatalf("首条被拆坏了：%q", got[0])
+	}
+	if got[1] != "观众记住的是「怎么讲」，不是「讲了什么」" {
+		t.Fatalf("次条被拆坏了：%q", got[1])
+	}
+	if n := len(splitPoints("   ")); n != 0 {
+		t.Fatalf("空白应返回空，got %d", n)
+	}
+}

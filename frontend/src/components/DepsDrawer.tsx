@@ -52,10 +52,33 @@ export default function DepsDrawer({ onClose }: Props) {
       .catch((err) => setMcpError(errorText(err)))
   }, [load])
 
-  // 抽屉开着时每 3 秒对一次账：别的终端起了服务，这里要能看见
+  // 抽屉开着时每 3 秒对一次账：别的终端起了服务，这里要能看见。
+  // 标签页切到后台就停：不可见的界面没人看，继续轮询只会刷引擎日志。
   useEffect(() => {
-    const timer = setInterval(() => void load(), 3000)
-    return () => clearInterval(timer)
+    let timer: ReturnType<typeof setInterval> | null = null
+    const start = () => {
+      if (timer === null) timer = setInterval(() => void load(), 3000)
+    }
+    const stop = () => {
+      if (timer !== null) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop()
+        return
+      }
+      start()
+      void load() // 回到前台立刻对一次，不等下一个 3 秒
+    }
+    if (!document.hidden) start()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [load])
 
   useEffect(() => {

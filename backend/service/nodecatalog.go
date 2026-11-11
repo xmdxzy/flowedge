@@ -71,7 +71,7 @@ type Cost struct {
 	BaseSec     float64 `json:"base_sec"`  // 固定开销：提交 / 取回 / 拼接
 	ColdLoadSec float64 `json:"cold_load_sec"`
 	SecPerUnit  float64 `json:"sec_per_unit"`
-	Unit        string  `json:"unit"` // image | frame | char | call | round | none
+	Unit        string  `json:"unit"`                // image | frame | char | call | round | none
 	RefWidth    int     `json:"ref_width,omitempty"` // 单位基准分辨率；0 = 不按面积缩放
 	RefHeight   int     `json:"ref_height,omitempty"`
 	VramMB      int     `json:"vram_mb"`
@@ -100,7 +100,7 @@ type CatalogEntry struct {
 func f64(v float64) *float64 { return &v }
 
 var (
-	widthField1024 = FieldSpec{Key: "width", Label: "宽", Kind: FieldInt, Default: 1024, Min: f64(384), Max: f64(1536)}
+	widthField1024  = FieldSpec{Key: "width", Label: "宽", Kind: FieldInt, Default: 1024, Min: f64(384), Max: f64(1536)}
 	heightField1024 = FieldSpec{Key: "height", Label: "高", Kind: FieldInt, Default: 1024, Min: f64(384), Max: f64(1536)}
 	widthField608   = FieldSpec{Key: "width", Label: "宽", Kind: FieldInt, Default: 608, Min: f64(256), Max: f64(1536)}
 	heightField352  = FieldSpec{Key: "height", Label: "高", Kind: FieldInt, Default: 352, Min: f64(160), Max: f64(1024)}
@@ -112,7 +112,7 @@ var (
 var nodeContracts = map[string]NodeContract{
 	"start": {
 		Label: "开始",
-		Out: []Port{{Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "text", Kind: PortText}},
 		Fields: []FieldSpec{
 			{Key: "prompt", Label: "提示词 / 文案", Kind: FieldTextarea, Hint: "下游文本线从这里取"},
 		},
@@ -120,15 +120,15 @@ var nodeContracts = map[string]NodeContract{
 	},
 	"end": {
 		Label: "结束",
-		In:   []Port{{Key: "in", Kind: PortAny}},
-		Cost: Cost{GPUClass: "cpu", Unit: "none"},
+		In:    []Port{{Key: "in", Kind: PortAny}},
+		Cost:  Cost{GPUClass: "cpu", Unit: "none"},
 	},
 
 	// ---- 语言侧 ----
 	"llm": {
 		Label: "语言模型",
-		In:  []Port{{Key: "text", Kind: PortText, Required: true}},
-		Out: []Port{{Key: "text", Kind: PortText}},
+		In:    []Port{{Key: "text", Kind: PortText, Required: true}},
+		Out:   []Port{{Key: "text", Kind: PortText}},
 		Fields: []FieldSpec{
 			{Key: "prompt", Label: "指令", Kind: FieldTextarea},
 			{Key: "model", Label: "模型", Kind: FieldText, Hint: "留空用默认模型"},
@@ -137,8 +137,8 @@ var nodeContracts = map[string]NodeContract{
 	},
 	"storyboard": {
 		Label: "分镜规划",
-		In:  []Port{{Key: "text", Kind: PortText, Required: true}},
-		Out: []Port{{Key: "text", Kind: PortText}},
+		In:    []Port{{Key: "text", Kind: PortText, Required: true}},
+		Out:   []Port{{Key: "text", Kind: PortText}},
 		Fields: []FieldSpec{
 			{Key: "prompt", Label: "故事", Kind: FieldTextarea},
 			{Key: "seconds", Label: "目标时长（秒）", Kind: FieldFloat, Default: 10.0, Min: f64(2), Max: f64(180)},
@@ -150,8 +150,8 @@ var nodeContracts = map[string]NodeContract{
 	// ---- 扩散侧 ----
 	"text2image": {
 		Label: "文生图",
-		In:  []Port{{Key: "text", Kind: PortText, Required: true}},
-		Out: []Port{{Key: "image", Kind: PortImage}},
+		In:    []Port{{Key: "text", Kind: PortText, Required: true}},
+		Out:   []Port{{Key: "image", Kind: PortImage}},
 		Fields: []FieldSpec{
 			{Key: "prompt", Label: "画面描述（节点内）", Kind: FieldTextarea, Hint: "优先取上游文本；无连线时才用这里"},
 			{Key: "prompts", Label: "批量提示词（每行一条）", Kind: FieldTextarea},
@@ -166,8 +166,8 @@ var nodeContracts = map[string]NodeContract{
 	},
 	"image2image": {
 		Label: "图像重绘",
-		In:  []Port{{Key: "image", Kind: PortImage, Required: true}, {Key: "text", Kind: PortText}},
-		Out: []Port{{Key: "image", Kind: PortImage}},
+		In:    []Port{{Key: "image", Kind: PortImage, Required: true}, {Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "image", Kind: PortImage}},
 		Fields: []FieldSpec{
 			{Key: "image_path", Label: "输入图", Kind: FieldFile, Hint: "也可连一条上游图片线"},
 			{Key: "prompt", Label: "重绘描述", Kind: FieldTextarea},
@@ -179,8 +179,8 @@ var nodeContracts = map[string]NodeContract{
 	},
 	"inpaint": {
 		Label: "局部重绘",
-		In:  []Port{{Key: "image", Kind: PortImage, Required: true}, {Key: "text", Kind: PortText}},
-		Out: []Port{{Key: "image", Kind: PortImage}},
+		In:    []Port{{Key: "image", Kind: PortImage, Required: true}, {Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "image", Kind: PortImage}},
 		Fields: []FieldSpec{
 			{Key: "image_path", Label: "原图", Kind: FieldFile},
 			{Key: "mask_path", Label: "蒙版（白色为重绘区）", Kind: FieldFile},
@@ -192,8 +192,8 @@ var nodeContracts = map[string]NodeContract{
 	},
 	"upscale": {
 		Label: "超分放大",
-		In:  []Port{{Key: "image", Kind: PortImage, Required: true}},
-		Out: []Port{{Key: "image", Kind: PortImage}},
+		In:    []Port{{Key: "image", Kind: PortImage, Required: true}},
+		Out:   []Port{{Key: "image", Kind: PortImage}},
 		Fields: []FieldSpec{
 			{Key: "image_path", Label: "输入图", Kind: FieldFile},
 			{Key: "scale", Label: "放大倍数", Kind: FieldFloat, Default: 2.0, Min: f64(1.5), Max: f64(4)},
@@ -205,8 +205,8 @@ var nodeContracts = map[string]NodeContract{
 	// ---- 视频（H3 走语言侧调度，与 NodeSpecs 保持一致）----
 	"text2video": {
 		Label: "文生视频",
-		In:  []Port{{Key: "text", Kind: PortText, Required: true}, {Key: "image", Kind: PortImage}},
-		Out: []Port{{Key: "video", Kind: PortVideo}},
+		In:    []Port{{Key: "text", Kind: PortText, Required: true}, {Key: "image", Kind: PortImage}},
+		Out:   []Port{{Key: "video", Kind: PortVideo}},
 		Fields: []FieldSpec{
 			{Key: "prompt", Label: "画面描述", Kind: FieldTextarea},
 			{Key: "backend", Label: "后端", Kind: FieldEnum, Default: "h3", Options: []string{"h3"}},
@@ -216,14 +216,15 @@ var nodeContracts = map[string]NodeContract{
 			{Key: "ref_images", Label: "参考图（多行路径）", Kind: FieldTextarea, Hint: "给了就走 Ref2VA 六段式"},
 			{Key: "ref_audio", Label: "参考音频", Kind: FieldFile},
 			{Key: "low_vram", Label: "低显存模式", Kind: FieldBool, Default: false},
+			{Key: "pdd", Label: "PDD 8 步加速（非台词镜）", Kind: FieldBool, Default: false, Hint: "H3 PDD LoRA 8 步蒸馏，与 turbo 互斥"},
 		},
 		Cost: Cost{GPUClass: "language", BaseSec: 20, SecPerUnit: 0.7, Unit: "frame",
 			RefWidth: 608, RefHeight: 352, VramMB: 23800, ColdLoadSec: 90},
 	},
 	"shotlist": {
 		Label: "多镜出片",
-		In:  []Port{{Key: "text", Kind: PortText}},
-		Out: []Port{{Key: "video", Kind: PortVideo}},
+		In:    []Port{{Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "video", Kind: PortVideo}},
 		Fields: []FieldSpec{
 			{Key: "plan", Label: "分镜表 JSON（留空取上游）", Kind: FieldTextarea},
 			widthField608, heightField352, stepsField,
@@ -240,8 +241,8 @@ var nodeContracts = map[string]NodeContract{
 	// ---- 语音侧 ----
 	"tts": {
 		Label: "语音合成",
-		In:  []Port{{Key: "text", Kind: PortText, Required: true}},
-		Out: []Port{{Key: "audio", Kind: PortAudio}},
+		In:    []Port{{Key: "text", Kind: PortText, Required: true}},
+		Out:   []Port{{Key: "audio", Kind: PortAudio}},
 		Fields: []FieldSpec{
 			{Key: "text", Label: "台词", Kind: FieldTextarea},
 			{Key: "voice", Label: "音色", Kind: FieldText, Hint: "留空用默认音色"},
@@ -250,11 +251,37 @@ var nodeContracts = map[string]NodeContract{
 		Cost: Cost{GPUClass: "audio", BaseSec: 5, SecPerUnit: 0.2, Unit: "char", ColdLoadSec: 60, VramMB: 0},
 	},
 
+	// ---- 音乐侧：ACE-Step 1.5（GPU）----
+	// 只列「出片会用到的」字段；repaint/cover 这类编辑任务等有真实需求再加，
+	// 现在加进来只会让节点面板出现一堆没人用的输入框。
+	"music": {
+		Label: "音乐生成（ACE-Step）",
+		In:    []Port{{Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "audio", Kind: PortAudio}},
+		Fields: []FieldSpec{
+			{Key: "prompt", Label: "风格/氛围描述", Kind: FieldTextarea,
+				Hint: "例：warm lo-fi piano, soft vinyl noise, 80 BPM, no vocals；留空取上游文本"},
+			{Key: "lyrics", Label: "歌词（留空 = 纯音乐）", Kind: FieldTextarea},
+			{Key: "duration", Label: "时长（秒）", Kind: FieldInt, Default: 30, Min: f64(10), Max: f64(600)},
+			{Key: "model", Label: "模型", Kind: FieldEnum, Default: defaultMusicModel,
+				Options: []string{"acestep-v15-xl-turbo", "acestep-v15-xl-sft", "acestep-v15-turbo"}},
+			{Key: "steps", Label: "推理步数", Kind: FieldInt, Default: 8, Min: f64(1), Max: f64(64)},
+			{Key: "language", Label: "歌词语言", Kind: FieldText, Hint: "zh / en / ja…；留空按歌词猜"},
+			{Key: "thinking", Label: "LM 增强（更慢更稳）", Kind: FieldBool, Default: false},
+			{Key: "seed", Label: "种子", Kind: FieldInt, Hint: "0/留空 = 随机"},
+			{Key: "output_path", Label: "输出路径（可空）", Kind: FieldText},
+		},
+		// 冷加载 3–5 分钟（9GB 权重 + LM）；生成按秒算，先按 1s/秒音频给初值，
+		// 真实值跑过一次后会由 EWMA 覆盖。
+		Cost: Cost{GPUClass: "music", BaseSec: 15, SecPerUnit: 1.2, Unit: "second",
+			VramMB: 12000, ColdLoadSec: 240},
+	},
+
 	// ---- 质量控制 ----
 	"quality_loop": {
 		Label: "质量循环",
-		In:  []Port{{Key: "text", Kind: PortText}},
-		Out: []Port{{Key: "video", Kind: PortVideo}, {Key: "image", Kind: PortImage}},
+		In:    []Port{{Key: "text", Kind: PortText}},
+		Out:   []Port{{Key: "video", Kind: PortVideo}, {Key: "image", Kind: PortImage}},
 		Fields: []FieldSpec{
 			{Key: "workflow_id", Label: "被循环的图 id", Kind: FieldInt, Min: f64(1)},
 			{Key: "max_rounds", Label: "最多轮数", Kind: FieldInt, Default: 3, Min: f64(1), Max: f64(8)},
@@ -372,4 +399,3 @@ func PortDeclared(typ string, outbound bool, key string) bool {
 	}
 	return false
 }
-

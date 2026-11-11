@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -161,7 +160,7 @@ func (s *Supervisor) deviceFreeVRAMMB() int {
 // 用 nounits：默认输出带 "9999 MiB" 后缀，多显卡时按行取第一张，
 // 与本项目「单卡」的既有假设一致（总显存 24576MB 也来自同一处假设）。
 func nvidiaFreeVRAMMB() int {
-	out, err := exec.Command("nvidia-smi", "--query-gpu=memory.free",
+	out, err := hiddenExec("nvidia-smi", "--query-gpu=memory.free",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
 		return 0

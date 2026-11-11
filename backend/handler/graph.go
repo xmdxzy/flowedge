@@ -1,11 +1,14 @@
-﻿package handler
+package handler
 
 import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -27,6 +30,10 @@ type GraphHandler struct {
 	db    *gorm.DB
 	pipes *service.PipelineStore
 
+	// dataDir 数据目录（导演包落盘到 <dataDir>/packs/）。未注入时导出会直接报错，
+	// 不落到当前工作目录——那会让包散落在 exe 旁边，用户永远找不到。
+	dataDir string
+
 	// 依赖预检（SetProbe/SetSupervisor 注入；nil 时干跑只报结构与类型问题）
 	probe func() service.Capabilities
 	sup   *service.Supervisor
@@ -41,6 +48,9 @@ func (g *GraphHandler) SetProbe(fn func() service.Capabilities) { g.probe = fn }
 
 // SetSupervisor 注入依赖托管器（判断 ComfyUI 实例能不能被拉起）。
 func (g *GraphHandler) SetSupervisor(sup *service.Supervisor) { g.sup = sup }
+
+// SetDataDir 注入数据目录：导演包导出/导入都落在 <dataDir>/packs/ 下。
+func (g *GraphHandler) SetDataDir(dir string) { g.dataDir = dir }
 
 // ---- 节点目录 ----
 
@@ -244,7 +254,7 @@ func (g *GraphHandler) GetWorkflow(c *gin.Context) {
 		"id": wf.ID, "name": wf.Name, "origin": wf.Origin,
 		"schema_version": wf.SchemaVersion,
 		"nodes":          nodes, "edges": edges,
-		"report": rep,
+		"report":     rep,
 		"created_at": wf.CreatedAt, "updated_at": wf.UpdatedAt,
 	})
 }
@@ -438,4 +448,122 @@ func probeState(probe func() service.Capabilities) string {
 		return "skipped"
 	}
 	return "probed"
+}
+
+// ---- 导演包（.fepack.zip）----
+
+// ExportPack 把一张图连同它引用的本地素材打成包，落到 <dataDir>/packs/。
+//
+// 为什么不做成"下载流"：包动辄几百 MB，浏览器下载 + 引擎落盘两份内存没必要；
+// 落盘后返回路径，前端给个"打开所在目录"更实用（也能直接拷进 U 盘交接）。
+func (g *GraphHandler) ExportPack(c *gin.Context) {
+	wf, ok := g.loadWorkflow(c)
+	if !ok {
+		return
+	}
+	if g.dataDir == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "数据目录未配置，无法导出导演包"})
+		return
+	}
+	dir := filepath.Join(g.dataDir, "packs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "建包目录失败：" + err.Error()})
+		return
+	}
+	out := filepath.Join(dir, fmt.Sprintf("%s-%s.fepack.zip",
+		packFileName(wf.Name), time.Now().Format("20060102-150405")))
+
+	m, err := service.ExportPack(wf.Name, wf.Nodes, wf.Edges, out)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "导出失败：" + err.Error()})
+		return
+	}
+	st, _ := os.Stat(out)
+	var bytes int64
+	if st != nil {
+		bytes = st.Size()
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"path": out, "assets": len(m.Assets), "bytes": bytes,
+		"workflow_id": wf.ID, "name": wf.Name,
+	})
+}
+
+// ImportPack 导入一个包 → 解出素材 → 新建一张图（不覆盖任何已有图）。
+func (g *GraphHandler) ImportPack(c *gin.Context) {
+	var body struct {
+		Path string `json:"path"`
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体不是合法 JSON：" + err.Error()})
+		return
+	}
+	src := strings.TrimSpace(body.Path)
+	if src == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 path（要导入的 .fepack.zip）"})
+		return
+	}
+	if st, err := os.Stat(src); err != nil || st.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "找不到这个包：" + src})
+		return
+	}
+	if g.dataDir == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "数据目录未配置，无法导入导演包"})
+		return
+	}
+	// 每次导入用独立目录：同名包导两次不会互相覆盖素材（覆盖会让第一张图的素材被换掉）
+	packID := fmt.Sprintf("pack-%d", time.Now().UnixNano())
+	dest := filepath.Join(g.dataDir, "packs", packID)
+
+	m, nodes, edges, err := service.ImportPack(src, dest)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "导入失败：" + err.Error()})
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = strings.TrimSpace(m.Name)
+	}
+	if name == "" {
+		name = "导入的导演包"
+	}
+	wf := model.Workflow{
+		Name: name + "（导入）", Nodes: nodes, Edges: edges,
+		Origin: "user", SchemaVersion: 1,
+	}
+	if err := g.db.Create(&wf).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "建图失败：" + err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"id": wf.ID, "name": wf.Name, "assets": len(m.Assets),
+		"assets_dir": dest, "pack_version": m.FormatVersion,
+	})
+}
+
+// packFileName 文件名里只留安全字符（中文会变成下划线：文件名不是给人读的，
+// 包里的 name 字段才是）。
+func packFileName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "pack"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if len(out) > 40 {
+		out = out[:40]
+	}
+	if out == "" {
+		return "pack"
+	}
+	return out
 }

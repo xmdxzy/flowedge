@@ -35,16 +35,19 @@ cd frontend && npx tsc --noEmit
 
 ## Adding a node type
 
-1. Backend: implement the executor in `backend/service/`, register it in the
+1. Backend, two files, both required: the scheduling metadata in
+   `backend/service/nodespec.go` (does it need the GPU, which VRAM side, timeout)
+   and the canvas contract in `backend/service/nodecatalog.go` (ports, fields,
+   cost, label). `nodecatalog_test.go` fails if the two key sets drift apart.
+2. Implement the executor in `backend/service/`, register it in the
    `nodeRegistry` map in `engine_v2.go`, and add its timeout case in
    `nodeTimeoutFor`.
-2. Update the registry guard test (`TestNodeRegistry_HasAllBuiltins`) — it is
-   supposed to fail until you register the new type deliberately.
-3. Frontend: add the palette entry, output fields, and environment requirement
-   in `frontend/src/config/graph.ts`, plus a `nodeTypes` entry and default data
-   in `App.tsx`.
-4. Write one test that proves the node fails correctly on bad input. A node that
-   only has a happy-path test is not done.
+3. Nothing in the frontend hardcodes node types. The palette, the inspector and
+   the edge validation all read the catalog, so a correct backend entry is the
+   whole UI job. If you find yourself editing a list of node types in
+   `frontend/src`, something has gone wrong.
+4. Write one test that proves the node fails correctly on bad input. A node with
+   only a happy-path test is not done.
 
 ## Pull requests
 

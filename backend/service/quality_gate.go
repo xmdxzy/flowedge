@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -333,7 +332,7 @@ func probeLoudnessAndSilence(path string) (loudnessResult, [][2]float64) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, bin,
+	out, _ := hiddenExecContext(ctx, bin,
 		"-hide_banner", "-nostats", "-i", path,
 		"-af", "volumedetect,silencedetect=noise=-35dB:d=0.4",
 		"-f", "null", "-").CombinedOutput()

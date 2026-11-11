@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -13,9 +13,10 @@
   #stage{position:absolute;inset:0;perspective:1400px;perspective-origin:50% 48%;overflow:hidden}
   #world{position:absolute;inset:0;transform-style:preserve-3d;will-change:transform}
   .card{
-    position:absolute;left:50%;top:50%;width:1320px;height:700px;margin:-350px 0 0 -660px;
+    position:absolute;left:50%;top:50%;width:var(--cw,1320px);height:var(--ch,700px);
+    margin:calc(var(--ch,700px) / -2) 0 0 calc(var(--cw,1320px) / -2);
     transform-style:preserve-3d;backface-visibility:hidden;
-    border-radius:28px;padding:62px 72px;box-sizing:border-box;
+    border-radius:28px;padding:var(--pad,62px 72px);box-sizing:border-box;
     background:linear-gradient(160deg,rgba(20,23,28,.90),rgba(11,13,17,.94));
     border:1px solid rgba(255,255,255,.13);
     box-shadow:0 40px 120px rgba(0,0,0,.72), inset 0 1px 0 rgba(255,255,255,.07);
@@ -26,23 +27,23 @@
     content:"";position:absolute;left:72px;right:72px;bottom:0;height:1px;
     background:linear-gradient(90deg,transparent,rgba(91,233,185,.55),transparent);
   }
-  .idx{position:absolute;right:58px;top:48px;font:600 18px/1 "Cascadia Mono",Consolas,monospace;
+  .idx{position:absolute;right:52px;top:44px;font:600 var(--idxF,18px)/1 "Cascadia Mono",Consolas,monospace;
        color:var(--faint);letter-spacing:.14em}
-  .kick{display:inline-flex;align-items:center;gap:10px;height:38px;padding:0 20px;border-radius:19px;
+  .kick{display:inline-flex;align-items:center;gap:10px;height:var(--kickH,38px);padding:0 20px;border-radius:19px;
         border:1px solid rgba(91,233,185,.55);color:var(--mint);
-        font:600 17px/1 "Cascadia Mono",Consolas,monospace;letter-spacing:.16em;text-transform:uppercase}
+        font:600 var(--kickF,17px)/1 "Cascadia Mono",Consolas,monospace;letter-spacing:.16em;text-transform:uppercase}
   .kick i{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 12px var(--mint)}
-  h1{margin:32px 0 0;font-size:var(--h1,64px);line-height:1.2;font-weight:700;letter-spacing:-.01em;
+  h1{margin:28px 0 0;font-size:var(--h1,64px);line-height:1.22;font-weight:700;letter-spacing:-.01em;
      text-wrap:balance;clip-path:inset(0 100% 0 0)}
   .rule{height:2px;width:0;margin:30px 0 0;border-radius:2px;
         background:linear-gradient(90deg,var(--mint),rgba(167,139,250,.75))}
-  ul{margin:26px 0 0;padding:0;list-style:none}
-  li{position:relative;padding-left:30px;margin:16px 0 0;font-size:29px;line-height:1.5;color:var(--dim);
+  ul{margin:var(--ulTop,26px) 0 0;padding:0;list-style:none}
+  li{position:relative;padding-left:28px;margin:var(--liGap,16px) 0 0;font-size:var(--li,29px);line-height:1.5;color:var(--dim);
      opacity:0;transform:translateY(14px)}
   li::before{content:"";position:absolute;left:0;top:14px;width:12px;height:12px;border-radius:3px;
              background:var(--mint);opacity:.85;transform:rotate(45deg)}
   li:nth-child(even)::before{background:var(--purple)}
-  .bars{position:absolute;right:72px;bottom:96px;width:560px;display:flex;gap:34px;align-items:flex-end;
+  .bars{position:absolute;right:var(--barPad,72px);bottom:96px;width:var(--barW,560px);display:flex;gap:34px;align-items:flex-end;
         height:138px;opacity:0}
   .bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:10px}
   .bar em{font:600 15px/1 "Cascadia Mono",Consolas,monospace;color:var(--mint);font-style:normal;opacity:.9}
@@ -52,7 +53,8 @@
   .bar span{font:500 16px/1.2 "Cascadia Mono",Consolas,monospace;color:var(--faint);letter-spacing:.06em}
   .note{position:absolute;right:62px;bottom:44px;font:500 15px/1 "Cascadia Mono",Consolas,monospace;
         color:var(--faint);letter-spacing:.18em;text-transform:uppercase}
-  .prop{position:absolute;left:50%;top:50%;border-radius:6px;background:rgba(255,255,255,.045);
+  .bigidx{position:absolute;left:40px;bottom:14px;font:800 var(--bigIdx,200px)/.84 "Microsoft YaHei",sans-serif;
+          color:rgba(91,233,185,.075);letter-spacing:-.05em;pointer-events:none;user-select:none}  .prop{position:absolute;left:50%;top:50%;border-radius:6px;background:rgba(255,255,255,.045);
         border:1px solid rgba(255,255,255,.055);transform-style:preserve-3d}
   .glow{position:absolute;left:50%;top:50%;border-radius:50%;filter:blur(90px);opacity:.5}
   #floor{position:absolute;left:50%;top:50%;width:5200px;height:5200px;margin:-2600px 0 0 -2600px;

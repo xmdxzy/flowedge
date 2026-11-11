@@ -35,18 +35,28 @@ func ParseBudget(params map[string]interface{}) Budget {
 	if params == nil {
 		return b
 	}
-	if raw, ok := params["budget"].(map[string]interface{}); ok {
-		if v, ok := raw["max_wall_seconds"].(float64); ok && v > 0 {
-			b.MaxWallSeconds = v
+	switch v := params["budget"].(type) {
+	case map[string]interface{}:
+		if f, ok := v["max_wall_seconds"].(float64); ok && f > 0 {
+			b.MaxWallSeconds = f
 		}
-		if s, ok := raw["on_exceed"].(string); ok {
+		if s, ok := v["on_exceed"].(string); ok {
 			b.OnExceed = normalizeOnExceed(s)
+		}
+	case float64:
+		// pipelines.json 的字段声明是 int，params 解出来是数字：budget=600 即 600 秒。
+		if v > 0 {
+			b.MaxWallSeconds = v
 		}
 	}
 	if b.MaxWallSeconds <= 0 {
 		if v, ok := params["max_wall_seconds"].(float64); ok && v > 0 {
 			b.MaxWallSeconds = v
 		}
+	}
+	// on_exceed 也可以单独给（与 budget 数值解耦，UI 上是两个字段）
+	if s, ok := params["budget_on_exceed"].(string); ok && s != "" {
+		b.OnExceed = normalizeOnExceed(s)
 	}
 	return b
 }

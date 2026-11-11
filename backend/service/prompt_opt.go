@@ -136,6 +136,28 @@ FINAL SELF-CHECK — silently fix every item that fails before answering:
 // 关键约定：一旦给了参考音频，就用 fully_copy（参考音频 = 成片完整音轨），
 // 因此整体声景必须写 N/A，否则模型会往音轨里加东西。环境声要在送进来之前
 // 就混进 wav（TTS 人声 + 环境底噪），这样成片声音完全可控。
+// ensureSourceVideoPrompt 给"拿现成视频改造"的提示词补一条 <Video 1> 说明。
+//
+// 为什么必须补：ref_videos 接进去以后，模型默认把那段素材当**风格参考**，
+// 而不是"这段就是要改的源片"——于是它会从头生成一条新片，改了个寂寞。
+// 写在 retention_analysis 段里（每条参考一行的位置），不是甩在提示词末尾。
+func ensureSourceVideoPrompt(prompt string) string {
+	if strings.Contains(strings.ToLower(prompt), "<video 1>") {
+		return prompt
+	}
+	line := "<Video 1>: the source clip. Fully preserve its subject, wardrobe, framing and camera movement; apply only the requested changes."
+	idx := strings.Index(strings.ToLower(prompt), "retention_analysis:")
+	if idx < 0 {
+		return strings.TrimSpace(prompt) + "\n" + line + "\n"
+	}
+	nl := strings.Index(prompt[idx:], "\n")
+	if nl < 0 {
+		return prompt + "\n" + line + "\n"
+	}
+	cut := idx + nl + 1
+	return prompt[:cut] + line + "\n" + prompt[cut:]
+}
+
 func ensureRef2VAPrompt(prompt string, nImg, nAud int) string {
 	low := strings.ToLower(prompt)
 	if strings.Contains(low, "subject_definitions") {

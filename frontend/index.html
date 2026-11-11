@@ -4,21 +4,39 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlowEdge 出片台</title>
+    <meta
+      name="description"
+      content="FlowEdge：单机单卡的本地多模态出片台——在图或固定流水线上编排 LLM、出图、视频与配音，带体检、质量门与产物血缘。数据不出本机。"
+    />
+    <meta name="theme-color" content="#0a0d12" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="robots" content="noindex" />
     <script>
-      // 首帧前定主题，避免「先白一帧再变深」的闪屏。
-      // 与 src/lib/theme.ts 共用同一个 key：flowedge.theme = light | dark | system
-      // 调试/截图可用 ?theme=light|dark|system 直接改偏好（会写进 localStorage）。
+      // 首帧前定主题，避免「先白一帧再变深」（或反过来）。
+      // 必须与 src/lib/theme.ts 的 getInitialPref() 判断顺序**完全一致**：
+      //   有保存的 light/dark → 用它；有 system 或从没选过 → 跟随系统。
+      // 反例（真机抓到）：这里原来写死 `localStorage || 'dark'`，
+      // 而 theme.ts 首帧后按系统切成浅色 —— 浅色系统用户会先黑一帧再变白，
+      // 正是这段脚本想避免的闪屏。调试/截图可用 ?theme=light|dark|system 强制。
       (function () {
         try {
           var forced = new URLSearchParams(location.search).get('theme');
           if (forced === 'light' || forced === 'dark' || forced === 'system') {
             localStorage.setItem('flowedge.theme', forced);
           }
-          var pref = localStorage.getItem('flowedge.theme') || 'dark';
-          if (pref !== 'light' && pref !== 'dark') {
-            pref = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-          }
-          document.documentElement.setAttribute('data-theme', pref);
+          var saved = localStorage.getItem('flowedge.theme');
+          var pref =
+            saved === 'light' || saved === 'dark' || saved === 'system' ? saved : 'system';
+          var resolved =
+            pref === 'system'
+              ? window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark'
+              : pref;
+          document.documentElement.setAttribute('data-theme', resolved);
+          document.documentElement.setAttribute('data-pref', pref);
         } catch (e) {
           document.documentElement.setAttribute('data-theme', 'dark');
         }
@@ -27,6 +45,11 @@
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <div style="padding: 40px; font: 14px/1.8 system-ui, 'Microsoft YaHei UI', sans-serif">
+        FlowEdge 的界面需要 JavaScript。请在浏览器设置里允许本页运行脚本后刷新。
+      </div>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

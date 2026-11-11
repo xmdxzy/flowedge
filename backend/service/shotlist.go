@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -371,6 +373,9 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	// 首拍 append、重拍就地替换，装配后按它排字幕时间轴（subtitles.go）。
 	dubs := make([]*DubTrackReport, 0, len(plan.Shots))
 	var prevLastFrame string
+	// 段间引导要用上一镜的**整段尾部视频**（不是单张末帧）：N 帧画面 + 同段音轨。
+	// 单帧续接只能给「起点」，N 帧才能给「运动」——这是两者的本质差别。
+	var prevPart string
 	nodeStart := time.Now()
 
 	// 镜头级作业：每镜成功即落盘，失败重跑时已完成的镜头直接复用（不重烧显存）。
@@ -402,6 +407,38 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 	needsReshoot := make([]bool, len(plan.Shots))
 	reshootCount := 0
 	cacheDir := shotCacheDir(outDir)
+
+	// 选择运行：only_shots（"2,3"，空 = 全跑）。解析失败直接报错——
+	// 静默忽略会变成"以为只跑一镜，结果整片重烧"。
+	onlyShots, onlyErr := parseShotSpec(node.Data["only_shots"])
+	if onlyErr != nil {
+		return nil, onlyErr
+	}
+	if len(onlyShots) > 0 {
+		log.Printf("[shotlist] 选择运行：只跑第 %v 镜，其余必须是缓存里已有的产物", sortedShotIDs(onlyShots))
+	}
+
+	// v2v / rv2v：源视频按镜切段（每镜吃自己那一段，不重复喂整片）。
+	// 起点按**帧**累计——秒数会被 17k+5 吸附，用秒切会和实际画面对不上。
+	// 预先算好（而不是循环里累加）：重拍轮次会重复经过同一镜，累加会把光标带偏。
+	sourceVideo := strings.TrimSpace(fieldString(node, "source_video"))
+	var srcStarts []int
+	if sourceVideo != "" {
+		srcStarts = make([]int, len(plan.Shots))
+		acc := 0
+		for k, s := range plan.Shots {
+			srcStarts[k] = acc
+			acc += s.Frames
+		}
+		log.Printf("[shotlist] v2v 模式：源视频 %s，%d 镜共需 %d 帧（源片不够会由 ComfyUI 截短）",
+			filepath.Base(sourceVideo), len(plan.Shots), acc)
+		// 2026-11-01 实测：把源片接到官方 ref_videos 上，成片与源片的结构相似度
+		// 只有 0.52（8 步）/ 0.59（20 步），而"完全不给源片"的对照是 0.51——
+		// 差异在噪声区，够不上"改造源片"。所以这条链路标成实验性：
+		// 让用户知道出来的东西可能接近"按提示词重新生成"，而不是他手里的那段素材。
+		log.Printf("[shotlist] ⚠ v2v 源视频为实验性能力：实测模型对 <Video 1> 的跟随很弱" +
+			"（SSIM 0.59 vs 对照 0.51），结果可能接近重新生成，别当成稳定的素材改造")
+	}
 
 	// finishShot 单镜产出后的共用收尾：结果落位 → 音频治理 → 缓存 → 进度 → 末帧。
 	// 单镜路径与批量路径都走这里，两份逻辑迟早漂移（AGENTS §0.12④）。
@@ -471,6 +508,7 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 
 		// 取末帧供下一镜续接（仅当下一镜需要 continue 时才真的会用到）
 		if i < len(plan.Shots)-1 && sh.Transition == "continue" {
+			prevPart = part
 			tmp := filepath.Join(os.TempDir(), fmt.Sprintf("flowedge-shot-%d-%d.png", time.Now().UnixNano(), sh.ID))
 			if err := extractLastFrame(part, tmp); err == nil {
 				prevLastFrame = tmp
@@ -672,6 +710,48 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			sh := plan.Shots[i]
 			// 只有上一镜声明 continue 时才用末帧引导；其余一律独立生成（多角度才成立）
 			continuity := i > 0 && plan.Shots[i-1].Transition == "continue" && prevLastFrame != ""
+
+			// ---- 段间引导（motion context）参数 ----
+			//
+			// continuity_frames = 0（默认）→ 老行为：只钉 1 帧当首帧（且必须放弃 ref2va 身份锁）；
+			// continuity_frames = 5/22/39/56 → 把上一镜末 N 帧 + 同段音轨钉成本镜前缀，
+			//   模型先重演这段尾巴再往下写，生成后裁掉前缀（正文长度不变）。
+			//
+			// 帧预算（抄 AIMixer 的 generation_frame_budget）：sample = align17(正文 + N)，
+			// 因为 H3 只吃 17k+5 网格；124+22=146 落在 158，所以多生成 34 帧再裁 22。
+			ctxFrames, genFrames := 0, sh.Frames
+			var guideClip, guideAudio string
+			if continuity {
+				if v, ok := nodeIntLoose(node.Data["continuity_frames"]); ok && v >= 5 {
+					ctxFrames = snapContextFrames(v)
+				}
+			}
+			if ctxFrames > 0 {
+				if prevPart == "" {
+					// 上一镜产物不在手上（重拍轮次里位置变了），退回单帧引导。
+					log.Printf("[shotlist] 第 %d 镜想要的段间引导拿不到上一镜产物，退回单帧首帧引导", sh.ID)
+					ctxFrames = 0
+				} else {
+					genFrames = alignH3Frames(sh.Frames + ctxFrames)
+					clipPath := filepath.Join(outDir, fmt.Sprintf("guide-%d-%d.mp4", sh.ID, time.Now().UnixNano()))
+					if gerr := extractTailClip(prevPart, clipPath, ctxFrames, 24); gerr != nil {
+						// 不静默降级：段间引导是用户显式打开的，退回单帧会得到完全不同的画面，
+						// 这时候继续跑等于交一条用户没要的片子。此时还没烧 GPU，直接失败最便宜。
+						return nil, fmt.Errorf("第 %d 镜段间引导准备失败：%w", sh.ID, gerr)
+					}
+					guideClip = clipPath
+					audPath := filepath.Join(outDir, fmt.Sprintf("guide-%d-%d.wav", sh.ID, time.Now().UnixNano()))
+					if aerr := extractTailAudio(prevPart, audPath, ctxFrames, 24); aerr == nil {
+						guideAudio = audPath
+					} else {
+						// 音轨缺失只影响接缝听感，画面续接仍然成立，可以继续但要留痕。
+						log.Printf("[shotlist] 第 %d 镜段间引导只续画面（取尾音轨失败）：%v", sh.ID, aerr)
+					}
+					log.Printf("[shotlist] 第 %d 镜段间引导：钉上一镜末 %d 帧，生成 %d 帧（正文 %d），解码后裁头 %d 帧",
+						sh.ID, ctxFrames, genFrames, sh.Frames, ctxFrames)
+				}
+			}
+
 			// 提示词：富模式手写六段式优先；结构化模式字段编译
 			prompt := sh.Prompt
 			if strings.TrimSpace(prompt) == "" {
@@ -707,25 +787,94 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 				}
 			}
 
-			lowVRAM := shotNeedsLowVRAM(node, width, height, sh.Frames)
+			// 低显存判定用**实际生成帧数**（genFrames），不是正文帧数：
+			// 段间引导会让 124 帧的一镜变成 158 帧，实测峰值 23249/24576 MiB
+			// （离爆只差 1.3GB）。按正文帧判会把「已超基准 27%」的镜当常规镜，
+			// 736×416 那种分辨率上再加 27% 时序长度就会 OOM。
+			lowVRAM := shotNeedsLowVRAM(node, width, height, genFrames)
 
 			req := MediaRequest{
 				Kind: "h3", Prompt: prompt,
 				Width: width, Height: height,
-				Frames: sh.Frames, FPS: 24, Steps: shotSteps,
+				Frames: genFrames, FPS: 24, Steps: shotSteps,
 				Turbo: turbo, LowVRAM: lowVRAM, PDD: pdd,
 				// 把取消信号带进生成链路：节点超时/点停止时，ComfyUI 里那条
 				// 提交要立刻从队列里撤掉，而不是继续烧到它自己的预算耗尽。
 				Ctx: ctx,
 			}
+			// 二采：节点 data 的 refine（0=关；0.25–0.5 是常用区间，越大越容易改掉一采构图）
+			var refineSteps int
+			if v, ok := nodeFloatLoose(node.Data["refine"]); ok && v > 0 {
+				if v > 0.9 {
+					v = 0.9 // 再高就不叫精修了，等于重画一遍（还白花一倍时间）
+				}
+				req.RefineDenoise = v
+				req.RefineSteps = 4
+				if n, ok2 := nodeIntLoose(node.Data["refine_steps"]); ok2 && n > 0 {
+					req.RefineSteps = n
+				}
+				refineSteps = req.RefineSteps
+			}
+
+			// ---- 一采确认（confirm_first_pass）----
+			//
+			// 目的：先只出一采给用户看构图，满意了再烧二采——二采最贵的地方在于
+			// "构图不对也得先采完才知道"，这一步把它挡在前面。
+			//
+			// 实现靠 **seed + ComfyUI 节点缓存**，不改 ComfyUI 内部：
+			//   第 1 遍：confirm 开、refine 被压成 0 → 只跑一采，出片给用户看；
+			//   第 2 遍：confirm 关、同 seed 同提示词 → 一采那张图逐节点命中缓存，
+			//            实际只多跑二采那几秒。
+			// 所以 confirm 开时**必须**给 seed：随机 seed 的第二遍会重新采一遍一采，
+			// 用户精修的就不是刚才看过的那版构图了。
+			confirmFirst, _ := node.Data["confirm_first_pass"].(bool)
+			seedIn := int64(0)
+			if v, ok := nodeIntLoose(node.Data["seed"]); ok && v > 0 {
+				seedIn = int64(v)
+			}
+			refineOut, seedOut, gateErr := firstPassGate(req.RefineDenoise, confirmFirst, seedIn)
+			if gateErr != nil {
+				return nil, fmt.Errorf("第 %d 镜：%w", sh.ID, gateErr)
+			}
+			if confirmFirst && req.RefineDenoise > 0 {
+				log.Printf("[shotlist] 第 %d 镜：一采确认模式，本轮只跑一采（二采压成 0）。"+
+					"看完构图满意后，把 confirm_first_pass 关掉、保持 seed=%d 再跑一次，二采会复用这次的一采",
+					sh.ID, seedOut)
+			}
+			req.RefineDenoise, req.Seed = refineOut, seedOut
+			if refineOut == 0 {
+				req.RefineSteps = 0
+				refineSteps = 0
+			}
 			switch {
 			case dubPath != "":
 				// 台词段必须走 ref2va：只有它吃 ref_audio（念稿 1:1 透传 + 口型同步）。
-				// 与末帧续接互斥时音频确定性优先——i2v 根本没有音频输入口。
+				// 段间引导与念稿音轨会抢同一个音频位（Audio 锚定 vs Audio 参考，
+				// fully_copy 语义还会把锚定音轨当念稿原样透传），所以台词镜不带引导。
 				req.Kind = "h3_r2v"
 				req.RefImages = refImgs
 				req.RefAudios = []string{dubPath}
-			case len(refImgs) > 0 && !continuity:
+				if ctxFrames > 0 {
+					log.Printf("[shotlist] 第 %d 镜是台词镜，按「音频确定性优先」关掉段间引导", sh.ID)
+					ctxFrames = 0
+					req.Frames = sh.Frames
+				}
+			case ctxFrames > 0:
+				// 连续镜：参考图与段间引导可以同时成立。
+				// AddGuide 是**追加** keyframe（读 positive 里已有的 minimax_keyframes），
+				// 不会覆盖 ref2va 的 minimax_refs —— 身份锁和运动续接都不丢。
+				if len(refImgs) > 0 {
+					req.Kind = "h3_r2v"
+					req.RefImages = refImgs
+				} else {
+					req.Kind = "h3" // fl2va 纯文生 + 前缀锚定
+				}
+				req.GuideClip = guideClip
+				req.GuideFrames = ctxFrames
+				req.GuideAudio = guideAudio
+				req.TrimHead = ctxFrames
+				req.Frames = genFrames
+			case len(refImgs) > 0:
 				// 有定妆图且不是续接镜：身份交给参考图（ref2va 自己管身份，
 				// 与 AddGuide 互斥，所以这里显式不让位首帧）
 				req.Kind = "h3_r2v"
@@ -733,6 +882,15 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			case continuity:
 				req.Kind = "h3_i2v"
 				req.Image = prevLastFrame
+			}
+
+			// v2v / rv2v：源视频优先于其它形态——它的语义是"改这段素材"，
+			// 不是"照提示词生成"。与段间引导并存时两者都喂：源片当 <Video 1>，
+			// 前缀当 keyframe（一个是内容基准，一个是接缝续接，互不冲突）。
+			if sourceVideo != "" {
+				req.Kind = "h3_r2v"
+				req.SourceVideo = sourceVideo
+				req.SourceStartFrame = srcStarts[i]
 			}
 
 			// Ref2VA 的 PDD 8 步尚未验证出收益（实测反而 3m40s/镜），先只给 FL2VA 用；
@@ -748,14 +906,53 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 			// 这是「失败重跑不重烧」的全部依据（见 shot_cache.go 的由来）：
 			// 原来文案承诺复用、代码却从没查过任何存储，一晚 6 次失败每次从第 1 镜重来。
 			cacheKey := ""
-			if !dialogue {
+			// 段间引导镜不吃缓存：画面取决于上一镜的尾巴，同一提示词两次结果不同，
+			// 命中缓存会把「续接」变成「回放上一次独立生成的片」。
+			// 二采同理：开关一变画面就变，而键里没有 refine 维度（加了要动批量那一份），
+			// 干脆不吃缓存，宁可多烧一次也不给错片。
+			if !dialogue && ctxFrames == 0 && req.RefineDenoise == 0 && sourceVideo == "" {
 				cacheKey = shotCacheKey(prompt, width, height, sh.Frames, shotSteps, backend, turbo, pdd)
 			}
 			reusedShot := false
+			// part 提到这里声明：选择运行会提前把缓存产物填进来，然后 continue。
+			var part string
+
+			// ---- 选择运行：只跑勾选的镜 ----
+			//
+			// 用途：改了第 3 镜的提示词想单独看效果，不想整片重烧。
+			// 规则很硬：没勾的镜**必须**能从镜头缓存取回，取不回就报错，绝不静默重烧——
+			// 静默重烧的代价是一次十几分钟的 GPU，而用户以为只跑了一镜。
+			//
+			// 不能复用的三类（都不进缓存）：台词镜（画面取决于当次 TTS 音轨）、
+			// 段间引导镜（取决于上一镜尾巴）、二采镜（缓存键里没有 refine 维度）。
+			if len(onlyShots) > 0 && !onlyShots[sh.ID] {
+				if reason := shotSkipBlocker(cacheKey); reason != "" {
+					return nil, fmt.Errorf("第 %d 镜未勾选，但它无法复用（%s）：请把它勾上", sh.ID, reason)
+				}
+				cached := shotCacheHit(cacheDir, cacheKey)
+				if cached == "" {
+					return nil, fmt.Errorf("第 %d 镜未勾选，但缓存里没有它的产物（提示词或参数变了）。"+
+						"先不带 only_shots 完整跑一次，再来做定点重跑", sh.ID)
+				}
+				part = cached
+				reusedCount++
+				gateNote := "未勾选，复用已落盘产物"
+				e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "reused", 0)
+				log.Printf("[shotlist] 第 %d 镜未勾选，复用缓存产物：%s", sh.ID, filepath.Base(cached))
+				finishShot(i, pass, sh, part, 0, 0, gateNote, nil, true, cacheKey)
+				// 复用也要更新"上一镜尾巴"，否则后面勾选的连续镜拿不到锚定素材
+				if i < len(plan.Shots)-1 && sh.Transition == "continue" {
+					prevPart = part
+					tmp := filepath.Join(os.TempDir(), fmt.Sprintf("flowedge-shot-%d-%d.png", time.Now().UnixNano(), sh.ID))
+					if err := extractLastFrame(part, tmp); err == nil {
+						prevLastFrame = tmp
+					}
+				}
+				continue
+			}
 
 			// 生成 + 段级门：台词段 ASR 验词，不过按 segment_retry 重跑
 			// （采样有随机性，重跑比放过一镜乱语便宜得多）。
-			var part string
 			var gerr error
 			var genElapsed time.Duration
 			attempts := 0
@@ -775,7 +972,8 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 				e.emitShotProgress(runID, node.ID, i, len(plan.Shots), sh.ID, "generating", 0)
 				genStart := time.Now()
 				// 看门狗：跑到「明显不可能正常完成」就掐断，别等节点预算烧完（见 shot_watchdog.go）
-				limit := ShotGenerationLimit(sh.Frames, width, height, shotSteps)
+				// 看门狗预算要把二采的步数算进去，否则开了精修的镜会被当成"超时"
+				limit := ShotGenerationLimit(req.Frames, width, height, shotSteps+refineSteps)
 				wd := armShotWatchdog(limit, func() {
 					logShotAborted(sh.ID, i+1, len(plan.Shots), limit)
 					e.interruptComfy()
@@ -816,15 +1014,25 @@ func (e *EngineV2) execShotListNode(ctx context.Context, node *model.NodeInstanc
 					return nil, fmt.Errorf("第 %d 镜生成失败（已完成 %d/%d 镜并已落盘）：%w",
 						sh.ID, len(results), len(plan.Shots), gerr)
 				}
+				// 段间引导：生成结果是「上一镜尾巴 + 本镜正文」，必须立刻裁掉前缀。
+				// 顺序关键——**先裁再验词**，否则上一镜的台词会被当成本镜重复念（误判不过）。
+				if req.TrimHead > 0 && part != "" {
+					body := filepath.Join(outDir, fmt.Sprintf("shot-%d-body-%d.mp4", sh.ID, time.Now().UnixNano()))
+					if terr := trimHeadFrames(part, body, req.TrimHead, sh.Frames, 24); terr != nil {
+						return nil, fmt.Errorf("第 %d 镜段间引导裁头失败（已烧 GPU，前缀无法去除）：%w", sh.ID, terr)
+					}
+					part = body
+					log.Printf("[shotlist] 第 %d 镜已裁掉段间引导前缀 %d 帧，正文 %d 帧", sh.ID, req.TrimHead, sh.Frames)
+				}
 				log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 生成完成，用时 %s（第 %d 次）",
 					i+1, len(plan.Shots), sh.ID, genElapsed.Round(time.Second), attempts)
 				// 慢镜就地喊一声：那一晚 27 倍慢没有任何一行日志提示，
 				// 用户只能连着重试，每次白烧 15 分钟（见 JudgeShotSpeed 注释）。
 				if freeMB, ferr := e.t2i.FreeVRAMMB(); ferr == nil {
-					if warn := JudgeShotSpeed(sh.Frames, width, height, steps, genElapsed, freeMB); warn != "" {
+					if warn := JudgeShotSpeed(req.Frames, width, height, steps, genElapsed, freeMB); warn != "" {
 						log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 异常慢：%s", i+1, len(plan.Shots), sh.ID, warn)
 					}
-				} else if warn := JudgeShotSpeed(sh.Frames, width, height, steps, genElapsed, 0); warn != "" {
+				} else if warn := JudgeShotSpeed(req.Frames, width, height, steps, genElapsed, 0); warn != "" {
 					log.Printf("[shotlist] 第 %d/%d 镜 shot=%d 异常慢：%s", i+1, len(plan.Shots), sh.ID, warn)
 				}
 				if !dialogue {
@@ -1341,4 +1549,174 @@ func appendNote(a, b string) string {
 		return a
 	}
 	return a + "；" + b
+}
+
+// firstPassGate 一采确认的门：开了确认就强制只跑一采，并且必须给固定 seed。
+//
+// 为什么 seed 是硬条件：第二遍要靠"同 seed → 同一次一采采样 → 命中 ComfyUI 节点缓存"
+// 才能只补二采。seed 随机时第二遍会把一采重采一遍，用户精修的就不再是他看过那版。
+func firstPassGate(refine float64, confirm bool, seed int64) (float64, int64, error) {
+	// 没开二采时"确认一采"没有意义：直接把参数原样放行，不拿 seed 卡人。
+	if !confirm || refine <= 0 {
+		return refine, seed, nil
+	}
+	if seed <= 0 {
+		return refine, seed, fmt.Errorf("开了「一采确认」就必须填 seed（正整数）：否则第二遍的一采是另一次随机采样，" +
+			"你精修的就不是刚才看过的那一版构图了")
+	}
+	return 0, seed, nil
+}
+
+// shotSkipBlocker 判断"未勾选的镜"能不能靠缓存复用；返回不能复用的原因（空 = 可以）。
+//
+// 不能复用的三类，都是因为缓存键里根本没有区分它们：
+//   - 台词镜：画面取决于当次 TTS 音轨（shot_cache.go 里显式不缓存）；
+//   - 段间引导镜：画面取决于上一镜尾巴；
+//   - 二采镜：键里没有 refine 维度。
+//
+// 让它们"按缓存跳过"就等于交一条画面不是用户要的片子，所以宁可报错。
+func shotSkipBlocker(cacheKey string) string {
+	if cacheKey != "" {
+		return ""
+	}
+	return "台词镜 / 段间引导镜 / 二采镜都不进缓存"
+}
+
+// parseShotSpec 解析 only_shots："2,3" / "2 3" / "2，3" / 空字符串。
+//
+// 接受中文逗号与顿号（用户手打时很自然会用），但**不猜**：任何解析不出的片段
+// 都直接报错。这条路径的失败代价不对称——猜错成"全都跑"要烧十几分钟 GPU，
+// 猜错成"一个都不跑"会得到一条空片。
+func parseShotSpec(v interface{}) (map[int]bool, error) {
+	out := map[int]bool{}
+	// 数字也接受（有人会在 API/MCP 里直接传 3 表示"只跑第 3 镜"），但不接受非整数：
+	// 2.5 当镜号是笔误，猜成 2 比报错危险得多。
+	if v != nil {
+		switch n := v.(type) {
+		case float64:
+			if n != float64(int(n)) || n <= 0 {
+				return nil, fmt.Errorf("only_shots 里的 %v 不是合法镜号（要正整数）", n)
+			}
+			out[int(n)] = true
+			return out, nil
+		case int:
+			if n <= 0 {
+				return nil, fmt.Errorf("only_shots 里的 %d 不是合法镜号（要正整数）", n)
+			}
+			out[n] = true
+			return out, nil
+		case string:
+			// 走下面的字符串解析
+		default:
+			return nil, fmt.Errorf("only_shots 类型不对：%T（要字符串或整数）", v)
+		}
+	}
+	s, ok := v.(string)
+	if !ok || strings.TrimSpace(s) == "" {
+		return out, nil
+	}
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case ',', '，', '、', ';', '；', ' ', '\t', '\n':
+			return true
+		}
+		return false
+	})
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// 逐字符校验而不是交给 Sscanf：Sscanf("%d") 会把 "2.5" 读成 2 且不报错，
+		// 于是"镜号写错了"变成"只跑了第 2 镜"，安静得可怕。
+		allDigits := true
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if !allDigits {
+			return nil, fmt.Errorf("only_shots 里的 %q 不是合法镜号：要写从 1 开始的整数，用逗号分隔（例如 2,3）", part)
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("only_shots 里的 %q 不是合法镜号：要写从 1 开始的整数，用逗号分隔（例如 2,3）", part)
+		}
+		out[n] = true
+	}
+	return out, nil
+}
+
+// sortedShotIDs 让日志与报错里的镜号顺序稳定（map 遍历是随机的，同一件事两次跑
+// 打出不同顺序会让人误以为计划变了）。
+func sortedShotIDs(m map[int]bool) []int {
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// nodeFloatLoose 同 nodeIntLoose，但取浮点（refine 的 denoise 是小数）。
+func nodeFloatLoose(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case string:
+		out := 0.0
+		if _, err := fmt.Sscanf(strings.TrimSpace(n), "%f", &out); err == nil {
+			return out, true
+		}
+	}
+	return 0, false
+}
+
+// nodeIntLoose 从节点 data 里宽松取整数：JSON 解出来是 float64，手写/测试里
+// 可能是 int 或字符串。取不到返回 ok=false —— 不替用户猜默认值。
+func nodeIntLoose(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case string:
+		out := 0
+		if _, err := fmt.Sscanf(strings.TrimSpace(n), "%d", &out); err == nil {
+			return out, true
+		}
+	}
+	return 0, false
+}
+
+// snapContextFrames 把上下文帧数对齐到官方 AddGuide 认的长度（5/22/39/56…）。
+//
+// 为什么必须对齐：AddGuide 拿到 21 帧会**自己往下削**到 5 帧
+// （`while guide_frames % 17 != 5: guide_frames -= 1`），于是「续接 22 帧」
+// 静默退化成「续接 5 帧」——画面看起来就是几乎没接上，且不报任何错。
+func snapContextFrames(n int) int {
+	if n >= 56 {
+		return 56
+	}
+	for _, c := range []int{39, 22, 5} {
+		if n >= c {
+			return c
+		}
+	}
+	return 5
+}
+
+// alignH3Frames 把帧数向上对齐到 H3 的 17k+5 网格（124 = 17*7+5）。
+func alignH3Frames(n int) int {
+	if n <= 5 {
+		return 5
+	}
+	return 5 + ((n-5+16)/17)*17
 }

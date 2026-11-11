@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# 同一分支的新推送会取消还在跑的旧任务：PR 连推时不必等上一版跑完
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   backend:
     name: Backend (Go)
@@ -15,10 +23,22 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
-      - name: Build
-        run: cd backend && go build ./...
+          check-latest: true
+      - name: Format
+        run: |
+          cd backend
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "这些文件没跑 gofmt："
+            echo "$unformatted"
+            exit 1
+          fi
       - name: Vet
         run: cd backend && go vet ./...
+      # 构建真正的可执行文件，而不是只 `go build ./...`：
+      # 后者不会链接 main 包，ldflags / 内嵌资源出问题在这里就能发现。
+      - name: Build binary
+        run: cd backend && go build -trimpath -o /tmp/flowedge .
       - name: Test
         run: cd backend && go test ./... -count=1
 
@@ -30,13 +50,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - name: Install
         run: cd frontend && npm ci
       - name: Type check
         run: cd frontend && npx tsc --noEmit
       - name: Unit tests
         # 零新增依赖：esbuild（vite 自带）打包 *.test.ts，node:test 执行。
-        # 其中包含前后端契约测试（后端节点类型必须出现在调色板里）。
+        # 流水线字段契约测试在后端（backend/service/pipeline_test.go），不在这里。
         run: cd frontend && npm test
       - name: Build
         run: cd frontend && npm run build
@@ -51,3 +73,9 @@ jobs:
           python-version: "3.11"
       - name: film-gates self-check
         run: python scripts/film-gates.py --help >/dev/null && echo "film-gates importable"
+      # 90 个脚本不可能都在 CI 里跑（要 GPU / 素材 / 权重），但语法腐烂可以先拦住
+      - name: Scripts syntax
+        run: python -m compileall -q scripts && echo "scripts compile"
+      # 公开仓库的底线：不放用户名、邮箱、局域网 IP、密钥、日志和内部笔记
+      - name: Privacy scan
+        run: python scripts/privacy-scan.py

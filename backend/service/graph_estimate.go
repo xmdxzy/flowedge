@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"encoding/json"
@@ -37,10 +37,10 @@ type EstimateLine struct {
 type GraphEstimate struct {
 	OptimisticSec float64 `json:"optimistic_sec"` // 最乐观（热实例、无重试）
 	P50Sec        float64 `json:"p50_sec"`
-	P90Sec        float64 `json:"p90_sec"`        // 含冷加载
-	WorstSec      float64 `json:"worst_sec"`      // 硬上限：各节点超时预算之和
-	ColdLoadSec   float64 `json:"cold_load_sec"`  // P90 里含的冷加载部分
-	VramPeakMB    int     `json:"vram_peak_mb"`   // 峰值取最大值，不是求和（单侧驻留）
+	P90Sec        float64 `json:"p90_sec"`       // 含冷加载
+	WorstSec      float64 `json:"worst_sec"`     // 硬上限：各节点超时预算之和
+	ColdLoadSec   float64 `json:"cold_load_sec"` // P90 里含的冷加载部分
+	VramPeakMB    int     `json:"vram_peak_mb"`  // 峰值取最大值，不是求和（单侧驻留）
 
 	Lines     []EstimateLine `json:"lines"`
 	Uncertain []string       `json:"uncertain,omitempty"`
@@ -81,6 +81,7 @@ func estimateFloat(n *model.NodeInstance, key string, def float64) float64 {
 	}
 	return def
 }
+
 // clampArea 面积缩放系数，夹在 [0.25, 6]，防止 4K/320 这类极端把估算拉爆。
 func clampArea(v float64) float64 {
 	if v <= 0 || math.IsNaN(v) {

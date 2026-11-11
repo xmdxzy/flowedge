@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -820,7 +819,7 @@ func (s *VideoService) ComposeVideoMulti(imagePaths []string, audioPath string, 
 
 	args = append(args, outputPath)
 
-	cmd := exec.CommandContext(ctx, s.FFmpegPath, args...)
+	cmd := hiddenExecContext(ctx, s.FFmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -832,7 +831,7 @@ func (s *VideoService) ComposeVideoMulti(imagePaths []string, audioPath string, 
 }
 
 func (s *VideoService) AddSubtitles(videoPath string, subtitlePath string, outputPath string) error {
-	cmd := exec.Command(s.FFmpegPath,
+	cmd := hiddenExec(s.FFmpegPath,
 		"-y", "-i", videoPath,
 		"-vf", fmt.Sprintf("subtitles=%s", subtitlePath),
 		"-c:a", "copy",

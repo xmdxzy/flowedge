@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"sync"
@@ -228,7 +227,7 @@ func (s *GPUScheduler) gpuInfoLocked() (*GPUInfo, error) {
 // Windows Terminal 后，任何未声明 CREATE_NO_WINDOW 的控制台子进程
 // 都会被系统重新拉起一个 Windows Terminal 窗口——每 5 秒闪一次黑框。
 func (s *GPUScheduler) queryGPU() (*GPUInfo, error) {
-	cmd := exec.Command("nvidia-smi",
+	cmd := hiddenExec("nvidia-smi",
 		"--query-gpu=memory.total,memory.used,memory.free,utilization.gpu",
 		"--format=csv,noheader,nounits")
 	cmd.SysProcAttr = hiddenWindowAttr()

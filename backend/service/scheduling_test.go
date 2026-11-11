@@ -279,6 +279,8 @@ func sideConstValue(ident string) string {
 		return sideLanguage
 	case "sideAudio":
 		return sideAudio
+	case "sideMusic":
+		return sideMusic
 	}
 	return ""
 }

@@ -42,6 +42,13 @@ const (
 	sideDiffusion = "diffusion" // ComfyUI：flux / qwen-image / 视频
 	sideLanguage  = "language"  // Ollama：LLM / VLM
 	sideAudio     = "audio"     // faster-whisper / Kokoro
+	// sideMusic ACE-Step 1.5（XL 权重约 9GB，运行时再叠加 VAE / LM）。
+	//
+	// 为什么单独开一侧而不是并进 sideAudio：TTS 在 GPU 上能驻留 15–20GB，
+	// 与 9–12GB 的音乐侧在同一张 24GB 卡上装不下。并进 audio 的话
+	// 「先配音、后出 BGM」这条最常见的顺序不会触发换侧 ⇒ 直接 OOM，
+	// 而日志里两边都「正常」。分开两侧才逼出一次真实的卸载。
+	sideMusic = "music"
 )
 
 // arbiter 懒初始化显存仲裁器。
@@ -80,9 +87,9 @@ func nodeSide(nodeType string) string {
 	return ""
 }
 
-// sideOrder 重任务组的执行顺序：扩散（最重、冷启动最贵）→ 语言 → 语音。
+// sideOrder 重任务组的执行顺序：扩散（最重、冷启动最贵）→ 语言 → 语音 → 音乐。
 // 固定顺序而非按数量排序：避免每次运行顺序漂移，行为可预期才敢无人值守。
-var sideOrder = []string{sideDiffusion, sideLanguage, sideAudio}
+var sideOrder = []string{sideDiffusion, sideLanguage, sideAudio, sideMusic}
 
 const (
 	// vramCoexistMargin 共存判断的安全余量。
@@ -165,6 +172,8 @@ func (e *EngineV2) enterSide(side string) func() {
 			// 语音侧必须先卸：Breeze TTS 2 实测驻留 15–20GB，不腾出来，
 			// 下面那句「等 16GB 空闲」必然空转满 12 秒然后继续带病前进。
 			e.releaseAudioSide("进扩散侧")
+			// 音乐侧同理（ACE-Step XL 约 9GB）：它没有 /unload，只能停进程。
+			e.releaseMusicSide("进扩散侧")
 			// 关键：Ollama 的卸载返回 ≠ 显存归还（实测要几秒），不等等它，
 			// 扩散模型一进来就是「卸载了但没释放」→ OOM。
 			if e.llm != nil {
@@ -182,6 +191,7 @@ func (e *EngineV2) enterSide(side string) func() {
 			// 语音侧同理：Ollama 14B（≈9GB）与 TTS 的 15GB 在 24G 卡上装不下，
 			// 共存判断只覆盖了扩散↔语言这一对，语音这一侧没人管过。
 			e.releaseAudioSide("进语言侧")
+			e.releaseMusicSide("进语言侧")
 		case sideAudio:
 			// 语音两侧都让位（whisper large-v3 也要 3GB）
 			if e.releaseDiffusionAndWait("进语音侧") {
@@ -190,6 +200,18 @@ func (e *EngineV2) enterSide(side string) func() {
 			if e.llm != nil {
 				e.llm.UnloadAllLoaded()
 			}
+			e.releaseMusicSide("进语音侧")
+		case sideMusic:
+			// 音乐侧要 9–12GB：扩散、语言、语音三侧全部让位。
+			// 顺序有讲究——先卸最贵的扩散（它有真实的 /free 与等待），
+			// 再卸语言，最后卸语音，免得「卸了语音又去等 16GB 空闲」白等。
+			if e.releaseDiffusionAndWait("进音乐侧") {
+				a.unloads++
+			}
+			if e.llm != nil {
+				e.llm.UnloadAllLoaded()
+			}
+			e.releaseAudioSide("进音乐侧")
 		}
 		a.lastSide = side
 	}
@@ -267,6 +289,30 @@ func (e *EngineV2) releaseAudioSide(reason string) {
 		return
 	}
 	log.Printf("[vram] 释放语音侧显存（%s）：TTS 不可达，跳过", reason)
+}
+
+// releaseMusicSide 让音乐服务把显存交出来。
+//
+// ACE-Step **没有 /unload 端点**（只有每个任务结束后的 _empty_cache，
+// 权重仍驻留），所以这里只有一条路：停托管进程。冷启动代价是重新载入
+// 9GB XL 权重 + LM（本机实测 3–5 分钟），因此只在真的要换侧时才调——
+// 不是「每次出片都顺手停一下」。
+//
+// 与 TTS 的区别：TTS 有 /unload（进程保留、只丢权重），音乐没有。
+// 别为了「看起来一致」给 MusicService 造一个假 Unload —— 那正是
+// Breeze TTS「假卸载」踩过的坑（AGENTS §0.16 那条 2026-10-28 记录）。
+func (e *EngineV2) releaseMusicSide(reason string) {
+	if e.music == nil || e.deps == nil {
+		return
+	}
+	if !e.deps.Healthy("acestep") {
+		return // 本来就没起，别为它惊动进程
+	}
+	if err := e.deps.Stop("acestep"); err != nil {
+		log.Printf("[vram] 释放音乐侧显存（%s）：停服务失败：%v", reason, err)
+		return
+	}
+	log.Printf("[vram] 释放音乐侧显存（%s）：已停 ACE-Step 进程（无 /unload，只能停进程）", reason)
 }
 
 // waitVRAMFree 等显存真的回来（目标 minFreeMB，最多 timeout）。

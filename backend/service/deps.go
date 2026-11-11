@@ -144,8 +144,36 @@ type depsFile struct {
 		// 之前这个键只给 Python 服务自己读，Go 侧解析不到 ⇒ 队列只能一刀切按 GPU 串行。
 		Device string `json:"device"`
 	} `json:"tts"`
-	// IdleRelease 空闲显存回收（2026-10-28）。
+	// Acestep 段：ACE-Step 1.5 音乐生成服务（本地 GPU，XL 权重约 9GB）。
 	//
+	// 与 TTS 段的差别（别照抄 TTS 的字段就不看差异）：
+	//   - 没有 idle_unload：上游服务不提供 /unload，释放显存只能停进程，
+	//     所以「空闲卸载」由引擎侧的 idle_release 统一管（它会 Stop 本服务）；
+	//   - model/lm_model/lm_backend 是**模型选择**：XL turbo 8 步是日常档，
+	//     xl-sft 质量更高但要 50 步（慢一个数量级）。
+	Acestep struct {
+		Home      string `json:"home"`
+		Script    string `json:"script"`
+		Python    string `json:"python"`
+		Port      string `json:"port"`
+		BaseURL   string `json:"base_url"`
+		Autostart bool   `json:"autostart"`
+		Model     string `json:"model"`
+		LMModel   string `json:"lm_model"`
+		LMBackend string `json:"lm_backend"`
+		Device    string `json:"device"`
+		// InitLLM 是否在服务启动时就初始化 5Hz LM（auto/true/false）。
+		//
+		// 默认 false：2026-11-03 实测，预载 LM 要多付 3.4GB 权重 + 49s tokenizer，
+		// 而**纯音乐（BGM）根本不用它**——请求里已经把 use_cot_caption /
+		// use_cot_language 关掉了。需要「写歌 / 带歌词」时改成 auto 或 true。
+		InitLLM string `json:"init_llm"`
+		// CheckpointsDir 权重目录（默认 D:/AI/Models/ace-step）。
+		// 项目规则：权重只放 D:/AI/Models，仓库目录不存模型。
+		CheckpointsDir string `json:"checkpoints_dir"`
+	} `json:"acestep"`
+
+	// IdleRelease 空闲显存回收（2026-10-28）。	//
 	// 用户的原话是「无任务时释放我的显存啊，flowedge 白白占用了那么多」。
 	// 这一段的语义：**连续 after_seconds 秒没有任何 GPU 活 → 把托管模型的权重
 	// 还回显存**（/unload、/free 都保留进程，下次只付权重加载）。
@@ -228,6 +256,35 @@ func LoadDepsFile() depsFile {
 func TTSBaseURL() string {
 	return strings.TrimSpace(LoadDepsFile().TTS.BaseURL)
 }
+
+// MusicBaseURL 从配置里取音乐服务地址（缺省端口 8104）。
+func MusicBaseURL() string {
+	if v := strings.TrimSpace(os.Getenv("MUSIC_BASE_URL")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(LoadDepsFile().Acestep.BaseURL)
+}
+
+// acestepWorkRoot 给 ACE-Step 一个「派生进程写得进去」的项目根。
+//
+// 不能直接用 D:/AI/ACE-Step-1.5：它的 .cache/acestep/local_redis 是 sqlite，
+// 引擎派生进程写进去会报 readonly（实测），和 H3 的 output 目录同一个坑。
+// 放在 <cwd>/data/acestep 下（cwd = 部署目录），随部署目录一起可写。
+func acestepWorkRoot() string {
+	if v := strings.TrimSpace(os.Getenv("ACESTEP_PROJECT_ROOT")); v != "" {
+		return v
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		wd = "."
+	}
+	root := filepath.Join(wd, "data", "acestep")
+	_ = os.MkdirAll(filepath.Join(root, ".cache", "acestep"), 0o755)
+	return filepath.ToSlash(root)
+}
+
+// DefaultMusicBaseURL 音乐服务的缺省地址（与 deps.go 里推导出的端口一致）。
+const DefaultMusicBaseURL = "http://127.0.0.1:8104"
 
 // NewSupervisor 依据配置构造依赖规格；comfyBase/asrBase 用于推导端口
 func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
@@ -487,6 +544,79 @@ func NewSupervisor(comfyBase, asrBase, ttsBase string) *Supervisor {
 		Hint:       ttsHint,
 	}
 
+	// ---- ACE-Step 1.5（音乐生成，GPU）----
+	//
+	// 与 TTS 的托管契约几乎一样：一个 python 脚本 + HTTP /health + 固定端口。
+	// 三个**必须知道**的差异：
+	//   1. 冷加载更贵（9GB XL 权重 + LM，实测 3–5 分钟）⇒ readyTimeout 单独给 600s；
+	//   2. 没有 /unload ⇒ 换侧只能停进程（见 vram.go releaseMusicSide）；
+	//   3. 权重目录必须指到 D:/AI/Models（ACESTEP_CHECKPOINTS_DIR），
+	//      否则它会往仓库目录里下 10GB+ —— 项目规则禁止在项目目录存权重。
+	acestepHome := firstNonEmpty(os.Getenv("ACESTEP_HOME"), conf.Acestep.Home, "D:/AI/ACE-Step-1.5")
+	acestepScriptName := firstNonEmpty(os.Getenv("ACESTEP_SCRIPT"), conf.Acestep.Script, "acestep/api_server.py")
+	acestepScript := acestepScriptName
+	if !filepath.IsAbs(acestepScriptName) {
+		acestepScript = filepath.Join(acestepHome, acestepScriptName)
+	}
+	acestepPython := firstNonEmpty(os.Getenv("ACESTEP_PYTHON"), conf.Acestep.Python, detectVenvPython(acestepHome))
+	musicBase := firstNonEmpty(os.Getenv("MUSIC_BASE_URL"), conf.Acestep.BaseURL, DefaultMusicBaseURL)
+	acestepPort := portFromURL(musicBase, "8104")
+	if p := strings.TrimSpace(conf.Acestep.Port); p != "" {
+		acestepPort = p
+	}
+	acestepHint := ""
+	if _, err := os.Stat(acestepScript); err != nil {
+		acestepHint = "未找到 ACE-Step（需 " + acestepHome + " 下有 acestep/api_server.py）：" +
+			"克隆 https://github.com/ace-step/ACE-Step-1.5 并在该目录 uv sync 后重试"
+	}
+	acestepModel := firstNonEmpty(os.Getenv("ACESTEP_CONFIG_PATH"), conf.Acestep.Model, "acestep-v15-xl-turbo")
+	acestepLM := firstNonEmpty(os.Getenv("ACESTEP_LM_MODEL_PATH"), conf.Acestep.LMModel, "acestep-5Hz-lm-1.7B")
+	acestepLMBackend := firstNonEmpty(os.Getenv("ACESTEP_LM_BACKEND"), conf.Acestep.LMBackend, "vllm")
+	acestepCkpt := firstNonEmpty(os.Getenv("ACESTEP_CHECKPOINTS_DIR"), conf.Acestep.CheckpointsDir, "D:/AI/Models/ace-step")
+	acestepEnv := append(os.Environ(),
+		"ACESTEP_API_PORT="+acestepPort,
+		"ACESTEP_API_HOST=127.0.0.1",
+		"ACESTEP_CHECKPOINTS_DIR="+acestepCkpt,
+		// 项目根指向**工作区**：ACE-Step 会在 <project_root>/.cache/acestep 下建
+		// diskcache（sqlite）+ tmp。2026-11-03 实测：引擎派生进程对 D:/AI 写不了
+		// （sqlite 报 `attempt to write a readonly database`，最后 `Application
+		// startup failed`），而同一个命令在 agent 的 job 里跑就正常——和 H3
+		// SaveVideo 写 D:/AI/ComfyUI/output 报 PermissionError 是同一类问题
+		// （AGENTS §0.16 那条 2026-10-27）。权重目录仍指 D:/AI/Models（只读，没问题）。
+		"ACESTEP_PROJECT_ROOT="+acestepWorkRoot(),
+		"ACESTEP_CONFIG_PATH="+acestepModel,
+		"ACESTEP_LM_MODEL_PATH="+acestepLM,
+		"ACESTEP_LM_BACKEND="+acestepLMBackend,
+		"ACESTEP_DEVICE="+firstNonEmpty(os.Getenv("ACESTEP_DEVICE"), conf.Acestep.Device, "auto"),
+		// 默认 false：BGM 不需要 LM，预载它只会让冷启动多等 4GB + 49s
+		"ACESTEP_INIT_LLM="+firstNonEmpty(os.Getenv("ACESTEP_INIT_LLM"), conf.Acestep.InitLLM, "false"),
+		// 权重已在本机时别再联网查更新
+		"HF_HUB_OFFLINE="+firstNonEmpty(os.Getenv("HF_HUB_OFFLINE"), "1"),
+		// HF_HOME 必须指到**工作区内**：引擎派生进程对工作区外（D:/AI、E:/caches）没有写权限，
+		// 而 transformers 加载 sft 权重的 trust_remote_code 动态模块时要往
+		// <HF_HOME>/modules/transformers_modules 写文件。2026-11-04 实测：
+		// 沿用全局 HF_HOME=E:/caches/huggingface 会 WinError 5 直接初始化失败，
+		// 换到工作区后正常（turbo 能跑只是因为它那份模块早在 11-03 就缓存好了、只读命中）。
+		"HF_HOME="+filepath.ToSlash(filepath.Join(acestepWorkRoot(), "hf-home")),
+		"TRANSFORMERS_CACHE="+filepath.ToSlash(filepath.Join(acestepWorkRoot(), "hf-home", "transformers")),
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONUTF8=1",
+	)
+	s.specs["acestep"] = &DepSpec{
+		Name:       "acestep",
+		Label:      "音乐生成（ACE-Step 1.5 XL）",
+		Binary:     acestepPython,
+		Args:       []string{acestepScript},
+		WorkDir:    acestepHome,
+		Env:        acestepEnv,
+		Endpoint:   normalBase(musicBase),
+		HealthPath: "/health",
+		// 默认不常驻：9GB 权重挂在卡上会挤掉 H3 的 20.5GB。用到再起，
+		// 用完由引擎侧 idle_release / 换侧停进程回收。
+		Autostart: conf.Acestep.Autostart,
+		Hint:      acestepHint,
+	}
+
 	// ---- Ollama（语言侧）----
 	//
 	// 为什么把它也收进托管：video 的提示词优化、image_batch 的拆镜、film 的分镜规划
@@ -600,8 +730,10 @@ func looksLikeScriptPath(arg string) bool {
 // ensureTempEnv 给托管进程指定一个**确定可写**的临时目录。
 //
 // 由来（2026-10-26 现场）：引擎拉起的 ComfyUI-H3 一起就退，日志里是
-//   FileNotFoundError: No usable temporary directory found in
-//   ['C:\Users\...\AppData\Local\Temp', 'C:\Users\...\AppData\Local\Temp\2']
+//
+//	FileNotFoundError: No usable temporary directory found in
+//	['<用户临时目录>', '<用户临时目录>\2']
+//
 // 而用同一个 venv 的 python 从交互 shell 跑完全正常（连 `import torch._dynamo` 都过）。
 // 也就是说：不是 torch/权重坏了，是**引擎派生的这个子进程在 %TEMP% 里建不了文件**。
 // 这类"父进程能写、子进程不能写"的差异不值得继续猜（job 对象 / 令牌 / 安全软件都可能），
@@ -695,7 +827,7 @@ func (s *Supervisor) Start(name string) error {
 		// 这种最常见的路径必然报「3s 内未就绪」。
 		return s.WaitReady(name, readyTimeout(name))
 	}
-	cmd := exec.Command(spec.Binary, spec.Args...)
+	cmd := hiddenExec(spec.Binary, spec.Args...)
 	cmd.Dir = spec.WorkDir
 	// 临时目录必须在**上锁之前**备好（ensureTempEnv 会建目录，可能慢一拍）。
 	tmpEnv := ensureTempEnv(spec.Env)
@@ -798,6 +930,7 @@ func (s *Supervisor) attachDepLog(cmd *exec.Cmd, name string) *os.File {
 //   - /api/deps 全部挂住（20s+ 不返回）
 //   - /api/deps/comfy_h3/start 返回 202，但再也不派生任何进程
 //   - /api/health、/api/runs 却完全正常（它们不碰这把锁）
+//
 // 所以：**"服务起不来"先怀疑锁，别往模型/权重上找**。
 // 这里留成无锁纯函数，是让 Start 能安全地在锁内调用。
 func depLogHandleAt(cmd *exec.Cmd, name, path string) *os.File {
@@ -912,7 +1045,7 @@ func (s *Supervisor) Status() []DepStatus {
 	sort.Strings(names)
 	for _, n := range names {
 		spec := s.specs[n]
-	healthy := s.Healthy(n)
+		healthy := s.Healthy(n)
 		st := DepStatus{
 			Name:      spec.Name,
 			Label:     spec.Label,
@@ -1127,7 +1260,7 @@ func hasSageAttention(python string) bool {
 	// 实测该 venv 里 `import torch + sageattention` 要 6.5s，超时给短了会误判成「没装」
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, python, "-c", "from sageattention import sageattn")
+	cmd := hiddenExecContext(ctx, python, "-c", "from sageattention import sageattn")
 	cmd.SysProcAttr = hiddenWindowAttr()
 	return cmd.Run() == nil
 }
@@ -1183,6 +1316,13 @@ func readyTimeout(name string) time.Duration {
 		return 180 * time.Second // 独立 venv + 20GB 权重，实测冷启 ~50s
 	case "comfy_moss":
 		return 300 * time.Second // 实测冷启 ~130s（988 节点注册 + torch 2.14 导入），180s 会误判失败
+	case "acestep":
+		// ACE-Step XL 的冷启动**比 README 说的 3–5 分钟长得多**。
+		// 2026-11-03 本机实测（3090 24GB）：进程拉起 ~40s → 主模型 4 个 shard
+		// 载入 ~3 分钟 → LM tokenizer 49s → LM 权重 → 首次生成，全程 **15 分钟以上**。
+		// 其中很大一块是「它自己又去 ModelScope 校验/补下 29 个文件」。
+		// 1200s 覆盖这条最坏路径；探活成功会立刻返回，放宽不等于真等满。
+		return 1200 * time.Second
 	default:
 		return 120 * time.Second
 	}

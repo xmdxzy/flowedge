@@ -1,0 +1,19 @@
+{
+  "shots": [
+    {
+      "id": 1,
+      "frames": 107,
+      "prompt": "integrated_multimodal_description: [Shot 1] High-end commercial product photography, a dark minimal studio, a matte grey stone plinth, a seamless charcoal wall falling into black behind it, a narrow directional key light raking in from the upper right and one very weak fill from the left tracing the silhouette. Macro framing on a round stainless steel mechanical watch resting at the centre of the plinth, the polished bezel edge holding one sharp highlight, a deep navy sunburst dial fanning radial sheen as the angle changes, an uncoated sapphire crystal clear and glare free, slim sword hands set at ten past ten, a recessed sub dial at six o'clock, a brown calfskin strap curving down onto the stone, every visible surface reading as bare brushed metal, clear glass and unprinted leather. The camera advances slowly and steadily, the sub dial hand ticking eight times a second, the crown turning out under an unseen force, a fine ratchet click on every turn. overall_soundscape: An extremely clean studio room tone, tight and dry, a regular high frequency mechanical tick marking every step. non_diegetic_music: N/A"
+    },
+    {
+      "id": 2,
+      "frames": 107,
+      "prompt": "integrated_multimodal_description: [Shot 2] At 00:04.000, the shot cuts to a floating exploded view, the camera orbiting slowly around the watch as it rises vertically and splits into exactly five components: the sapphire crystal lifts first, the navy dial and hands rise above it and spread flat, revealing the movement beneath, where the balance wheel swings at a constant frequency, the gear train turns in mesh, the mainspring barrel releases slowly. Each separated component holds its own position in the air, thin white leader lines running from each one out to a numbered callout above it. One line of white text appears beside the floating assembly reading \"72H Power Reserve\" in a slim semibold sans. overall_soundscape: A faint airflow and the fine metallic friction of parts separating, then the soft rhythmic swing of the balance wheel and the low tension of the releasing mainspring. non_diegetic_music: Sparse low synth tones at a slow tempo, a few cool metallic pings, density rising as the movement opens. "
+    },
+    {
+      "id": 3,
+      "frames": 73,
+      "prompt": "integrated_multimodal_description: [Shot 3] At 00:08.500, the shot cuts to an extreme close up of the balance wheel at very shallow depth of field, the camera locked off and still. The five separated components draw inward in order, the movement seats first, the dial returns above it, the crystal settles last and the watch closes into one whole case, its polished bezel edge passing one clean highlight as it settles. The watch rests back on the stone plinth, the strap folding around the wrist support, the clasp meeting with a crisp metal click, the sub dial hand still ticking evenly, and the image fades to black. overall_soundscape: Tight mechanical seating sounds in quick succession, one soft glass chime as the crystal settles, then the crisp clasp click and the tick of the movement trailing away into silence. non_diegetic_music: The synth bed thins to a single sustained note, resolving on the clasp click and fading out. "
+    }
+  ]
+}

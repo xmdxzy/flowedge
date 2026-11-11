@@ -14,12 +14,13 @@ import (
 //   - /api/deps 全部挂住（20s+ 不返回）
 //   - /api/deps/comfy_h3/start 返回 202，但再也不派生任何进程
 //   - /api/health、 /api/runs 却完全正常（它们不碰这把锁）
+//
 // 结论：**"服务起不来"要先看是不是锁**，不要往模型/权重上找。
 func TestDepLogHandleAt_DoesNotTakeSupervisorLock(t *testing.T) {
 	s := NewSupervisor("", "", "")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "probe.log") // Start 在锁外先算好 path
-	s.mu.Lock()                              // 模拟 Start 的持锁状态
+	s.mu.Lock()                             // 模拟 Start 的持锁状态
 	done := make(chan struct{})
 	go func() {
 		f := depLogHandleAt(exec.Command("cmd", "/c", "echo", "x"), "probe", path)

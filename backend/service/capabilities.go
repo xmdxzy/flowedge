@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -28,17 +29,20 @@ type Capability struct {
 
 // Capabilities 部署环境能力矩阵
 type Capabilities struct {
-	OS      string          `json:"os"`
-	BaseDir string          `json:"base_dir"`
-	GPU     Capability      `json:"gpu"`
-	Ollama  Capability      `json:"ollama"`
-	ComfyUI Capability      `json:"comfyui"`
-	ComfyH3 Capability      `json:"comfy_h3"` // H3 独立实例（音视频联合生成，端口 8189）
-	Vision  Capability      `json:"vision"`
-	FFmpeg  Capability      `json:"ffmpeg"`
-	ASR     Capability      `json:"asr"`
-	TTS     Capability      `json:"tts"`
-	Ready   map[string]bool `json:"ready"` // llm / image / h3 / comfy / audio / video / vision
+	OS      string     `json:"os"`
+	BaseDir string     `json:"base_dir"`
+	GPU     Capability `json:"gpu"`
+	Ollama  Capability `json:"ollama"`
+	ComfyUI Capability `json:"comfyui"`
+	ComfyH3 Capability `json:"comfy_h3"` // H3 独立实例（音视频联合生成，端口 8189）
+	Vision  Capability `json:"vision"`
+	FFmpeg  Capability `json:"ffmpeg"`
+	ASR     Capability `json:"asr"`
+	TTS     Capability `json:"tts"`
+	// Music ACE-Step 1.5 音乐生成（端口 8104）。共享 CPU/GPU，与 TTS 一样
+	// 属于「没起也能一键拉起」的托管依赖，预检只把它当提示不当硬拦。
+	Music   Capability      `json:"music"`
+	Ready   map[string]bool `json:"ready"` // llm / image / h3 / comfy / audio / video / vision / music
 	Missing []string        `json:"missing"`
 }
 
@@ -232,6 +236,22 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, comfyH
 		setOK(&caps.TTS, c)
 	}()
 
+	// 音乐生成（ACE-Step 1.5）：本地 GPU 服务，缺省 8104。
+	// 探测地址不走签名参数（ProbeCapabilities 有多个调用点与测试），
+	// 统一按「环境变量 > deps.json > 默认」解析，与 main.go 的装配口径一致。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		musicBase := firstNonEmpty(os.Getenv("MUSIC_BASE_URL"), MusicBaseURL(), DefaultMusicBaseURL)
+		c := Capability{Endpoint: musicBase, Hint: "音乐生成服务未启动：ACE-Step 1.5 需要 D:/AI/ACE-Step-1.5 已 uv sync 且权重在 D:/AI/Models/ace-step。勾选「自动配乐」时引擎会按需拉起它（冷加载 3–5 分钟）"}
+		if ok, _ := httpGetBody(musicBase + "/health"); ok != nil {
+			c.OK = true
+			c.Hint = ""
+			c.Detail = "已连接"
+		}
+		setOK(&caps.Music, c)
+	}()
+
 	wg.Wait()
 
 	// image / h3 / comfy 三者语义必须分开，否则会重演两种假状态（AGENTS §0.6）：
@@ -254,10 +274,12 @@ func ProbeCapabilities(gpu *GPUScheduler, baseDir, ollamaBase, comfyBase, comfyH
 		"tts":    caps.TTS.OK,
 		"video":  caps.FFmpeg.OK,
 		"vision": caps.Vision.OK,
+		"music":  caps.Music.OK,
 	}
 	for name, ok := range caps.Ready {
-		// asr/tts 是 audio 的分项诊断，不再重复计进 missing，避免缺项清单噪音
-		if !ok && name != "asr" && name != "tts" {
+		// asr/tts 是 audio 的分项诊断，不再重复计进 missing，避免缺项清单噪音。
+		// music 同理：绝大多数出片不需要 BGM，缺它不该让每次预检都报一条红字。
+		if !ok && name != "asr" && name != "tts" && name != "music" {
 			caps.Missing = append(caps.Missing, name)
 		}
 	}

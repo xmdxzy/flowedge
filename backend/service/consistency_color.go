@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 )
@@ -35,7 +34,7 @@ func clipChroma(path string) (u, v float64, ok bool) {
 		"-vf", "fps=2,signalstats,metadata=print",
 		"-f", "null", "-",
 	}
-	out, _ := exec.Command(ffmpegBin(), args...).CombinedOutput()
+	out, _ := hiddenExec(ffmpegBin(), args...).CombinedOutput()
 	if len(out) == 0 {
 		return 0, 0, false
 	}

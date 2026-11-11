@@ -65,7 +65,8 @@ PRESETS = {
     },
     "kokoro": {
         "script": "tts_kokoro_server.py",
-        "python": "C:/Users/Administrator/Desktop/flowedge/运行/local-services/.venv/Scripts/python.exe",
+        # 解释器从仓库位置推：<repo>/运行/local-services/.venv/...，换机器不用改文件
+        "python": os.path.join(SERVICES, ".venv", "Scripts", "python.exe"),
         "port": "8102",
         "base_url": "http://127.0.0.1:8102",
         "autostart": False,

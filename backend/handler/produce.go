@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -253,6 +255,153 @@ func (p *Producer) GetManifest(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, m)
+}
+
+// ResumeRun 从断点续跑一条被中断的运行（V3 加固）。
+//
+// 由来（2026-10-31 实测）：引擎被外部终止两次（10:04 / 10:11），每次 run 都被标成
+// failed 且「可续跑」只写在错误文案里——没有任何入口能真的续跑，一支跑了 10 分钟的片子
+// 直接作废。现在：
+//   - 中断的 run 标 interrupted（见 queue.RecoverInterrupted）
+//   - 这个接口按 node_states 把「没成功的节点」重置为 pending，成功的保留产物
+//   - 复用同一张图（WorkflowID 里的 nodes/edges），不重新组装参数
+//
+// 刻意不自动续跑：中断时显存/依赖状态未知，自动重试可能连撞两次。
+func (p *Producer) ResumeRun(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("runId"), 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "run id 不合法"})
+		return
+	}
+	var run model.WorkflowRun
+	if err := p.db.First(&run, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "运行记录不存在", "run_id": id})
+		return
+	}
+	switch run.Status {
+	case "interrupted", "failed", "cancelled":
+		// 可续跑
+	default:
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  "只有被中断/失败/取消的运行可以续跑（当前 " + run.Status + "）",
+			"run_id": id,
+		})
+		return
+	}
+	if run.WorkflowID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":  "这条运行没有可复用的工作流定义，请用 POST /api/runs/:id/rerun 重新提交",
+			"run_id": id,
+		})
+		return
+	}
+	var wf model.Workflow
+	if err := p.db.First(&wf, run.WorkflowID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":  "工作流定义已被清理（质量循环的临时图跑完即删），请用 rerun 重新提交",
+			"run_id": id, "workflow_id": run.WorkflowID,
+		})
+		return
+	}
+
+	if p.engine == nil {
+		// 顺序刻意放在最后：状态/工作流问题比「引擎没起来」更具体。
+		// 反例（测试抓到）：先报 503 会让用户以为是自己环境坏了，去重启引擎白折腾。
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "引擎未初始化，无法续跑"})
+		return
+	}
+	var prev []model.NodeInstance
+	if len(run.NodeStates) > 0 {
+		if err := json.Unmarshal(run.NodeStates, &prev); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "上次节点状态不可解析：" + err.Error()})
+			return
+		}
+	}
+	// 只重置「没成功」的节点；成功的保留 Output，引擎会按其状态跳过。
+	reused := 0
+	for i := range prev {
+		if prev[i].Status == "success" {
+			reused++
+			continue
+		}
+		prev[i].Status = "pending"
+		prev[i].Error = ""
+		prev[i].ErrorCode = ""
+		prev[i].StartedAt = nil
+		prev[i].EndedAt = nil
+	}
+
+	now := time.Now()
+	run.Status = "running"
+	run.Error = ""
+	run.StartedAt = &now
+	run.EndedAt = nil
+	if err := p.db.Save(&run).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "运行记录更新失败：" + err.Error()})
+		return
+	}
+	job := model.Job{RunID: run.ID, WorkflowID: run.WorkflowID, Status: "pending", Trigger: "resume", CreatedAt: now}
+	p.db.Create(&job)
+
+	nodesJSON := []byte(wf.Nodes)
+	edgesJSON := []byte(wf.Edges)
+	if len(nodesJSON) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "工作流节点为空，无法续跑"})
+		return
+	}
+
+	persist := func(states []model.NodeInstance) {
+		if b, err := json.Marshal(states); err == nil {
+			p.db.Model(&model.WorkflowRun{}).Where("id = ?", run.ID).Update("node_states", json.RawMessage(b))
+		}
+	}
+	exec := func() {
+		nodeStates, execErr := p.engine.ResumeFromWithRunID(nodesJSON, edgesJSON, prev, "", run.ID, persist)
+		endNow := time.Now()
+		run.EndedAt = &endNow
+		job.EndedAt = &endNow
+		switch {
+		case execErr != nil && service.ErrorCodeOf(execErr) == model.ErrorCodeCancelled:
+			run.Status, job.Status = "cancelled", "interrupted"
+			run.Error = execErr.Error()
+			job.Error = execErr.Error()
+		case execErr != nil:
+			run.Status, job.Status = "failed", "failed"
+			run.Error = execErr.Error()
+			job.Error = execErr.Error()
+		default:
+			run.Status, job.Status = "success", "done"
+		}
+		if b, err := json.Marshal(nodeStates); err == nil {
+			run.NodeStates = json.RawMessage(b)
+		}
+		p.db.Save(run)
+		p.db.Model(&model.Job{}).Where("id = ?", job.ID).Updates(map[string]interface{}{
+			"status": job.Status, "error": job.Error, "ended_at": endNow,
+		})
+		reconcile := p.clearBudget(run.ID)
+		p.writeRunManifest(&run, nodeStates, reconcile)
+		log.Printf("[resume] run=%d 续跑结束：%s（复用 %d 个已完成节点）", run.ID, run.Status, reused)
+	}
+
+	var nodesForClass []model.NodeInstance
+	_ = json.Unmarshal(nodesJSON, &nodesForClass)
+	if p.queue != nil {
+		p.queue.EnqueueClass(job, service.JobClassForNodes(nodesForClass), exec)
+	} else {
+		job.Status = "running"
+		job.StartedAt = &now
+		p.db.Save(&job)
+		go exec()
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"run_id":       run.ID,
+		"status":       "running",
+		"resumed":      true,
+		"reused_nodes": reused,
+		"note":         "已完成的节点直接复用产物；失败/未跑的节点重新执行",
+	})
 }
 
 // ListPipelines 返回向导要用的流水线目录。
@@ -520,9 +669,6 @@ func (p *Producer) start(req produceRequest) (*model.WorkflowRun, int, string) {
 
 		nodeStates, execErr := p.engine.ExecuteWithRunID(nodesJSON, edgesJSON, run.ID, persist)
 
-		endNow := time.Now()
-		run.EndedAt = &endNow
-		job.EndedAt = &endNow
 		switch {
 		case execErr != nil && service.ErrorCodeOf(execErr) == model.ErrorCodeCancelled:
 			run.Status = "cancelled"
@@ -545,7 +691,24 @@ func (p *Producer) start(req produceRequest) (*model.WorkflowRun, int, string) {
 				job.Status = "failed"
 				job.Error = err.Error()
 			}
+			// 自动配乐同理：勾了 bgm_auto 就必须真的配出来，配不出来算失败。
+			// 放在贴字之后：BGM 要按「最终成片」的时长铺，先贴后混才不会错位。
+			if run.Status == "success" {
+				if _, err := p.engine.ApplyAutoBGM(nodeStates, req.Params); err != nil {
+					run.Status = "failed"
+					run.Error = err.Error()
+					job.Status = "failed"
+					job.Error = err.Error()
+				}
+			}
 		}
+		// 结束时间必须算在**贴字/配乐之后**：这两步都是交付物本身，
+		// 有时能跑几十秒到几分钟（2026-11-03 实测 run 433：图形生成 4m02s 结束，
+		// 音乐冷加载 + 混音又多花 4m13s）。原来 endNow 在它们之前取，
+		// DB 里的耗时会少报一大截，ETA/预算对账全跟着偏。
+		endNow := time.Now()
+		run.EndedAt = &endNow
+		job.EndedAt = &endNow
 		statesJSON, _ := json.Marshal(nodeStates)
 		run.NodeStates = json.RawMessage(statesJSON)
 		p.db.Save(run)
@@ -698,11 +861,32 @@ func (p *Producer) PreflightPipelines(c *gin.Context) {
 	})
 }
 
+// externalGPUUsers 列出非自家的 GPU 占用者（引擎自己 + 托管依赖都算自家）。
+//
+// 为什么要排除托管依赖：ComfyUI/TTS 本来就吃显存，把它们报成「外部占用」
+// 会让这条提醒永远在响——永远在响的提醒等于没有提醒。
+func (p *Producer) externalGPUUsers() []service.GPUUser {
+	own := []int{os.Getpid()}
+	if p.sup != nil {
+		own = append(own, p.sup.PIDs()...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return service.ExternalGPUUsers(ctx, own)
+}
+
 // preflightWarnings 组装「能跑但不便宜」的提醒。全部是**建议**，不改变 ok。
 func (p *Producer) preflightWarnings(built *service.BuiltPipeline) []string {
 	out := []string{}
 	if built == nil {
 		return out
+	}
+
+	// 0) 外部 GPU 占用（2026-10-31）：显存前瞻只算「够不够」，答不出「被谁占着」。
+	// 实测踩过：同一张卡上跑着 UnrealEditor，本该 85–120s 的单镜跑了 12 分钟撞超时，
+	// 而所有指标（显存/依赖/参数）看起来都正常。开跑前点名，比事后解释便宜得多。
+	if msg := service.DescribeExternalGPUUsers(p.externalGPUUsers()); msg != "" {
+		out = append(out, msg)
 	}
 
 	// 1) 显存前瞻：换页跑法能出片，但实测同一镜 85s → 2269s。

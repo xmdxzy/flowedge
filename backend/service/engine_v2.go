@@ -96,6 +96,7 @@ type EngineV2 struct {
 	t2i             *Text2ImageService
 	asr             *ASRService
 	tts             *TTSService
+	music           *MusicService
 	video           *VideoService
 	gpuSched        *GPUScheduler
 	wsHub           *WSHub
@@ -449,6 +450,13 @@ func NewEngineV2(
 	e.registerBuiltinNodes()
 	return e
 }
+
+// SetMusic 注入音乐生成服务（ACE-Step）。
+//
+// 用 setter 而不是改 NewEngineV2 签名：那个签名被 26 个既有测试直接调用，
+// 加参数会把「部署一个音乐服务」的成本摊到所有测试上。music 为 nil 时
+// music 节点显式报「没有配置音乐服务」，不会静默产出空文件。
+func (e *EngineV2) SetMusic(m *MusicService) { e.music = m }
 
 // Execute 执行工作流（按层并行 DAG + 按边传递输入 + 分支级联跳过 + 节点超时）
 // ExecuteWithRunID 可取消的执行入口：注册 runID → 取消函数
@@ -1128,6 +1136,7 @@ func (e *EngineV2) registerBuiltinNodes() {
 		"comfy":        e.execComfyNode,
 		"code_video":   e.execCodeVideoNode,
 		"tts":          plain(e.execTTSNode),
+		"music":        plain(e.execMusicNode),
 		"quality_loop": e.execQualityLoopNode,
 		"end":          plain(e.execEndNode),
 	}

@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"strings"
@@ -119,4 +119,3 @@ func TestValidatePorts_CleanGraphIsSilent(t *testing.T) {
 		t.Fatalf("干净图不该有任何端口问题，实际 %+v", issues)
 	}
 }
-

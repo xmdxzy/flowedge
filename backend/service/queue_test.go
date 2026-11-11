@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -138,10 +139,15 @@ func TestJobQueue_RecoverInterrupted_ReconcilesRuns(t *testing.T) {
 		t.Fatalf("no runs should remain running, got %d", len(stuck))
 	}
 
+	// 2026-10-31 改：原来标 failed，于是「可续跑」只写在文案里、没有入口能真的续跑，
+	// 一次外部终止就等于整支白跑。现在标 interrupted，配合 POST /runs/:id/resume。
 	var run model.WorkflowRun
-	db.Where("workflow_id = ? AND status = ?", 1, "failed").First(&run)
+	db.Where("workflow_id = ? AND status = ?", 1, "interrupted").First(&run)
 	if run.Error == "" {
 		t.Fatal("recovered run must carry a reason")
+	}
+	if !strings.Contains(run.Error, "resume") {
+		t.Errorf("错误文案要点名续跑入口，实际：%q", run.Error)
 	}
 }
 

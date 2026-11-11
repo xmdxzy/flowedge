@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { cancelRun, errorText, fetchRun, fetchRuns, rerunRun } from '../api/client'
+import { cancelRun, errorText, fetchRun, fetchRuns, rerunRun, resumeRun } from '../api/client'
 import type { NodeState, Pipeline, RunDetail, RunSummary } from '../api/types'
 import ErrorNotice from '../components/ErrorNotice'
 import { toast } from '../components/Toast'
@@ -207,6 +207,24 @@ export default function RunsPage({ pipelines, focusRunId, onFocusRun }: Props) {
     }
   }
 
+  // 断点续跑：引擎被外部杀掉时（interrupted）重跑等于从零再烧一遍，
+  // 续跑只补没成功的节点——同一个页面里给用户这条正确的路。
+  const handleResume = async (runId: number) => {
+    setActionBusy(true)
+    try {
+      const accepted = await resumeRun(runId)
+      const reused = accepted.reused_nodes ? `，复用 ${accepted.reused_nodes} 个已完成节点` : ''
+      toast(`已从断点续跑 #${runId}${reused}`, 'success')
+      onFocusRun(runId)
+      await loadDetail(runId, true)
+      await loadList(0, false)
+    } catch (err) {
+      toast(errorText(err), 'error')
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
   const handleCopy = async (runId: number) => {
     try {
       await navigator.clipboard.writeText(String(runId))
@@ -314,6 +332,7 @@ export default function RunsPage({ pipelines, focusRunId, onFocusRun }: Props) {
               now={now}
               busy={actionBusy}
               onCancel={() => void handleCancel(detail.run_id)}
+              onResume={() => void handleResume(detail.run_id)}
               onRerun={() => void handleRerun(detail.run_id)}
               onCopy={() => void handleCopy(detail.run_id)}
               onRefresh={() => void loadDetail(detail.run_id)}
@@ -336,14 +355,21 @@ interface DetailProps {
   now: number
   busy: boolean
   onCancel: () => void
+  onResume: () => void
   onRerun: () => void
   onCopy: () => void
   onRefresh: () => void
 }
 
-function RunDetailView({ detail, pipelineName, now, busy, onCancel, onRerun, onCopy, onRefresh }: DetailProps) {
+function RunDetailView({ detail, pipelineName, now, busy, onCancel, onResume, onRerun, onCopy, onRefresh }: DetailProps) {
   const running = detail.status === 'running'
-  const canRerun = detail.status === 'success' || detail.status === 'failed' || detail.status === 'cancelled'
+  // 中断的运行只该给「继续」：成功的节点已经算过钱，从零重跑是浪费
+  const canResume = detail.status === 'interrupted'
+  const canRerun =
+    detail.status === 'success' ||
+    detail.status === 'failed' ||
+    detail.status === 'cancelled' ||
+    detail.status === 'interrupted'
   const duration = elapsedMs(detail.started_at, detail.ended_at, now)
   const nodes: NodeState[] = detail.node_states ?? []
   const params = Object.entries(detail.params ?? {})
@@ -366,8 +392,13 @@ function RunDetailView({ detail, pipelineName, now, busy, onCancel, onRerun, onC
               中止
             </button>
           )}
+          {canResume && (
+            <button className="btn btn--primary btn--sm" disabled={busy} onClick={onResume}>
+              从断点继续
+            </button>
+          )}
           {canRerun && (
-            <button className="btn btn--primary btn--sm" disabled={busy} onClick={onRerun}>
+            <button className="btn btn--ghost btn--sm" disabled={busy} onClick={onRerun}>
               重跑
             </button>
           )}

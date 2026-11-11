@@ -1,10 +1,26 @@
-# 构建上下文瘦身：排除运行时产物与本地产物
+# 构建上下文瘦身：排除运行时产物与本地产物。
+# 不排 运行/（15GB 部署目录）会让 docker build 每次先传十几 GB 才失败。
 .git
+.github
+运行/
+.tmp/
+outputs/
+作品/
+exports/
+deliveries/
+.slim-trash/
+.workbuddy/
+.dsh-*/
+**/node_modules
 backend/data
 backend/local-services/.venv
 backend/flowedge.exe
-frontend/node_modules
 frontend/dist
 **/*.db
+**/*.db-*
 **/*.log
+**/__pycache__
+**/*.pyc
 **/.DS_Store
+docs/demo
+assets/

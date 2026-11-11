@@ -21,7 +21,6 @@ import (
 	"io/fs"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,10 +34,12 @@ var codeTplFS embed.FS
 
 // codeVideoStyles 可用的视觉风格 → 内嵌模板目录。
 // 每套风格只实现同一份 CodeSpec，靠视觉签名区分：
-//   blueprint = 工程蓝图（自研初版）
-//   darkcard  = 暗色 3D 卡片世界 + 准一镜到底（对标抖音「基地」）
-//   atlas     = DK 图鉴 / 剖面图解（对标小红书爆款 3D 剖面图）
-//   studio    = 黑画布 MG 信息图 + 章节 HUD（对标 anything2explainer）
+//
+//	blueprint = 工程蓝图（自研初版）
+//	darkcard  = 暗色 3D 卡片世界 + 准一镜到底（对标抖音「基地」）
+//	atlas     = DK 图鉴 / 剖面图解（对标小红书爆款 3D 剖面图）
+//	studio    = 黑画布 MG 信息图 + 章节 HUD（对标 anything2explainer）
+//
 // 共用 codetpl/_shared/kit.js。加风格 = 这里加一行 + 建目录，无需改执行器逻辑。
 var codeVideoStyles = map[string]string{
 	"blueprint": "codetpl/blueprint",
@@ -133,6 +134,15 @@ func (e *EngineV2) execCodeVideoNode(ctx context.Context, node *model.NodeInstan
 	if v, ok := node.Data["height"].(float64); ok && v >= 16 {
 		h = int(v)
 	}
+	// aspect 优先于 width/height：一个下拉框就能切画幅，不用让用户同时填两个数。
+	// 竖屏是抖音/视频号的默认形态（9:16），小红书图文常用 3:4。
+	if a := strings.TrimSpace(dataString(node, "aspect")); a != "" {
+		aw, ah, ok := aspectDims(a)
+		if !ok {
+			return nil, fmt.Errorf("code_video: 未知 aspect=%q；可用：16:9, 9:16, 3:4, 1:1", a)
+		}
+		w, h = aw, ah
+	}
 	if w%2 == 1 {
 		w++
 	}
@@ -163,7 +173,7 @@ func (e *EngineV2) execCodeVideoNode(ctx context.Context, node *model.NodeInstan
 	if nodeBin == "" {
 		nodeBin = "node"
 	}
-	cmd := exec.CommandContext(ctx, nodeBin, args...)
+	cmd := hiddenExecContext(ctx, nodeBin, args...)
 	cmd.Dir = root
 	// 子进程输出只在失败时进错误信息：成功时每 60 帧一行进度，刷日志没意义
 	output, runErr := cmd.CombinedOutput()
@@ -195,7 +205,7 @@ func (e *EngineV2) execCodeVideoNode(ctx context.Context, node *model.NodeInstan
 			"-i", outPath, "-i", wavPath,
 			"-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
 			"-map", "0:v:0", "-map", "1:a:0", "-shortest", mixed}
-		if b, merr := exec.CommandContext(ctx, ffmpegBin(), muxArgs...).CombinedOutput(); merr != nil {
+		if b, merr := hiddenExecContext(ctx, ffmpegBin(), muxArgs...).CombinedOutput(); merr != nil {
 			return nil, fmt.Errorf("code_video: 旁白合流失败（%v）：%s", merr, strings.TrimSpace(string(b)))
 		}
 		_ = os.Remove(outPath)
@@ -291,10 +301,13 @@ func dataString(node *model.NodeInstance, key string) string {
 	return ""
 }
 
-// codeVideoTimeout 按帧数估：1080p/24fps 单 worker 约 0.1s/帧
-// （实测 still 200ms 含冷启动，整片按 worker 切分后更快），
-// 保守取 0.25s/帧 + 60s 固定（浏览器启动 + ffmpeg 收尾）。
-// spec JSON 里的 duration 节点上看不到，这里只按节点字段估，硬上限 30 分钟兜底。
+// codeVideoTimeout 按帧数估时：90s 固定（浏览器冷启动 + ffmpeg 收尾）+ 每帧预算。
+//
+// 每帧预算取 0.55s/worker，是按**真机生产**定的，不是按台架：
+// 同一台机器上 test 台架 15s/360 帧 24s（0.065s/帧），而进产品的 8s/192 帧真机跑了 52s
+// （0.27s/帧，冷启动 + 与其它进程抢 CPU）。旧公式用 0.25s/帧且没除 workers，
+// 算出 1m48s 把一条**正常**的 8s 片子判成 `node timeout after 1m48s`（run 386）。
+// 宁可给宽：确定性渲染超时只是白等，误杀会让用户以为节点坏了。
 func codeVideoTimeout(n *model.NodeInstance) time.Duration {
 	dur := 6.0
 	if v, ok := n.Data["duration"].(float64); ok && v > 0 {
@@ -304,7 +317,49 @@ func codeVideoTimeout(n *model.NodeInstance) time.Duration {
 	if v, ok := n.Data["fps"].(float64); ok && v > 0 {
 		fps = v
 	}
-	return 60*time.Second + time.Duration(dur*fps*0.25*float64(time.Second))
+	workers := 2.0
+	if v, ok := n.Data["workers"].(float64); ok && v >= 1 {
+		workers = v
+	}
+	frames := dur * fps
+	return 90*time.Second + time.Duration(frames*0.55/workers*float64(time.Second))
+}
+
+// splitPoints 要点只按换行切分。
+//
+// 为什么不能用 splitLoose：中文句子里自带「，」是正文的一部分。
+// 用 splitLoose 会把「信息密度一样，观感差距来自版式与节奏」静默拆成两条要点，
+// 出片时观众看到的是被腰斩的句子（2026-10-31 真机 produce 抓到的）。
+// labels/values 那种「运镜,硬切,版式」的逗号列表仍走 splitLoose。
+func splitPoints(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	norm := strings.ReplaceAll(s, "\r\n", "\n")
+	norm = strings.ReplaceAll(norm, "\r", "\n")
+	out := []string{}
+	for _, line := range strings.Split(norm, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// aspectDims 画幅 → 像素尺寸。竖屏用 1080 宽（平台上传的就是这个档），
+// 横屏用 1920 宽；两者都是偶数，满足 h264 的偶数尺寸要求。
+func aspectDims(a string) (int, int, bool) {
+	switch strings.ToLower(strings.TrimSpace(a)) {
+	case "16:9", "16x9", "landscape", "横屏":
+		return 1920, 1080, true
+	case "9:16", "9x16", "portrait", "竖屏":
+		return 1080, 1920, true
+	case "3:4", "3x4":
+		return 1080, 1440, true
+	case "1:1", "square":
+		return 1080, 1080, true
+	}
+	return 0, 0, false
 }
 
 // buildCodeSpec 从节点参数/上游文本组装渲染规格。
@@ -326,7 +381,7 @@ func buildCodeSpec(node *model.NodeInstance, upstream map[string]interface{}) (*
 		return nil, fmt.Errorf("code_video: 缺少内容；填 title/points，或给 spec（JSON），或让上游文本流入")
 	}
 
-	points := splitLoose(dataString(node, "points"))
+	points := splitPoints(dataString(node, "points"))
 	card := CodeCard{
 		Kicker:  strings.TrimSpace(dataString(node, "kicker")),
 		Heading: title,

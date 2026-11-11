@@ -84,6 +84,12 @@ var NodeSpecs = map[string]NodeSpec{
 
 	// ---- 语音侧：CPU，但与扩散权重抢内存带宽 ----
 	"tts": {Type: "tts", Side: sideAudio, Media: true, Timeout: ttsTimeout},
+
+	// ---- 音乐侧：ACE-Step 1.5（GPU，XL 权重约 9GB）----
+	// Side=sideMusic 是独立一侧：与 TTS 装不下同一张 24GB 卡（见 vram.go 注释）。
+	// Heavy=true：它真的吃满显存做采样，要记峰值档案。
+	"music": {Type: "music", Side: sideMusic, Heavy: true, Media: true, Timeout: musicTimeout,
+		MaxTimeout: 40 * time.Minute},
 }
 
 // NodeSpecOf 查节点元数据。未登记的类型返回零值 + false，

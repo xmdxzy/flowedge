@@ -59,7 +59,7 @@ func main() {
 
 	// 临时目录：引擎被某些外壳拉起时，%TEMP% 指向平时那个目录却**建不了文件**。
 	// 必须在任何 os.CreateTemp / 拉依赖之前修好，否则下面两处都会炸（实测）：
-	//   - 贴字节点：贴字失败：临时文件创建不了：open C:\Users\...\Temp\...
+	//   - 贴字节点：贴字失败：临时文件创建不了：open <用户临时目录>\Temp\...
 	//   - ComfyUI-H3 一起就退：FileNotFoundError: No usable temporary directory
 	ensureProcessTempDir(baseDir)
 
@@ -167,6 +167,16 @@ func main() {
 
 	asrService := service.NewASRService(asrURL)
 	ttsService := service.NewTTSService(ttsURL)
+	// 音乐生成（ACE-Step 1.5）：地址优先级 环境变量 > data/deps.json > 默认 8104。
+	// 服务没起不影响引擎启动——节点执行时按需拉起（见 execMusicNode）。
+	musicURL := getEnv("MUSIC_BASE_URL", "")
+	if musicURL == "" {
+		musicURL = service.MusicBaseURL()
+	}
+	if musicURL == "" {
+		musicURL = service.DefaultMusicBaseURL
+	}
+	musicService := service.NewMusicService(musicURL)
 	videoService := service.NewVideoService()
 
 	// 显存驻留路线：模型 → 侧别 → 实测峰值（data/model_residency.json）。
@@ -179,6 +189,7 @@ func main() {
 		registered, residency.TotalVRAMMB, residency.Describe())
 
 	engine := service.NewEngineV2(llmService, t2iService, asrService, ttsService, videoService, gpuSched, wsHub)
+	engine.SetMusic(musicService)
 
 	// 显存档案：每次重节点执行后累积实测峰值，供提交前预测（data/vram_profiles.json）
 	profileStore := service.LoadProfileStore(filepath.Join(baseDir, "data", "vram_profiles.json"), 24576)
@@ -231,7 +242,11 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	r := gin.Default()
+	// 不用 gin.Default()：它给每个请求都打一行，而常驻面板每 3 秒轮询 /api/deps、
+	// 探活脚本每秒打 /api/health、播放器拖动会刷 /api/artifacts/*——
+	// 这些成功请求会把真正有用的报错淹掉。失败一律照打，见 accessLog。
+	r := gin.New()
+	r.Use(gin.Recovery(), accessLog())
 
 	// 安全边界：默认只监听 127.0.0.1；对外开放必须带 token。
 	bindAddr := getEnv("FLOWEDGE_HOST", "127.0.0.1")
@@ -345,6 +360,7 @@ func main() {
 			return service.ProbeCapabilities(gpuSched, baseDir, cfg.OllamaBaseURL, comfyURL, h3URL, asrURL, ttsURL)
 		})
 		graphHandler.SetSupervisor(depSupervisor)
+		graphHandler.SetDataDir(baseDir)
 		api.GET("/node-catalog", graphHandler.Catalog)
 		api.GET("/workflows", graphHandler.ListWorkflows)
 		api.POST("/workflows", graphHandler.CreateWorkflow)
@@ -352,6 +368,9 @@ func main() {
 		api.GET("/workflows/:id", graphHandler.GetWorkflow)
 		api.PUT("/workflows/:id", graphHandler.UpdateWorkflow)
 		api.DELETE("/workflows/:id", graphHandler.DeleteWorkflow)
+		// 导演包：把一张图连素材打包成 .fepack.zip（可交接/可复现），以及反向导入
+		api.POST("/workflows/:id/pack", graphHandler.ExportPack)
+		api.POST("/packs/import", graphHandler.ImportPack)
 		// 跑一张画布图：与流水线出片共用队列 / 预检 / 显存门 / 取消语义
 		api.POST("/workflows/:id/run", producer.RunWorkflow)
 		api.POST("/graph/validate", graphHandler.Validate)
@@ -363,6 +382,8 @@ func main() {
 		api.GET("/runs/:runId", producer.GetRun)
 		api.POST("/runs/:runId/cancel", producer.CancelRun)
 		api.POST("/runs/:runId/rerun", producer.Rerun)
+		// 断点续跑（V3 加固）：引擎被外部终止后，已完成的节点复用、失败的节点重跑
+		api.POST("/runs/:runId/resume", producer.ResumeRun)
 		api.GET("/runs/:runId/events", runHandler.Events)
 		api.GET("/runs/:runId/trace", runHandler.Trace)
 		// 血缘清单（V3 P0）：这次运行用了哪些权重/参数/产出，可离线复现
@@ -382,12 +403,21 @@ func main() {
 		api.POST("/deps/:name/stop", depHandler.Stop)
 		// 卸载模型但保留进程：把显存要回来，又不付冷启动代价
 		api.POST("/deps/:name/unload", depHandler.Unload)
+		// 回收显存（V3）：清 ComfyUI 队列 + /free + 测量前后对比。
+		// 任务超时后 ComfyUI 侧常卡在 VAE decode 里继续跑，这时只 /free 是无效的。
+		api.POST("/deps/:name/reclaim", depHandler.Reclaim)
 		api.GET("/deps/:name/wait", depHandler.Wait)
 
 		// 对外接入配置生成（MCP 客户端配置）：exe 绝对路径与端口只有引擎自己知道
 		integHandler := handler.NewIntegrationHandler(baseDir, cfg.Port)
 		api.GET("/mcp/config", integHandler.MCPConfig)
 
+		// OpenMontage 代理：把本地出片请求转发给独立部署的 OpenMontage Drama Studio
+		//（默认 http://127.0.0.1:8787）。环境变量 OPENMONTAGE_BASE_URL 可覆盖。
+		omBaseURL := getEnv("OPENMONTAGE_BASE_URL", "")
+		// 注意包前缀：注册函数定义在 handler 包（handler/openmontage.go），
+		// 早先这里写成不带的裸调用，整棵树 main 包编译不过。
+		handler.RegisterOpenMontageRoutes(api, omBaseURL)
 		api.GET("/ws", wsHandler.HandleWS)
 
 		healthHandler := handler.NewHealthHandler(version)
@@ -483,6 +513,43 @@ func initDB(cfg *config.Config) *gorm.DB {
 	return db
 }
 
+// accessLog 是 gin.Logger 的替代品：只记「需要人看的」请求。
+//
+// 规则很简单——4xx/5xx 一律记；2xx/3xx 只记真正的业务调用，
+// 探活、依赖就绪轮询、媒体流、静态资源这些高频成功请求不记。
+func accessLog() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+
+		status := c.Writer.Status()
+		if status < 400 && quietRequest(c.Request.Method, c.Request.URL.Path) {
+			return
+		}
+		latency := time.Since(start).Round(time.Millisecond)
+		note := ""
+		if errs := c.Errors.ByType(gin.ErrorTypePrivate).String(); errs != "" {
+			note = " | " + strings.TrimSpace(errs)
+		}
+		log.Printf("%s %s → %d (%s)%s", c.Request.Method, c.Request.URL.Path, status, latency, note)
+	}
+}
+
+// quietRequest 判断这条成功请求是否属于「高频噪声」。
+func quietRequest(method, p string) bool {
+	switch {
+	case p == "/api/health", p == "/api/capabilities", p == "/api/ws":
+		return true
+	case strings.HasPrefix(p, "/api/deps/") && strings.HasSuffix(p, "/wait"):
+		return true // 面板与一键修复就绪时每 1–8 秒打一次
+	case method == http.MethodGet && strings.HasPrefix(p, "/api/artifacts/"):
+		return true // 视频/图片流：拖动进度条就是几十个 Range 请求
+	case !strings.HasPrefix(p, "/api/"):
+		return true // 静态资源与 SPA 路由
+	}
+	return false
+}
+
 // mountStatic 挂载前端资源：外部目录 > exe 内嵌 > 明确的排障页
 func mountStatic(r *gin.Engine) {
 	candidates := []string{}
@@ -502,18 +569,33 @@ func mountStatic(r *gin.Engine) {
 				clean = "index.html"
 			}
 			if st, err := fs.Stat(root, clean); err != nil || st.IsDir() {
+				// 带扩展名的资源请求不能回退到 index.html：浏览器会把 HTML
+				// 当 JS/CSS 解析，报 "Unexpected token '<'"，比 404 难查十倍。
+				if path.Ext(clean) != "" {
+					c.String(http.StatusNotFound, "not found: %s", clean)
+					return
+				}
 				clean = "index.html" // SPA 前端路由回退
 			}
 			// index.html 必须直接写内容：http.ServeFile 见到 */index.html 会
-			// 301 重定向到 "./"，与 SPA 回退叠加会形成无限重定向
+			// 301 重定向到 "./"，与 SPA 回退叠加会形成无限重定向。
+			// 它引用的是带哈希的产物，自身不能缓存，否则升级后仍是旧壳。
 			if clean == "index.html" {
 				data, rerr := fs.ReadFile(root, "index.html")
 				if rerr != nil {
 					c.String(http.StatusInternalServerError, "index.html missing")
 					return
 				}
+				c.Header("Cache-Control", "no-cache")
 				c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 				return
+			}
+			// Vite 产物带内容哈希（index-<hash>.js），可以永久缓存；
+			// 其余资源（字体、图标、用户放的静态文件）给一小时。
+			if strings.HasPrefix(clean, "assets/") {
+				c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				c.Header("Cache-Control", "public, max-age=3600")
 			}
 			c.FileFromFS(clean, fileServer)
 		})
@@ -700,9 +782,10 @@ func setupLogFile(baseDir string) func() {
 // ensureProcessTempDir 保证本进程（以及它派生的依赖）有一个**确定可写**的临时目录。
 //
 // 由来（2026-10-26 实测，两种症状同一个根因）：
-//   - 贴字节点：`贴字失败：临时文件创建不了：open C:\Users\...\AppData\Local\Temp\...`（run 249）
+//   - 贴字节点：`贴字失败：临时文件创建不了：open <用户临时目录>\...`（run 249）
 //   - ComfyUI-H3：`FileNotFoundError: No usable temporary directory found in [...]`，
 //     进程一起就退，表现像"模型/权重坏了"
+//
 // 而同一个 python、同一段 Go 从交互 shell 跑完全正常——差别只在**谁派生的它**。
 // 这类父子进程差异不值得继续猜（job 对象 / 受限令牌 / 安全软件都可能），
 // 统一把 TEMP/TMP/TMPDIR 指到 <部署目录>/data/tmp：依赖日志就写在这里，一定可写。

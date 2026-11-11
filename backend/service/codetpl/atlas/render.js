@@ -5,29 +5,40 @@
 // 页面契约（lemo）：window.READY / window.DUR / window.render(t)
 
 import { clamp, lerp, prog, easeInOut, easeOut, wrapText, wrapBalanced, wrapByPunct, setFont, roundRect, makeGrain, SANS, SERIF, MONO } from './shared/kit.js';
+import { TOKENS } from './shared/tokens.js';
 
-const DW = 1920, DH = 1080;      // 设计画布
-const PAPER = '#F0EDE6';
-const INK = '#1F2429';
-const INK_DIM = 'rgba(31,36,41,.62)';
-const INK_FAINT = 'rgba(31,36,41,.26)';
-const NAVY = '#1F3A5F';
-const RUST = '#A8452E';
-const SAND = '#DCD5C6';
+// 竖屏换一套版式：横屏 1920×1080，竖屏 1080×DH（9:16→1920，3:4→1440）
+let DW = 1920, DH = 1080, PORTRAIT = false;
+// 配色来自 design tokens（shared/tokens.js）：改色只改 token 表，不在这里手写十六进制
+const T = TOKENS.atlas;
+const PAPER = T.paper, INK = T.ink, INK_DIM = T.dim, INK_FAINT = T.faint;
+const NAVY = T.accent, RUST = T.accent2, SAND = T.sand;
 
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d', { alpha: false });
-let SPEC = null, CARDS = [], DUR = 0, GRAIN = null, VW = DW, VH = DH;
+let SPEC = null, CARDS = [], DUR = 0, GRAIN = null, GRAIN_KEY = '', VW = 1920, VH = 1080;
 
 function resize() {
   VW = canvas.width = Math.max(2, window.innerWidth | 0);
   VH = canvas.height = Math.max(2, window.innerHeight | 0);
-  if (!GRAIN) GRAIN = makeGrain(DW, DH, 15, 11);
+  PORTRAIT = VH >= VW * 0.99;
+  if (PORTRAIT) {
+    DW = 1080;
+    DH = Math.round((1080 * VH) / VW);
+  } else {
+    DW = 1920;
+    DH = 1080;
+  }
+  const key = DW + 'x' + DH;
+  if (GRAIN_KEY !== key) {
+    GRAIN = makeGrain(DW, DH, 15, 11);
+    GRAIN_KEY = key;
+  }
 }
 
 function beginFrame() {
   // 设计坐标 → 实际像素（等比，居中，超出部分由底色兜住）
-  const s = Math.min(VW / DW, VH / DH);
+  const s = PORTRAIT ? VW / DW : Math.min(VW / DW, VH / DH);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = PAPER;
   ctx.fillRect(0, 0, VW, VH);
@@ -126,11 +137,11 @@ function autoLabels(card) {
   if ((card.labels || []).length) return card.labels;
   return (card.points || []).slice(0, 3).map((t) => {
     const s = String(t).trim();
-    return s.length > 9 ? s.slice(0, 9) + '…' : s;
+    return s.length > 8 ? s.slice(0, 8) + '…' : s;
   });
 }
 
-function drawCallouts(card, box, p) {
+function drawCallouts(card, box, p, inside = false) {
   const labels = autoLabels(card);
   if (!labels.length) return;
   const { x, y, w, h } = box;
@@ -140,7 +151,7 @@ function drawCallouts(card, box, p) {
     if (ap <= 0) return;
     const ay = y + h * ((i + 0.5) / n);
     const ax = x + w * (0.32 + 0.24 * ((i * 7) % 3) / 2);
-    const bx = x + w + 54;
+    const bx = inside ? x + w * 0.62 : x + w + 54;
     const by = ay - 26 + i * 4;
     const elbowX = lerp(ax, bx, 0.45);
 
@@ -166,7 +177,7 @@ function drawCallouts(card, box, p) {
     // 标签
     if (ap > 0.6) {
       ctx.globalAlpha = clamp((ap - 0.6) / 0.4, 0, 1);
-      setFont(ctx, 20, 600, SANS);
+      setFont(ctx, 19, 600, SANS);
       ctx.fillStyle = INK;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
@@ -285,11 +296,12 @@ function drawPage(card, i, total, local, alphaOut) {
   });
 
   // 右侧图版
-  const box = { x: 986, y: 214, w: 540, h: 520 };
+  const box = { x: 1010, y: 214, w: 500, h: 520 };
   const fp = clamp((local - 0.1) / 0.3, 0, 1);
   ctx.strokeStyle = 'rgba(31,36,41,.30)';
   ctx.lineWidth = 1.4;
-  ctx.strokeRect(box.x - 26, box.y - 34, box.w + 148, box.h + 96);
+  // 图版框右侧留出标注栏：标注必须落在框内，否则引线会穿过边框像排版事故
+  ctx.strokeRect(box.x - 26, box.y - 34, 1810 - (box.x - 26), box.h + 96);
 
   if (card.figure === 'bars') drawBars(card, box.x, box.y, box.w, box.h, fp);
   else {
@@ -323,6 +335,127 @@ function drawPage(card, i, total, local, alphaOut) {
   ctx.globalAlpha = 1;
 }
 
+// ============ 竖屏图版（1080 × DH）============
+// 竖屏按「一页图鉴」排：眉标 → 大标题 → 图版 → 图例 → 页脚。
+// 安全区：顶部 11.5%、底部 8%（图鉴类内容平台遮挡少，但要避开右上角「分享/更多」）。
+function drawPagePortrait(card, i, total, local, alphaOut) {
+  paper();
+  ctx.globalAlpha = alphaOut;
+  const m = 78, w = DW - 2 * m;
+  const top = DH * 0.095;
+  const footY = DH * 0.885;
+
+  // 眉标 + 图版号
+  setFont(ctx, 20, 600, MONO);
+  ctx.fillStyle = NAVY;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.save();
+  ctx.letterSpacing = '2px';
+  ctx.fillText((card.kicker || 'KNOWLEDGE ATLAS').toUpperCase(), m, top);
+  ctx.restore();
+  setFont(ctx, 20, 500, MONO);
+  ctx.fillStyle = INK_DIM;
+  ctx.textAlign = 'right';
+  ctx.fillText(`PLATE ${String(i + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}`, DW - m, top);
+  hairline(m, top + 40, DW - m, top + 40, 'rgba(31,36,41,.18)');
+
+  // 标题：宋体，最多 3 行
+  const pIn = clamp(local / 0.16, 0, 1);
+  let size = 84, lines = [];
+  for (const s of [84, 76, 68, 60, 52]) {
+    setFont(ctx, s, 700, SERIF);
+    const cand = wrapByPunct(ctx, card.heading || '', w, 3);
+    if (cand.length <= 3) {
+      size = s;
+      lines = cand;
+      break;
+    }
+  }
+  if (!lines.length) {
+    setFont(ctx, 52, 700, SERIF);
+    lines = wrapText(ctx, card.heading || '', w).slice(0, 3);
+    size = 52;
+  }
+  const lh = size * 1.28;
+  let ty = top + 70 + size;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(m, ty - size, (w + 6) * easeOut(pIn), (lines.length - 1) * lh + size + 10);
+  ctx.clip();
+  lines.forEach((ln, k) => {
+    setFont(ctx, size, 700, SERIF);
+    ctx.fillStyle = INK;
+    ctx.textAlign = 'left';
+    ctx.fillText(ln, m, ty + k * lh);
+  });
+  ctx.restore();
+  ty += (lines.length - 1) * lh;
+
+  ctx.fillStyle = NAVY;
+  ctx.fillRect(m, ty + 22, 132 * easeOut(clamp((local - 0.05) / 0.2, 0, 1)), 3);
+
+  // 图版（剖面）
+  // 图版高度由「标题底 → 页脚」之间的剩余空间决定：
+  // 固定比例在 3:4 上会把图例顶到页脚上（实测过），必须按预算算。
+  const legendRows = Math.min(3, (card.points || []).length);
+  const plateTop = ty + 60;
+  const plateBottom = footY - 140 - legendRows * 78;
+  const boxH = clamp(plateBottom - plateTop, 300, w * 0.72);
+  const box = { x: m, y: plateTop, w, h: boxH };
+  const fp = clamp((local - 0.1) / 0.3, 0, 1);
+  ctx.strokeStyle = 'rgba(31,36,41,.28)';
+  ctx.lineWidth = 1.4;
+  ctx.strokeRect(box.x - 18, box.y - 18, box.w + 36, box.h + 36);
+
+  if (card.figure === 'bars') drawBars(card, box.x + 10, box.y + 10, box.w - 20, box.h - 30, fp);
+  else {
+    drawSection(card, box.x + 14, box.y + 14, box.w - 28, box.h - 28, fp);
+    drawCallouts(card, { x: box.x + 14, y: box.y + 14, w: box.w - 28, h: box.h - 28 }, fp, true);
+  }
+
+  setFont(ctx, 18, 500, MONO);
+  ctx.fillStyle = INK_DIM;
+  ctx.textAlign = 'left';
+  ctx.fillText((card.note || 'CONCEPTUAL SECTION').toUpperCase(), box.x - 18, box.y + box.h + 62);
+
+  // 图例（要点在这里当图例用：编号 + 一条引线感的分隔）
+  let ly = box.y + box.h + 104;
+  (card.points || []).slice(0, 3).forEach((txt, j) => {
+    const ap = clamp((local - 0.18 - j * 0.07) / 0.2, 0, 1);
+    const y = ly + j * 74;
+    ctx.globalAlpha = alphaOut * ap;
+    setFont(ctx, 19, 600, MONO);
+    ctx.fillStyle = 'rgba(168,69,46,.85)';
+    ctx.textAlign = 'left';
+    ctx.fillText(String(j + 1).padStart(2, '0'), m, y);
+    setFont(ctx, 32, 500, SANS);
+    ctx.fillStyle = 'rgba(31,36,41,.88)';
+    const wrapped = wrapText(ctx, txt, w - 96);
+    ctx.fillText(wrapped[0] + (wrapped.length > 1 ? '…' : ''), m + 64, y);
+    hairline(m, y + 40, m + (w - 40) * ap, y + 40, 'rgba(31,36,41,.13)');
+    ctx.globalAlpha = alphaOut;
+  });
+
+  // 页脚
+  const fy = footY;
+  hairline(m, fy, DW - m, fy, 'rgba(31,36,41,.20)');
+  setFont(ctx, 18, 500, SANS);
+  ctx.fillStyle = 'rgba(31,36,41,.52)';
+  ctx.textAlign = 'left';
+  ctx.fillText('本图为原理概念示意，非等比例还原', m, fy + 42);
+  setFont(ctx, 18, 500, MONO);
+  ctx.fillStyle = INK_DIM;
+  ctx.textAlign = 'right';
+  ctx.fillText(`— 第 ${i + 1} 页 / 共 ${total} 页 —`, DW - m, fy + 42);
+  setFont(ctx, 16, 600, MONO);
+  ctx.fillStyle = 'rgba(31,36,41,.40)';
+  ctx.textAlign = 'left';
+  ctx.fillText('FLOWEDGE · ATLAS', m, fy + 76);
+
+  ctx.globalAlpha = 1;
+}
+
 function drawFrame(t) {
   resize();
   beginFrame();
@@ -332,7 +465,8 @@ function drawFrame(t) {
   const local = clamp((t - i * per) / per, 0, 1);
   // 结尾 12% 淡出，给换页留呼吸
   const alphaOut = local > 0.88 ? 1 - (local - 0.88) / 0.12 : 1;
-  drawPage(CARDS[i], i, n, local, alphaOut);
+  if (PORTRAIT) drawPagePortrait(CARDS[i], i, n, local, alphaOut);
+  else drawPage(CARDS[i], i, n, local, alphaOut);
 }
 
 async function init() {

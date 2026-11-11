@@ -48,6 +48,8 @@ func depFix(dep string) (fixDep string, fixable bool, fix string) {
 		return "comfy_h3", true, "点「一键修复」启动 ComfyUI-H3；注意它与默认实例互斥，会自动切实例"
 	case "comfy_moss":
 		return "comfy_moss", true, "点「一键修复」启动 ComfyUI-MOSS（图内文字渲染实例）；注意它与默认实例互斥，会自动切实例"
+	case "acestep":
+		return "acestep", true, "点「一键修复」启动音乐生成服务（ACE-Step 1.5 XL）；冷加载 3–5 分钟，启动中不要重复点"
 	case "ollama":
 		// 语言模型现在也是可托管依赖（video 的提示词优化、拆镜、分镜规划都要它）。
 		// 以前只能让用户"另开终端跑 ollama serve"——在双击 exe 的交付形态里等于
@@ -164,6 +166,15 @@ func PreflightDeps(nodes []model.NodeInstance, caps Capabilities, sup *Superviso
 			if c, ok := capabilityOf("tts", caps); ok {
 				add(n, "tts", "语音合成（TTS）", c)
 			}
+		case "music":
+			// 音乐生成：服务没起时节点会按需拉起（和 tts 一样），
+			// 所以这里只在「连拉起条件都不满足」时才拦——即 Startable 为 false。
+			// 单纯"没在跑"不该拦：那会让勾了自动配乐的片子每次都要求先手动点启动。
+			if c, ok := capabilityOf("acestep", caps); ok {
+				if !c.OK && (sup == nil || !sup.Startable("acestep")) {
+					add(n, "acestep", "音乐生成（ACE-Step 1.5）", c)
+				}
+			}
 		case "comfy":
 			// 逃生舱节点：instance 选哪个实例，就查哪个实例。
 			// comfyui / h3 走能力探针（在跑 = OK，没在跑但引擎托管可拉起 = 放行）；
@@ -216,6 +227,8 @@ func capabilityOf(dep string, caps Capabilities) (Capability, bool) {
 		return caps.ASR, true
 	case "tts":
 		return caps.TTS, true
+	case "acestep":
+		return caps.Music, true
 	case "vision":
 		return caps.Vision, true
 	case "ffmpeg":

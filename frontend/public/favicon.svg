@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="FlowEdge">
+  <rect width="64" height="64" rx="14" fill="#0a0d12" />
+  <path d="M14 44 L14 20 L26 20 L26 32 L38 32 L38 20 L50 20 L50 44 Z" fill="#6d7cff" opacity="0.18" />
+  <path d="M16 46 L16 18" stroke="#6d7cff" stroke-width="6" stroke-linecap="round" />
+  <path d="M48 46 L48 18" stroke="#39c6d6" stroke-width="6" stroke-linecap="round" />
+  <path d="M16 32 H48" stroke="#e6e9ef" stroke-width="5" stroke-linecap="round" />
+</svg>
