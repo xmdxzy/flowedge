@@ -638,7 +638,7 @@ func ffFilterPath(p string) string {
 	return "'" + q + "'"
 }
 
-// fontFileName 只取字体名：libass 按**字体名**匹配，不认路径，
+// fontFileName 取字体家族名：libass 按家族名匹配，不认文件路径。
 // 所以字体必须装在系统里（本机 msyh/simhei 都在 C:\Windows\Fonts）。
 func fontFileName(p string) string {
 	base := filepath.Base(p)
@@ -652,6 +652,18 @@ func fontFileName(p string) string {
 		return "SimHei"
 	case "simsun":
 		return "SimSun"
+	case "notosanscjk-bold", "notosanscjk-regular", "notosanscjk":
+		return "Noto Sans CJK SC"
+	case "notoserifcjk-bold", "notoserifcjk-regular":
+		return "Noto Serif CJK SC"
+	case "wqy-zenhei":
+		return "WenQuanYi Zen Hei"
+	case "uming":
+		return "AR PL UMing CN"
+	case "pingfang":
+		return "PingFang SC"
+	case "stheiti medium", "stheiti":
+		return "Heiti SC"
 	}
 	return name
 }

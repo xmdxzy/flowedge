@@ -8,8 +8,9 @@ import (
 	"testing"
 )
 
-// 滤镜里交给 libass 的路径必须是「正斜杠 + 盘符冒号转义 + 整体单引号」。
-// 实测（本机 ffmpeg 8.x）：只转义冒号不加引号会让过滤器把路径当成下一个选项名。
+// 滤镜里交给 libass 的路径必须是「正斜杠 + 冒号转义 + 整体单引号」。
+// 实测（ffmpeg 8.x）：只转义冒号不加引号，过滤器会把路径当成下一个选项名。
+// 冒号只出现在 Windows 盘符上，所以转义规则本身用固定路径验，与平台无关。
 func TestBuildOverlayFilter_UsesAssAndEscapesPath(t *testing.T) {
 	vf, cleanup, err := buildOverlayFilter(OverlayOptions{Text: "山海茶肆"}, 608, 352, 9.4, t.TempDir())
 	if err != nil {
@@ -19,8 +20,11 @@ func TestBuildOverlayFilter_UsesAssAndEscapesPath(t *testing.T) {
 	if !strings.HasPrefix(vf, "ass=") {
 		t.Fatalf("文字模式应当走 libass（ass=），得到 %q", vf)
 	}
-	if !strings.HasPrefix(vf, "ass='") || !strings.Contains(vf, `\:`) {
-		t.Fatalf("ASS 路径没按 'C\\:/...' 写法引号包裹：%s", vf)
+	if !strings.HasPrefix(vf, "ass='") || !strings.Contains(vf, ".ass'") {
+		t.Fatalf("ASS 路径没被单引号包住：%s", vf)
+	}
+	if got := ffFilterPath("C:\\Users\\you\\out.ass"); got != "'C\\:/Users/you/out.ass'" {
+		t.Fatalf("路径转义不对：%s", got)
 	}
 }
 
