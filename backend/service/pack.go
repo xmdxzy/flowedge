@@ -326,7 +326,7 @@ func setByPointer(tree interface{}, pointer, value string) {
 // 为什么不留原名：中文名在 zip 里靠 UTF-8 标志位，解压工具各不相同（Windows 资源
 // 管理器、7-Zip、macOS 归档实用工具三家三种结果），折成 ASCII 就永远不会错。
 func asciiAssetName(p string) string {
-	base := filepath.Base(p)
+	base := filepath.Base(strings.ReplaceAll(p, "\\", "/"))
 	ext := strings.ToLower(filepath.Ext(base))
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	var b strings.Builder

@@ -667,6 +667,10 @@ func overlayFontSize(height int) int {
 }
 
 // pickOverlayFont 按顺序找本机可用的中文字体（Windows 常见三档）。
+// pickOverlayFont 按顺序找本机可用的中文字体。
+//
+// 先 Windows，再 Linux（Noto/WQY 是发行版中文字体包的标准落点），最后 macOS。
+// 判据只有一条：文件在不在。
 func pickOverlayFont(explicit string) (string, error) {
 	if strings.TrimSpace(explicit) != "" {
 		if _, err := os.Stat(explicit); err != nil {
@@ -674,16 +678,26 @@ func pickOverlayFont(explicit string) (string, error) {
 		}
 		return explicit, nil
 	}
-	for _, f := range []string{
+	candidates := []string{
+		// Windows
 		`C:\Windows\Fonts\msyhbd.ttc`,
 		`C:\Windows\Fonts\msyh.ttc`,
 		`C:\Windows\Fonts\simhei.ttf`,
-	} {
+		// Linux：fonts-noto-cjk / fonts-wqy-zenhei
+		`/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc`,
+		`/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`,
+		`/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc`,
+		`/usr/share/fonts/truetype/arphic/uming.ttc`,
+		// macOS
+		`/System/Library/Fonts/PingFang.ttc`,
+		`/System/Library/Fonts/STHeiti Medium.ttc`,
+	}
+	for _, f := range candidates {
 		if _, err := os.Stat(f); err == nil {
 			return f, nil
 		}
 	}
-	return "", fmt.Errorf("贴字失败：没找到中文字体（试过 msyhbd / msyh / simhei），可用 overlay_font 指定")
+	return "", fmt.Errorf("贴字失败：没找到中文字体（Windows 看 msyh/simhei，Linux 装 fonts-noto-cjk，macOS 看 PingFang），可用 overlay_font 指定")
 }
 
 func ffprobeBeside(ffmpegPath string) string {

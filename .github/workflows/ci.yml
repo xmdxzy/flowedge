@@ -24,6 +24,12 @@ jobs:
         with:
           go-version: "1.25"
           check-latest: true
+      # 真实依赖，不能省的：ffmpeg 给音频/抽帧测试用，CJK 字体给贴字测试用。
+      # 缺它们时测试不是「失败」而是「跑不了」，那等于用假绿掩盖平台差异。
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk
       - name: Format
         run: |
           cd backend
